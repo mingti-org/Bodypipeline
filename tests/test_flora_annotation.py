@@ -113,6 +113,29 @@ def test_availability_accepts_a_peft_adapter_repository(tmp_path, settings_facto
     assert flora_annotation.available(settings) == (True, "")
 
 
+def test_availability_rejects_incomplete_sharded_weights(tmp_path, settings_factory):
+    settings = flora_settings(settings_factory, tmp_path)
+    captioner = tmp_path / "models/captioner"
+    (captioner / "model.safetensors").unlink()
+    (captioner / "model-00001-of-00002.safetensors").write_bytes(b"4")
+    (captioner / "model-00002-of-00002.safetensors").write_bytes(b"x")
+    (captioner / "model.safetensors.index.json").write_text(
+        json.dumps(
+            {
+                "metadata": {"total_size": 3},
+                "weight_map": {
+                    "a": "model-00001-of-00002.safetensors",
+                    "b": "model-00002-of-00002.safetensors",
+                },
+            }
+        )
+    )
+
+    ok, reason = flora_annotation.available(settings)
+    assert ok is False
+    assert "captioner" in reason
+
+
 def test_command_runs_one_three_camera_episode_on_one_slurm_gpu(
     tmp_path, settings_factory
 ):

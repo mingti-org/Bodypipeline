@@ -105,17 +105,10 @@ if [[ "${FLORA_SKIP_MODEL_CHECK:-0}" != "1" ]]; then
   missing=0
   for kind in tempseg captioner; do
     directory="$FLORA_MODEL_CACHE/$kind"
-    if [[ ! -d "$directory" ]]; then
-      echo "Missing model cache directory: $directory" >&2
-      missing=1
-      continue
-    fi
-    if [[ ! -f "$directory/config.json" && ! -f "$directory/adapter_config.json" ]]; then
-      echo "Missing model config in model cache: $directory" >&2
-      missing=1
-    fi
-    if ! compgen -G "$directory/*.safetensors" >/dev/null; then
-      echo "Missing safetensors in model cache: $directory" >&2
+    if [[ ! -d "$directory" ]] ||
+      { [[ ! -f "$directory/config.json" ]] && [[ ! -f "$directory/adapter_config.json" ]]; } ||
+      ! compgen -G "$directory/*.safetensors" >/dev/null; then
+      echo "Model cache is not ready: $directory" >&2
       missing=1
     fi
   done
@@ -138,6 +131,61 @@ if [[ "${FLORA_SKIP_MODEL_CHECK:-0}" != "1" ]]; then
     echo "Flora weights are incomplete. Download them separately; this script never fetches them." >&2
     exit 1
   fi
+  MODEL_CACHE="$FLORA_MODEL_CACHE" HF_HOME_CHECK="$FLORA_HF_HOME" "$FLORA_PYTHON" - <<'PY'
+import json
+import os
+import sys
+from pathlib import Path
+
+root = Path(os.environ["MODEL_CACHE"])
+
+def ready(path):
+    if not path.is_dir():
+        return False, "directory is missing"
+    if not (path / "config.json").is_file() and not (path / "adapter_config.json").is_file():
+        return False, "model config is missing"
+    files = list(path.glob("*.safetensors"))
+    if not files or any(not file.is_file() or file.stat().st_size <= 0 for file in files):
+        return False, "safetensors are missing or empty"
+    index_path = path / "model.safetensors.index.json"
+    if index_path.is_file():
+        try:
+            index = json.loads(index_path.read_text())
+            shards = {path / str(value) for value in (index.get("weight_map") or {}).values()}
+        except (OSError, TypeError, ValueError):
+            return False, "safetensors index is invalid"
+        if not shards or any(not file.is_file() or file.stat().st_size <= 0 for file in shards):
+            return False, "one or more indexed safetensors shards are missing"
+        total = (index.get("metadata") or {}).get("total_size")
+        if type(total) is int and sum(file.stat().st_size for file in shards) != total:
+            return False, "safetensors shards are incomplete"
+    return True, ""
+
+missing = False
+for kind in ("tempseg", "captioner"):
+    ok, why = ready(root / kind)
+    if not ok:
+        print(f"Model cache is not ready: {root / kind}: {why}", file=__import__("sys").stderr)
+        missing = True
+
+base_candidates = [root / "tempseg_base"]
+hf = Path(os.environ["HF_HOME_CHECK"])
+base_candidates.extend((hf / "hub/models--Qwen--Qwen3.5-9B/snapshots").glob("*"))
+if not any(ready(path)[0] for path in base_candidates):
+    print(
+        f"Missing complete Qwen3.5-9B base model in {root / 'tempseg_base'} "
+        f"or the Hugging Face cache under {hf}.",
+        file=__import__("sys").stderr,
+    )
+    missing = True
+if missing:
+    print(
+        "Flora weights are incomplete. Download them separately; "
+        "this script never fetches them.",
+        file=sys.stderr,
+    )
+    raise SystemExit(1)
+PY
 fi
 
 mkdir -p "$FLORA_HF_HOME"

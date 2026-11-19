@@ -46,7 +46,30 @@ def _model_directory_ready(path: Path) -> bool:
     has_config = (path / "config.json").is_file() or (
         path / "adapter_config.json"
     ).is_file()
-    return has_config and any(path.glob("*.safetensors"))
+    files = list(path.glob("*.safetensors"))
+    if not has_config or not files or any(not file.is_file() or file.stat().st_size <= 0 for file in files):
+        return False
+    index_path = path / "model.safetensors.index.json"
+    if index_path.is_file():
+        try:
+            index = json.loads(index_path.read_text())
+            weight_files = {
+                path / str(value)
+                for value in (index.get("weight_map") or {}).values()
+            }
+            if not weight_files or any(
+                not file.is_file() or file.stat().st_size <= 0
+                for file in weight_files
+            ):
+                return False
+            total_size = (index.get("metadata") or {}).get("total_size")
+            if type(total_size) is int and sum(
+                file.stat().st_size for file in weight_files
+            ) != total_size:
+                return False
+        except (OSError, TypeError, ValueError):
+            return False
+    return True
 
 
 def _base_model_ready(settings, model_cache: Path) -> bool:
