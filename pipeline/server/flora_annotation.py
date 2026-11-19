@@ -180,11 +180,22 @@ def command(
 
 def environment(settings) -> dict:
     config = _config(settings)
+    local_only = {
+        "DBUS_SESSION_BUS_ADDRESS",
+        "HOME",
+        "LOGNAME",
+        "PWD",
+        "SHELL",
+        "SHLVL",
+        "SSH_AUTH_SOCK",
+        "USER",
+        "XDG_RUNTIME_DIR",
+    }
     env = {
         key: value
         for key, value in settings.tool_environment().items()
         if not key.startswith(("OPENAI_", "OPENROUTER_", "HF_TOKEN"))
-        and key not in {"HUGGING_FACE_HUB_TOKEN", "CUDA_VISIBLE_DEVICES"}
+        and key not in local_only | {"HUGGING_FACE_HUB_TOKEN", "CUDA_VISIBLE_DEVICES"}
     }
     env.setdefault("PATH", os.defpath)
     env["CUDA_VISIBLE_DEVICES"] = "0"

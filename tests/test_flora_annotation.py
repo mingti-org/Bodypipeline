@@ -215,6 +215,8 @@ def test_environment_is_isolated_and_uses_flora_caches(tmp_path, settings_factor
     assert env["CUDA_VISIBLE_DEVICES"] == "0"
     assert not any(name.startswith("PIPELINE_ARGUS_") for name in env)
     assert not any(name.startswith("OPENAI_") for name in env)
+    assert "HOME" not in env
+    assert "USER" not in env
 
 
 def test_normalize_result_preserves_timestamps_and_incomplete_segments():
