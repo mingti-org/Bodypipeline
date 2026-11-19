@@ -1,6 +1,8 @@
 """Flora annotation backend contracts and output adaptation."""
 
 import json
+import shutil
+from pathlib import Path
 
 import pytest
 
@@ -18,15 +20,35 @@ def make_flora(tmp_path):
     return source, python
 
 
+def make_executable(path):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("#!/bin/sh\nexit 0\n")
+    path.chmod(0o755)
+    return path
+
+
 def flora_settings(settings_factory, tmp_path):
     source, python = make_flora(tmp_path)
+    tools = {
+        name: make_executable(tmp_path / f"bin/{name}")
+        for name in ("srun", "ffmpeg", "ffprobe")
+    }
+    models = tmp_path / "models"
+    for kind in ("tempseg", "captioner", "tempseg_base"):
+        directory = models / kind
+        directory.mkdir(parents=True)
+        (directory / "config.json").write_text("{}")
+        (directory / "model.safetensors").write_bytes(b"weights")
     return settings_factory(
         "server",
         flora={
             "enabled": True,
             "src": str(source),
             "python": str(python),
-            "model_cache": str(tmp_path / "models"),
+            "srun": str(tools["srun"]),
+            "ffmpeg": str(tools["ffmpeg"]),
+            "ffprobe": str(tools["ffprobe"]),
+            "model_cache": str(models),
             "hf_home": str(tmp_path / "hf"),
             "partition": "dev",
             "gpus": 1,
@@ -46,6 +68,39 @@ def test_availability_checks_the_source_and_interpreter(tmp_path, settings_facto
     ok, reason = flora_annotation.available(settings)
     assert ok is False
     assert "源码" in reason
+
+
+def test_availability_accepts_a_model_repository_root_infer(tmp_path, settings_factory):
+    settings = flora_settings(settings_factory, tmp_path)
+    source = Path(settings.flora["src"])
+    shutil.rmtree(source / "captioner")
+    (source / "infer.py").write_text("print('flora')\n")
+
+    assert flora_annotation.available(settings) == (True, "")
+
+
+def test_availability_accepts_the_qwen_base_in_the_huggingface_cache(
+    tmp_path, settings_factory
+):
+    settings = flora_settings(settings_factory, tmp_path)
+    shutil.rmtree(tmp_path / "models/tempseg_base")
+    snapshot = (
+        tmp_path
+        / "hf/hub/models--Qwen--Qwen3.5-9B/snapshots/c202236235762e1c871ad0ccb60c8ee5ba337b9a"
+    )
+    snapshot.mkdir(parents=True)
+    (snapshot / "config.json").write_text("{}")
+    (snapshot / "model.safetensors").write_bytes(b"weights")
+
+    assert flora_annotation.available(settings) == (True, "")
+
+
+def test_availability_reports_incomplete_model_cache(tmp_path, settings_factory):
+    settings = flora_settings(settings_factory, tmp_path)
+    (tmp_path / "models/tempseg_base/model.safetensors").unlink()
+    ok, reason = flora_annotation.available(settings)
+    assert ok is False
+    assert "tempseg_base" in reason
 
 
 def test_command_runs_one_three_camera_episode_on_one_slurm_gpu(
@@ -74,7 +129,7 @@ def test_command_runs_one_three_camera_episode_on_one_slurm_gpu(
         work,
     )
     assert argv[:6] == [
-        "srun",
+        settings.flora["srun"],
         "--partition",
         "dev",
         "--gres=gpu:1",
@@ -92,6 +147,29 @@ def test_command_runs_one_three_camera_episode_on_one_slurm_gpu(
     assert argv[argv.index("--output") + 1] == str(
         work / "episode_000004.result.json"
     )
+
+
+def test_command_uses_a_model_repository_root_infer_script(
+    tmp_path, settings_factory
+):
+    settings = flora_settings(settings_factory, tmp_path)
+    source = Path(settings.flora["src"])
+    shutil.rmtree(source / "captioner")
+    infer = source / "infer.py"
+    infer.write_text("print('flora')\n")
+    main = tmp_path / "episode/main.mp4"
+    main.parent.mkdir()
+    main.write_bytes(b"video")
+
+    argv = flora_annotation.command(
+        settings,
+        {"provider": "agilex"},
+        {"id": "episode_000000", "main": str(main)},
+        tmp_path / "work",
+    )
+
+    assert str(infer) in argv
+    assert str(source / "captioner/infer.py") not in argv
 
 
 def test_environment_is_isolated_and_uses_flora_caches(tmp_path, settings_factory):
@@ -155,6 +233,32 @@ def test_normalize_result_rejects_malformed_segments():
     with pytest.raises(DomainError, match="segments"):
         flora_annotation.normalize_result(
             {"duration_s": 2, "segments": [{"start_s": "bad"}]},
+            "episode_000000",
+        )
+
+
+@pytest.mark.parametrize(
+    ("start_s", "end_s"),
+    [
+        (0.0, 0.0),
+        (float("nan"), 1.0),
+        (0.0, float("inf")),
+    ],
+)
+def test_normalize_result_rejects_empty_or_non_finite_intervals(start_s, end_s):
+    with pytest.raises(DomainError, match="时间区间"):
+        flora_annotation.normalize_result(
+            {
+                "duration_s": 2,
+                "segments": [
+                    {
+                        "start_s": start_s,
+                        "end_s": end_s,
+                        "caption": "Invalid.",
+                        "status": "complete",
+                    }
+                ],
+            },
             "episode_000000",
         )
 

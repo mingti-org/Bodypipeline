@@ -293,8 +293,6 @@ def _validate_probe(path: Path, probe: dict):
         or int(probe.get("frames") or 0) <= 0
     ):
         raise DomainError(f"Flora 输入视频参数无效：{path}", 422)
-    if int(probe.get("bytes") or 0) > MAX_FILE_BYTES:
-        raise DomainError(f"Flora 输入视频超过 256 MiB：{path}", 422)
     if max(int(probe.get("width") or 0), int(probe.get("height") or 0)) > MAX_SIDE:
         raise DomainError(f"Flora 输入视频边长超过 4096 px：{path}", 422)
 
@@ -363,6 +361,10 @@ def _extract_clip(argv: list[str], output: Path, run: Callable[[list[str]], None
         run(retry)
     if not output.is_file():
         raise DomainError(f"FFmpeg 未生成 Flora 视频：{output}", 500)
+    size = output.stat().st_size
+    if size <= 0 or size > MAX_FILE_BYTES:
+        output.unlink(missing_ok=True)
+        raise DomainError(f"Flora 输入视频超过 256 MiB 或为空：{output}", 422)
 
 
 def prepare_episode_slices(
@@ -382,31 +384,43 @@ def prepare_episode_slices(
     for role, clip in episode.cameras.items():
         value = probe(clip.path)
         _validate_probe(clip.path, value)
+        clip_duration = clip.end_s - clip.start_s
+        if abs(clip_duration - episode.duration_s) > max(
+            0.05, 1 / float(value["fps"])
+        ):
+            raise DomainError(
+                f"Episode {episode.episode_index} 相机 {role} 与 Episode 时长不同步",
+                422,
+            )
+        if clip.end_s > float(value["duration_s"]) + max(
+            0.05, 1 / float(value["fps"])
+        ):
+            raise DomainError(
+                f"Episode {episode.episode_index} 的 {role} 视频区间超出源文件",
+                422,
+            )
         probes[role] = value
     first_path, first = next(iter(probes.items()))
     for role, value in probes.items():
-        duration_delta = abs(float(value["duration_s"]) - float(first["duration_s"]))
         fps_delta = abs(float(value["fps"]) - float(first["fps"]))
-        frames_delta = abs(int(value["frames"]) - int(first["frames"]))
-        if duration_delta > max(0.05, 1 / float(first["fps"])) or (
-            fps_delta > 0.01 or frames_delta > 1
-        ):
+        if fps_delta > 0.01:
             raise DomainError(
                 f"Episode {episode.episode_index} 相机不同步："
-                f"{first_path} 与 {role} 的时长/帧率/帧数不一致",
+                f"{first_path} 与 {role} 的帧率不一致",
                 422,
             )
+    source_duration = float(episode.duration_s)
+    source_frames = round(source_duration * float(first["fps"]))
     if (
-        float(first["duration_s"]) > MAX_DURATION_S + 1e-6
-        or int(first["frames"]) > MAX_FRAMES
+        source_duration > MAX_DURATION_S + 1e-6
+        or source_frames > MAX_FRAMES
     ):
         count = max(
-            math.ceil(float(first["duration_s"]) / MAX_DURATION_S),
-            math.ceil(int(first["frames"]) / MAX_FRAMES),
+            math.ceil(source_duration / MAX_DURATION_S),
+            math.ceil(source_frames / MAX_FRAMES),
         )
     else:
         count = 1
-    source_duration = float(first["duration_s"])
     rows = []
     for number in range(count):
         offset = number * MAX_DURATION_S

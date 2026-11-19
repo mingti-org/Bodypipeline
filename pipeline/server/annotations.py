@@ -23,7 +23,7 @@ from pathlib import Path
 from pipeline.shared.core import DomainError, atomic_json, digest, now
 from pipeline.shared.identity import Principal
 
-from . import argus_annotation
+from . import argus_annotation, flora_annotation, flora_media_worker
 from .annotation_backends import BACKENDS, DEFAULT_ENGINE, backend_for
 from .datasets import dataset_for_job
 from .merges import source_snapshot
@@ -87,13 +87,18 @@ class AnnotationRunner:
                 )
             elif row["state"] == QUEUED:
                 # Model keys only exist in memory, so a queued task cannot run
-                # after a restart.  Keep it resumable instead of failing later
-                # without an explanation.
+                # after a restart. Flora has no task key and can also resume,
+                # but it remains explicit for the same queue-state reason.
+                flora = (row.get("engine") or DEFAULT_ENGINE) == flora_annotation.ENGINE_ID
                 self.save(
                     row,
                     state=INTERRUPTED,
                     stage="标注已中断",
-                    error="Server 重启后任务凭据已清除；请续跑并重新填写 baseURL / API Key",
+                    error=(
+                        "Server 重启；Flora 已完成 Episode 保留，可续跑未完成部分"
+                        if flora
+                        else "Server 重启后任务凭据已清除；请续跑并重新填写 baseURL / API Key"
+                    ),
                     cancel_requested=False,
                     finished_at=now(),
                 )
@@ -269,6 +274,7 @@ class AnnotationRunner:
                     "annotation_last": {
                         "id": last["id"],
                         "state": last["state"],
+                        "engine": last.get("engine") or DEFAULT_ENGINE,
                         "model": last.get("model"),
                         "cost_usd": last.get("cost_usd"),
                         "created_at": last.get("created_at"),
@@ -303,15 +309,19 @@ class AnnotationRunner:
         with self.lock:
             if engine not in BACKENDS:
                 raise DomainError(f"未知标注引擎：{engine}", 400)
+            is_flora = engine == "flora"
             job = self.store.get("job", job_id)
             data = dataset_for_job(self.settings, job)
-            ok, why = self.available()
+            backend = BACKENDS[engine]
+            ok, why = backend.available(self.settings)
             if not ok:
-                raise DomainError(f"Argus 自动标注不可用：{why}", 503)
+                raise DomainError(f"{backend.label}不可用：{why}", 503)
 
             template = None
             library_revision = None
             if template_id:
+                if is_flora:
+                    raise DomainError("Flora 首期只支持自由分析，不能使用共享任务模板", 422)
                 if not argus_annotation.template_available(self.settings):
                     raise DomainError(
                         "Argus 尚未安装模板支持，请重新运行 scripts/install_argus.sh",
@@ -332,54 +342,88 @@ class AnnotationRunner:
                     raise DomainError("任务模板至少需要一个 Subtask 或自定义字段", 422)
                 library_revision = library["revision"]
 
-            explicit_model = model is not None
-            model = (model or self.settings.argus_model or "").strip()
-            allowed_models = list(self.settings.argus_models or [])
-            # A per-task gateway publishes its own catalogue, so the server
-            # allowlist only governs the server's default upstream.
-            custom_gateway = bool(str(base_url or "").strip())
-            if allowed_models and model not in allowed_models and not custom_gateway:
-                if explicit_model:
-                    raise DomainError("标注模型不在服务器允许列表中", 400)
-                # A configured default outside the allowlist is a server
-                # configuration slip; fall back like the page does instead of
-                # rejecting every request that omits a model.
-                model = allowed_models[0]
-            if not model:
-                raise DomainError("未配置标注模型", 400)
-            gap = argus_annotation.pricing_gap(self.settings, model)
-            if gap and not self.settings.argus_annotation_unlimited:
-                raise DomainError(gap, 400)
             note = (note or self.settings.argus_annotation_note or "").strip()
             if len(note) > 4000:
                 raise DomainError("任务说明不能超过 4000 个字符", 400)
-            if reasoning is None:
-                reasoning = self.settings.argus_annotation_reasoning
-            if reasoning not in REASONING:
-                raise DomainError("推理强度无效", 400)
-            if inspection is None:
-                inspection = self.settings.argus_annotation_inspection
-            if inspection not in INSPECTION:
-                raise DomainError("证据检查模式无效", 400)
-            if concurrency is None:
-                concurrency = self.settings.argus_annotation_concurrency
-            if not isinstance(concurrency, int) or not 1 <= concurrency <= 64:
-                raise DomainError("并发数应在 1 到 64 之间", 400)
-            if sample_fps is None:
-                sample_fps = self.settings.argus_annotation_sample_fps
-            if not isinstance(sample_fps, (int, float)) or not 0 <= sample_fps <= 10:
-                raise DomainError("采样帧率应在 0 到 10 之间", 400)
-            if field_dictionary is None:
-                field_dictionary = self.settings.argus_annotation_field_dictionary
-            if type(field_dictionary) is not bool:
-                raise DomainError("字段解释选项必须为布尔值", 400)
-            if max_tokens is None:
-                max_tokens = self.settings.argus_max_tokens
-            if not isinstance(max_tokens, int) or not 256 <= max_tokens <= 200000:
-                raise DomainError("输出 token 上限应在 256 到 200000 之间", 400)
+            if is_flora:
+                if any(str(value or "").strip() for value in (base_url, api_key, model)):
+                    raise DomainError("Flora 本地标注不接受模型网关参数", 400)
+                provider = str(job.get("provider") or "").strip()
+                spec = flora_annotation.provider_spec(
+                    self.settings, {"provider": provider}
+                )
+                model = flora_annotation.MODEL_LABEL
+                concurrency = 1
+                reasoning = ""
+                sample_fps = 0.0
+                inspection = "off"
+                field_dictionary = False
+                max_tokens = 0
+            else:
+                spec = {}
+                explicit_model = model is not None
+                model = (model or self.settings.argus_model or "").strip()
+                allowed_models = list(self.settings.argus_models or [])
+                # A per-task gateway publishes its own catalogue, so the server
+                # allowlist only governs the server's default upstream.
+                custom_gateway = bool(str(base_url or "").strip())
+                if (
+                    allowed_models
+                    and model not in allowed_models
+                    and not custom_gateway
+                ):
+                    if explicit_model:
+                        raise DomainError("标注模型不在服务器允许列表中", 400)
+                    # A configured default outside the allowlist is a server
+                    # configuration slip; fall back like the page does instead of
+                    # rejecting every request that omits a model.
+                    model = allowed_models[0]
+                if not model:
+                    raise DomainError("未配置标注模型", 400)
+                gap = argus_annotation.pricing_gap(self.settings, model)
+                if gap and not self.settings.argus_annotation_unlimited:
+                    raise DomainError(gap, 400)
+                if reasoning is None:
+                    reasoning = self.settings.argus_annotation_reasoning
+                if reasoning not in REASONING:
+                    raise DomainError("推理强度无效", 400)
+                if inspection is None:
+                    inspection = self.settings.argus_annotation_inspection
+                if inspection not in INSPECTION:
+                    raise DomainError("证据检查模式无效", 400)
+                if concurrency is None:
+                    concurrency = self.settings.argus_annotation_concurrency
+                if not isinstance(concurrency, int) or not 1 <= concurrency <= 64:
+                    raise DomainError("并发数应在 1 到 64 之间", 400)
+                if sample_fps is None:
+                    sample_fps = self.settings.argus_annotation_sample_fps
+                if not isinstance(sample_fps, (int, float)) or not 0 <= sample_fps <= 10:
+                    raise DomainError("采样帧率应在 0 到 10 之间", 400)
+                if field_dictionary is None:
+                    field_dictionary = (
+                        self.settings.argus_annotation_field_dictionary
+                    )
+                if type(field_dictionary) is not bool:
+                    raise DomainError("字段解释选项必须为布尔值", 400)
+                if max_tokens is None:
+                    max_tokens = self.settings.argus_max_tokens
+                if not isinstance(max_tokens, int) or not 256 <= max_tokens <= 200000:
+                    raise DomainError("输出 token 上限应在 256 到 200000 之间", 400)
 
             for row in self.store.all("annotation"):
                 if row["job_id"] == job_id and row["state"] in ACTIVE:
+                    active_engine = str(row.get("engine") or DEFAULT_ENGINE)
+                    if active_engine != engine:
+                        other_label = (
+                            BACKENDS[active_engine].label
+                            if active_engine in BACKENDS
+                            else active_engine
+                        )
+                        raise DomainError(
+                            f"该数据集已有使用 {other_label} 的活动任务，"
+                            "请等待完成或取消后再切换标注引擎",
+                            409,
+                        )
                     if (row.get("task_template") or {}).get("id") != template_id or (
                         template and row.get("template_signature") != digest(template)
                     ):
@@ -389,8 +433,12 @@ class AnnotationRunner:
                         )
                     return row
 
-            credentials = argus_annotation.resolve_credentials(
-                self.settings, base_url, api_key
+            credentials = (
+                {}
+                if is_flora
+                else argus_annotation.resolve_credentials(
+                    self.settings, base_url, api_key
+                )
             )
             self._check_dataset_available(data)
             info = json.loads((data / "meta/info.json").read_text())
@@ -401,16 +449,26 @@ class AnnotationRunner:
                     409,
                 )
             count = int(info.get("total_episodes") or 1)
-            budget = self.budget(job_id, count)
-            cap = None
-            if not self.settings.argus_annotation_unlimited:
-                available = float(budget["available_usd"])
-                if available <= 0:
-                    raise BudgetExceeded("今日或本数据集的自动标注预算已用尽")
-                cap = available if cap_usd is None else float(cap_usd)
-                if cap <= 0:
-                    raise DomainError("本次费用上限必须大于 0", 400)
-                cap = min(cap, available)
+            if is_flora:
+                budget = {
+                    "task_cap_usd": 0.0,
+                    "task_used_usd": 0.0,
+                    "daily_cap_usd": 0.0,
+                    "daily_used_usd": 0.0,
+                    "available_usd": 0.0,
+                }
+                cap = 0.0
+            else:
+                budget = self.budget(job_id, count)
+                cap = None
+                if not self.settings.argus_annotation_unlimited:
+                    available = float(budget["available_usd"])
+                    if available <= 0:
+                        raise BudgetExceeded("今日或本数据集的自动标注预算已用尽")
+                    cap = available if cap_usd is None else float(cap_usd)
+                    if cap <= 0:
+                        raise DomainError("本次费用上限必须大于 0", 400)
+                    cap = min(cap, available)
             signature = source_snapshot(data)
             context = self._provider_context(job)
             row = {
@@ -449,17 +507,22 @@ class AnnotationRunner:
                 "max_tokens": max_tokens,
                 # The gateway URL is not secret and helps the page explain a
                 # resumed task.  The key stays in self.credentials.
-                "base_url": credentials["task_base_url"],
+                "base_url": credentials.get("task_base_url"),
                 "rig": context.get("rig") or "teleop_arms",
                 "provider_context": context,
                 "source": signature,
                 "budget": budget,
-                "argus_dir": "argus",
+                "argus_dir": None if is_flora else "argus",
+                "flora_dir": "flora" if is_flora else None,
+                "flora_profile": spec.get("profile") if is_flora else None,
+                "flora_camera_roles": spec.get("camera_roles") or {}
+                if is_flora
+                else {},
                 "attempts": 0,
                 "cost_usd": 0.0,
                 "carried_cost_usd": 0.0,
                 "reserved_cost_usd": 0.0,
-                "cost_complete": False,
+                "cost_complete": is_flora,
                 "work_path": None,
                 "error": None,
                 "cancel_requested": False,
@@ -481,7 +544,8 @@ class AnnotationRunner:
                 storage_path(self.settings, row, "annotations", row["id"])
             )
             self.save(row)
-            self.credentials[row["id"]] = credentials
+            if not is_flora:
+                self.credentials[row["id"]] = credentials
             return row
 
     def _check_dataset_available(self, data: Path):
@@ -567,18 +631,24 @@ class AnnotationRunner:
                 return row
             if row["state"] not in {PARTIAL, FAILED, INTERRUPTED, CANCELLED}:
                 raise DomainError("只有失败、部分完成、中断或取消的任务可以续跑", 409)
-            ok, why = self.available()
+            backend = backend_for(row)
+            is_flora = backend.id == flora_annotation.ENGINE_ID
+            ok, why = backend.available(self.settings)
             if not ok:
-                raise DomainError(f"Argus 自动标注不可用：{why}", 503)
-            if row.get("task_template") and not argus_annotation.template_available(
-                self.settings
-            ):
-                raise DomainError(
-                    "Argus 模板支持缺失，请重新运行 scripts/install_argus.sh", 503
+                raise DomainError(f"{backend.label}不可用：{why}", 503)
+            if not is_flora:
+                if row.get("task_template") and not argus_annotation.template_available(
+                    self.settings
+                ):
+                    raise DomainError(
+                        "Argus 模板支持缺失，请重新运行 scripts/install_argus.sh",
+                        503,
+                    )
+                gap = argus_annotation.pricing_gap(
+                    self.settings, row.get("model") or ""
                 )
-            gap = argus_annotation.pricing_gap(self.settings, row.get("model") or "")
-            if gap and not self.settings.argus_annotation_unlimited:
-                raise DomainError(gap, 400)
+                if gap and not self.settings.argus_annotation_unlimited:
+                    raise DomainError(gap, 400)
             job = self.store.get("job", row["job_id"])
             data = dataset_for_job(self.settings, job)
             if str(data) != row.get("dataset_path"):
@@ -592,39 +662,69 @@ class AnnotationRunner:
                 raise DomainError(
                     "来源数据集内容已变化，不能续跑；请创建新的标注任务", 409
                 )
-            # A server restart clears the in-memory key, so resuming asks for
-            # credentials again unless the server has its own default.
-            credentials = argus_annotation.resolve_credentials(
-                self.settings,
-                base_url if base_url is not None else row.get("base_url"),
-                api_key,
-            )
             fields = {
                 "state": QUEUED,
                 "stage": "等待续跑",
                 "error": None,
                 "finished_at": None,
                 "cancel_requested": False,
-                "base_url": credentials["task_base_url"],
             }
-            budget = self.budget(
-                row["job_id"], int(row.get("input_episode_count") or 1)
-            )
-            if budget["available_usd"] is not None and budget["available_usd"] <= 0:
-                raise BudgetExceeded("今日或本数据集的自动标注预算已用尽，不能续跑")
-            fields["budget"] = budget
-            previous = float(row.get("cost_usd") or 0.0)
-            fields["cap_usd"] = (
-                None
-                if self.settings.argus_annotation_unlimited
-                else round(
-                    min(
-                        float(row.get("cap_usd") or budget["available_usd"]),
-                        previous + float(budget["available_usd"]),
-                    ),
-                    4,
+            if is_flora:
+                fields.update(
+                    {
+                        "budget": {
+                            "task_cap_usd": 0.0,
+                            "task_used_usd": 0.0,
+                            "daily_cap_usd": 0.0,
+                            "daily_used_usd": 0.0,
+                            "available_usd": 0.0,
+                        },
+                        "cap_usd": 0.0,
+                        "cost_complete": True,
+                    }
                 )
-            )
+            else:
+                if (
+                    row.get("task_template")
+                    and not argus_annotation.template_available(self.settings)
+                ):
+                    raise DomainError(
+                        "Argus 模板支持缺失，请重新运行 scripts/install_argus.sh",
+                        503,
+                    )
+                gap = argus_annotation.pricing_gap(
+                    self.settings, row.get("model") or ""
+                )
+                if gap and not self.settings.argus_annotation_unlimited:
+                    raise DomainError(gap, 400)
+                # A server restart clears the in-memory key, so resuming asks
+                # for credentials again unless the server has its own default.
+                credentials = argus_annotation.resolve_credentials(
+                    self.settings,
+                    base_url if base_url is not None else row.get("base_url"),
+                    api_key,
+                )
+                fields["base_url"] = credentials["task_base_url"]
+                budget = self.budget(
+                    row["job_id"], int(row.get("input_episode_count") or 1)
+                )
+                if budget["available_usd"] <= 0:
+                    raise BudgetExceeded(
+                        "今日或本数据集的自动标注预算已用尽，不能续跑"
+                    )
+                fields["budget"] = budget
+                previous = float(row.get("cost_usd") or 0.0)
+                fields["cap_usd"] = (
+                    None
+                    if self.settings.argus_annotation_unlimited
+                    else round(
+                        min(
+                            float(row.get("cap_usd") or budget["available_usd"]),
+                            previous + float(budget["available_usd"]),
+                        ),
+                        4,
+                    )
+                )
             if principal is not None:
                 fields.update(principal.job_metadata())
             if self._preparation_refused(row.get("error") or ""):
@@ -638,7 +738,10 @@ class AnnotationRunner:
                     str(row.get("stage") or "") not in LABELLING_STAGES
                 )
             self.save(row, **fields)
-            self.credentials[aid] = credentials
+            if is_flora:
+                self.credentials.pop(aid, None)
+            else:
+                self.credentials[aid] = credentials
             return row
 
     @staticmethod
@@ -718,6 +821,8 @@ class AnnotationRunner:
                 attempts=int(row.get("attempts") or 0) + 1,
                 cancel_requested=False,
             )
+        if row.get("engine") == "flora":
+            return self._run_flora(row, event)
         work = storage_path(self.settings, row, "annotations", row["id"])
         log = work / "logs/run.log"
         state = RUNNING
@@ -976,6 +1081,245 @@ class AnnotationRunner:
                 self._running = False
         return self.store.get("annotation", row["id"])
 
+    def _run_flora(self, row, event: threading.Event):
+        work = data_directory(self.settings, row, "annotations", row["id"])
+        log = work / "logs/run.log"
+        process = None
+        state = RUNNING
+        stage = "准备 Episode 视频"
+        error = None
+        exit_code = None
+        try:
+            log.parent.mkdir(parents=True, exist_ok=True)
+            (work / "flora/slices").mkdir(parents=True, exist_ok=True)
+            data = Path(row["dataset_path"])
+            current = source_snapshot(data)
+            if (row.get("source") or {}).get("signature") not in {
+                None,
+                current.get("signature"),
+            }:
+                raise DomainError("来源数据集内容已变化，已停止标注")
+            camera_roles = row.get("flora_camera_roles") or None
+            episodes = flora_media_worker.load_episode_manifest(
+                data,
+                camera_roles=camera_roles,
+            )
+            atomic_json(
+                work / "flora/manifest.json",
+                {
+                    "profile": row.get("flora_profile"),
+                    "camera_roles": camera_roles or {},
+                    "episodes": [
+                        {
+                            "episode_id": episode.episode_id,
+                            "episode_index": episode.episode_index,
+                            "duration_s": episode.duration_s,
+                        }
+                        for episode in episodes
+                    ],
+                },
+            )
+            env = flora_annotation.environment(self.settings)
+            source = flora_annotation.source_path(self.settings)
+            timeout = float(self.settings.flora.get("timeout_seconds") or 14400)
+            failures = []
+            for episode in episodes:
+                final = work / f"{episode.episode_id}.result.json"
+                if final.is_file():
+                    existing = flora_annotation.episode(work, episode.episode_id)
+                    if existing is not None and existing.get("completed"):
+                        continue
+                    final.unlink(missing_ok=True)
+                if event.is_set():
+                    state, stage = CANCELLED, "已取消"
+                    break
+                if self.shutdown_requested.is_set():
+                    state, stage = INTERRUPTED, "已中断"
+                    error = "Server 正在停止"
+                    break
+                slices = flora_media_worker.prepare_episode_slices(
+                    episode,
+                    work / "flora/media",
+                    ffmpeg=str(self.settings.flora.get("ffmpeg") or "ffmpeg"),
+                    ffprobe=str(self.settings.flora.get("ffprobe") or "ffprobe"),
+                )
+                segments = []
+                revisions = {}
+                profile = None
+                source_hash = None
+                episode_failed = False
+                for media in slices:
+                    if event.is_set():
+                        state, stage = CANCELLED, "已取消"
+                        episode_failed = True
+                        break
+                    if self.shutdown_requested.is_set():
+                        state, stage = INTERRUPTED, "已中断"
+                        error = "Server 正在停止"
+                        episode_failed = True
+                        break
+                    argv = flora_annotation.command(
+                        self.settings,
+                        row,
+                        media,
+                        work,
+                    )
+                    stage = "Flora 推理"
+                    with log.open("ab") as out:
+                        out.write(
+                            (
+                                f"\n=== {media['id']} "
+                                f"{time.strftime('%Y-%m-%d %H:%M:%S')}\n"
+                            ).encode()
+                        )
+                        out.flush()
+                        process = subprocess.Popen(
+                            argv,
+                            stdout=out,
+                            stderr=subprocess.STDOUT,
+                            stdin=subprocess.DEVNULL,
+                            start_new_session=True,
+                            cwd=source,
+                            env=env,
+                        )
+                        deadline = time.monotonic() + timeout
+                        while process.poll() is None:
+                            if event.is_set():
+                                state, stage = CANCELLED, "已取消"
+                                _terminate(process)
+                                episode_failed = True
+                                break
+                            if self.shutdown_requested.is_set():
+                                state, stage = INTERRUPTED, "已中断"
+                                error = "Server 正在停止"
+                                _terminate(process)
+                                episode_failed = True
+                                break
+                            if time.monotonic() >= deadline:
+                                state = FAILED
+                                error = f"{media['id']} 标注超时"
+                                _terminate(process)
+                                episode_failed = True
+                                break
+                            time.sleep(0.5)
+                    exit_code = process.returncode
+                    if episode_failed or exit_code != 0:
+                        episode_failed = True
+                        failures.append(media["id"])
+                        break
+                    result_path = work / f"{media['id']}.result.json"
+                    try:
+                        payload = json.loads(result_path.read_text())
+                    except (OSError, ValueError) as exc:
+                        raise DomainError(
+                            f"{media['id']} 未生成有效 Flora 结果：{exc}",
+                            502,
+                        ) from exc
+                    offset = float(media.get("offset_s") or 0)
+                    shifted = []
+                    for segment in payload.get("segments") or []:
+                        if not isinstance(segment, dict):
+                            raise DomainError("Flora segments 包含无效条目", 502)
+                        item = dict(segment)
+                        item["start_s"] = float(item["start_s"]) + offset
+                        item["end_s"] = float(item["end_s"]) + offset
+                        shifted.append(item)
+                    payload["segments"] = shifted
+                    segments.extend(shifted)
+                    revisions.update(payload.get("model_revisions") or {})
+                    profile = payload.get("profile") or profile
+                    source_hash = payload.get("input_sha256") or source_hash
+                    atomic_json(
+                        work / "flora/slices" / f"{media['id']}.json",
+                        payload,
+                    )
+                    result_path.unlink(missing_ok=True)
+                    progress = flora_annotation.progress(work)
+                    row = self.save(
+                        self.store.get("annotation", row["id"]),
+                        stage=stage,
+                        units=progress["units"],
+                        episodes_done=progress["labelled"],
+                    )
+                if not episode_failed:
+                    result = flora_annotation.normalize_result(
+                        {
+                            "duration_s": episode.duration_s,
+                            "segments": segments,
+                            "profile": profile,
+                            "model_revisions": revisions,
+                            "input_sha256": source_hash,
+                        },
+                        episode.episode_id,
+                    )
+                    atomic_json(final, result)
+                if state in {CANCELLED, INTERRUPTED}:
+                    break
+            episodes_out = flora_annotation.outputs(work)
+            labelled = sum(row["labels_available"] for row in episodes_out)
+            fully_complete = sum(row["completed"] for row in episodes_out)
+            if state == RUNNING:
+                if (
+                    labelled == len(episodes)
+                    and fully_complete == len(episodes)
+                    and not failures
+                ):
+                    state, stage = COMPLETED, "标注完成"
+                elif labelled:
+                    state, stage = PARTIAL, "部分标注完成"
+                    error = (
+                        "部分 Flora Segment 未完成，已完成结果已保留"
+                        if fully_complete < labelled
+                        else _failure_tail(log)
+                    )
+                else:
+                    state, stage = FAILED, "标注失败"
+                    error = _failure_tail(log)
+            self.save(
+                row,
+                state=state,
+                stage=stage,
+                error=error,
+                exit_code=exit_code,
+                finished_at=now(),
+                cost_usd=0.0,
+                reserved_cost_usd=0.0,
+                cost_complete=True,
+                episode_count=len(episodes_out),
+                episodes_done=labelled,
+                episodes_failed=max(0, len(episodes) - labelled),
+                work_path=str(work),
+                flora_path=str(work / "flora"),
+                cancel_requested=False,
+            )
+        except DomainError as exc:
+            self.save(
+                row,
+                state=FAILED,
+                stage="标注失败",
+                error=exc.message,
+                finished_at=now(),
+                cancel_requested=False,
+                work_path=str(work),
+            )
+        except Exception as exc:  # noqa: BLE001 - recorded, never swallowed
+            if process is not None and process.poll() is None:
+                _terminate(process)
+            self.save(
+                row,
+                state=FAILED,
+                stage="标注失败",
+                error=f"{type(exc).__name__}: {exc}"[:1200],
+                finished_at=now(),
+                cancel_requested=False,
+                work_path=str(work),
+            )
+        finally:
+            self.cancel_events.pop(row["id"], None)
+            with self.lock:
+                self._running = False
+        return self.store.get("annotation", row["id"])
+
     # ---------------------------------------------------------------- results
     def work(self, row) -> Path:
         recorded = row.get("work_path")
@@ -1018,13 +1362,14 @@ class AnnotationRunner:
     def export(self, aid: str) -> dict:
         row = self.store.get("annotation", aid)
         work = self.work(row)
-        episodes = argus_annotation.outputs(work)
+        backend = backend_for(row)
+        episodes = backend.outputs(work)
         details = []
         for item in episodes:
-            value = argus_annotation.episode(work, item["id"])
+            value = backend.episode(work, item["id"])
             if value is not None:
                 details.append(value)
-        return {
+        exported = {
             "annotation": {
                 key: row.get(key)
                 for key in (
@@ -1032,6 +1377,7 @@ class AnnotationRunner:
                     "job_id",
                     "dataset_name",
                     "dataset_path",
+                    "engine",
                     "base_url",
                     "robot_type",
                     "model",
@@ -1060,10 +1406,14 @@ class AnnotationRunner:
                     "source",
                 )
             },
-            "argus": argus_annotation.cost(work),
-            "report": argus_annotation.read_report(work),
             "episodes": details,
         }
+        if backend.id == flora_annotation.ENGINE_ID:
+            exported["flora"] = backend.cost(work)
+        else:
+            exported["argus"] = backend.cost(work)
+            exported["report"] = argus_annotation.read_report(work)
+        return exported
 
 
 def _tail(path: Path, offset: int) -> tuple[str, int]:
@@ -1098,9 +1448,9 @@ def _failure_tail(log: Path) -> str:
             handle.seek(max(0, size - 16000))
             text = handle.read().decode(errors="replace")
     except OSError:
-        return "Argus 未生成可用标注"
+        return "未生成可用标注"
     lines = [line.strip() for line in text.strip().splitlines() if line.strip()]
-    return "\n".join(lines[-8:])[-1600:] or "Argus 未生成可用标注"
+    return "\n".join(lines[-8:])[-1600:] or "未生成可用标注"
 
 
 def _failure_error(log: Path, episodes: list[dict]) -> str:

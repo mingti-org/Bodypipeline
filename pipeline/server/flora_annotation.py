@@ -9,8 +9,10 @@ environment.
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
+import shutil
 from pathlib import Path
 
 from pipeline.shared.core import DomainError
@@ -31,20 +33,62 @@ def source_path(settings) -> Path:
     return Path(str(_config(settings).get("src") or "")).expanduser()
 
 
+def infer_script(settings) -> Path:
+    source = source_path(settings)
+    for relative in ("captioner/infer.py", "infer.py"):
+        path = source / relative
+        if path.is_file():
+            return path
+    return source / "captioner/infer.py"
+
+
+def _model_directory_ready(path: Path) -> bool:
+    return (path / "config.json").is_file() and any(path.glob("*.safetensors"))
+
+
+def _base_model_ready(settings, model_cache: Path) -> bool:
+    if _model_directory_ready(model_cache / "tempseg_base"):
+        return True
+    hf_home = Path(str(_config(settings).get("hf_home") or "")).expanduser()
+    snapshots = (
+        hf_home
+        / "hub"
+        / "models--Qwen--Qwen3.5-9B"
+        / "snapshots"
+    )
+    return snapshots.is_dir() and any(_model_directory_ready(path) for path in snapshots.iterdir())
+
+
 def available(settings) -> tuple[bool, str]:
     config = _config(settings)
     if not config.get("enabled"):
         return False, "未启用 Flora 本地标注"
     source = source_path(settings)
-    if not (source / "captioner/infer.py").is_file():
+    if not infer_script(settings).is_file():
         return False, f"Flora 源码不存在或不完整：{source}"
     python = Path(str(config.get("python") or "")).expanduser()
     if not python.is_file() or not os.access(python, os.X_OK):
         return False, "未找到 Flora 隔离环境的 Python 解释器"
+    for key, default, label in (
+        ("srun", "srun", "Slurm srun"),
+        ("ffmpeg", "ffmpeg", "ffmpeg"),
+        ("ffprobe", "ffprobe", "ffprobe"),
+    ):
+        command = str(config.get(key) or default)
+        found = shutil.which(command)
+        if not found and not (Path(command).is_file() and os.access(command, os.X_OK)):
+            return False, f"未找到 {label}：{command}"
+    model_cache = Path(str(config.get("model_cache") or "")).expanduser()
+    for kind in ("tempseg", "captioner"):
+        directory = model_cache / kind
+        if not _model_directory_ready(directory):
+            return False, f"Flora 模型缓存不完整：{directory}"
+    if not _base_model_ready(settings, model_cache):
+        return False, "Flora 基础模型缓存不完整：tempseg_base / Qwen3.5-9B"
     return True, ""
 
 
-def profile_for(settings, annotation: dict) -> dict:
+def provider_spec(settings, annotation: dict) -> dict:
     provider = str(annotation.get("provider") or "").strip()
     profiles = _config(settings).get("profiles") or {}
     spec = profiles.get(provider)
@@ -53,6 +97,11 @@ def profile_for(settings, annotation: dict) -> dict:
             f"Provider {provider or '（未声明）'} 尚未绑定 Flora 输入 Profile",
             422,
         )
+    return spec
+
+
+def profile_for(settings, annotation: dict) -> dict:
+    spec = provider_spec(settings, annotation)
     return {"profile": spec["profile"], "yam32": bool(spec.get("yam32", False))}
 
 
@@ -71,7 +120,7 @@ def command(
     if not main.is_file():
         raise DomainError("Flora Episode 缺少主相机视频", 422)
     python = str(config["python"])
-    infer = source_path(settings) / "captioner/infer.py"
+    infer = infer_script(settings)
     output = Path(work) / f"{media['id']}.result.json"
     argv = [
         str(config.get("srun") or "srun"),
@@ -142,7 +191,12 @@ def normalize_result(payload: dict, episode_id: str) -> dict:
             end = float(raw["end_s"])
         except (KeyError, TypeError, ValueError) as exc:
             raise DomainError("Flora segments 的开始或结束时间无效", 502) from exc
-        if start < 0 or end < start:
+        if (
+            not math.isfinite(start)
+            or not math.isfinite(end)
+            or start < 0
+            or end <= start
+        ):
             raise DomainError("Flora segments 的时间区间无效", 502)
         caption = str(raw.get("caption") or "").strip()
         status = str(raw.get("status") or "").strip() or "incomplete"
@@ -197,12 +251,16 @@ def outputs(work: Path) -> list[dict]:
     return rows
 
 
+def results(work: Path) -> dict[str, dict]:
+    return {row["id"]: row for row in outputs(work)}
+
+
 def episode(work: Path, episode_id: str) -> dict | None:
     _episode_index(episode_id)
     path = Path(work) / f"{episode_id}.result.json"
     try:
         return normalize_result(json.loads(path.read_text()), episode_id)
-    except (OSError, ValueError):
+    except (OSError, ValueError, DomainError):
         return None
 
 
@@ -282,12 +340,15 @@ __all__ = [
     "cost",
     "environment",
     "episode",
+    "infer_script",
     "log_names",
     "normalize_result",
     "outputs",
     "profile_for",
+    "provider_spec",
     "progress",
     "read_log",
+    "results",
     "source_path",
     "stage_from_log",
 ]

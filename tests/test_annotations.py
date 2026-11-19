@@ -2,6 +2,8 @@
 
 import io
 import json
+import sys
+import threading
 import time
 import urllib.error
 from pathlib import Path
@@ -9,7 +11,7 @@ from pathlib import Path
 import pytest
 from fastapi.testclient import TestClient
 
-from pipeline.server import argus_annotation
+from pipeline.server import argus_annotation, flora_annotation, flora_media_worker
 from pipeline.server.annotations import (
     AnnotationRunner,
     BudgetExceeded,
@@ -101,6 +103,38 @@ def service(settings_factory, tmp_path, monkeypatch):
     return AnnotationRunner(s, store), store, src, data
 
 
+def enable_flora(runner, data):
+    flora = data.parent / "flora"
+    (flora / "captioner").mkdir(parents=True, exist_ok=True)
+    (flora / "captioner/infer.py").write_text("print('flora')\n")
+    python = data.parent / "flora-python"
+    python.write_text("#!/bin/sh\nexit 0\n")
+    python.chmod(0o755)
+    tools = {}
+    for name in ("srun", "ffmpeg", "ffprobe"):
+        path = data.parent / f"flora-{name}"
+        path.write_text("#!/bin/sh\nexit 0\n")
+        path.chmod(0o755)
+        tools[name] = path
+    models = data.parent / "flora-models"
+    for kind in ("tempseg", "captioner", "tempseg_base"):
+        directory = models / kind
+        directory.mkdir(parents=True)
+        (directory / "config.json").write_text("{}")
+        (directory / "model.safetensors").write_bytes(b"weights")
+    runner.settings.flora = {
+        "enabled": True,
+        "src": str(flora),
+        "python": str(python),
+        "srun": str(tools["srun"]),
+        "ffmpeg": str(tools["ffmpeg"]),
+        "ffprobe": str(tools["ffprobe"]),
+        "model_cache": str(models),
+        "profiles": {"agilex": {"profile": "yam"}},
+    }
+    return flora
+
+
 def test_options_and_candidates_come_from_registered_datasets(service):
     runner, store, _src, data = service
     options = runner.options()
@@ -166,6 +200,377 @@ def test_legacy_annotations_default_to_argus_and_unknown_engines_are_rejected(
     store.put("annotation", row["id"], dict(row, state="CANCELLED"))
     with pytest.raises(DomainError, match="标注引擎"):
         runner.enqueue("job-1", engine="unknown")
+
+
+def test_flora_enqueue_skips_argus_credentials_and_usd_budget(service, monkeypatch):
+    runner, _store, _src, data = service
+    enable_flora(runner, data)
+    monkeypatch.delenv("PIPELINE_ARGUS_API_KEY", raising=False)
+    monkeypatch.delenv("OPENROUTER_API_KEYS", raising=False)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+
+    row = runner.enqueue("job-1", engine="flora")
+    assert row["engine"] == "flora"
+    assert row["model"] == "Flora-TempSeg + Flora-Captioner"
+    assert row["cap_usd"] == 0
+    assert row["cost_complete"] is True
+    assert row["id"] not in runner.credentials
+    assert runner.options()["engines"]["flora"]["available"] is True
+
+
+def test_annotation_engines_are_available_independently(service):
+    runner, _store, _src, data = service
+    runner.settings.argus_src = str(data.parent / "missing-argus")
+    enable_flora(runner, data)
+
+    engines = runner.options()["engines"]
+    assert engines["argus"]["available"] is False
+    assert engines["flora"]["available"] is True
+    assert engines["flora"]["reason"] == ""
+
+
+def test_active_annotation_cannot_be_returned_for_a_different_engine(service):
+    runner, _store, _src, data = service
+    enable_flora(runner, data)
+    argus = runner.enqueue("job-1")
+    with pytest.raises(DomainError, match="切换标注引擎"):
+        runner.enqueue("job-1", engine="flora")
+    assert runner.store.get("annotation", argus["id"])["engine"] == "argus"
+
+
+def test_api_accepts_flora_engine_without_argus_credentials(service, monkeypatch):
+    runner, _store, _src, data = service
+    enable_flora(runner, data)
+    monkeypatch.delenv("PIPELINE_ARGUS_API_KEY", raising=False)
+    monkeypatch.delenv("OPENROUTER_API_KEYS", raising=False)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    app = create_app(runner.settings, background=False)
+    app.state.annotations = runner
+    headers = {"Authorization": "Bearer " + runner.settings.token}
+
+    with TestClient(app) as http:
+        response = http.post(
+            "/api/annotations",
+            headers=headers,
+            json={"job_id": "job-1", "engine": "flora"},
+        )
+    assert response.status_code == 202, response.text
+    assert response.json()["engine"] == "flora"
+    assert response.json()["cap_usd"] == 0
+
+
+def test_flora_run_merges_slice_time_into_one_episode_result(
+    service, monkeypatch
+):
+    runner, store, _src, data = service
+    enable_flora(runner, data)
+    row = runner.enqueue("job-1", engine="flora")
+    prepared = data.parent / "prepared-main.mp4"
+    prepared.write_bytes(b"video")
+
+    cameras = {
+        "main": flora_media_worker.CameraClip(prepared, 0, 3),
+    }
+    episode = flora_media_worker.EpisodeMedia(
+        episode_id="episode_000000",
+        episode_index=0,
+        duration_s=3,
+        cameras=cameras,
+    )
+    slices = [
+        {
+            "id": "episode_000000_slice_000",
+            "episode_id": episode.episode_id,
+            "episode_index": 0,
+            "slice_index": 0,
+            "offset_s": 2.5,
+            "duration_s": 0.5,
+            "main": str(prepared),
+        }
+    ]
+    monkeypatch.setattr(
+        flora_media_worker,
+        "load_episode_manifest",
+        lambda *args, **kwargs: [episode],
+    )
+    monkeypatch.setattr(
+        flora_media_worker,
+        "prepare_episode_slices",
+        lambda *args, **kwargs: slices,
+    )
+
+    def fake_command(_settings, _annotation, media, work):
+        output = work / f"{media['id']}.result.json"
+        code = (
+            "import json, pathlib; "
+            f"pathlib.Path({str(output)!r}).write_text(json.dumps({{"
+            "'duration_s': 0.5, 'segments': [{'start_s': 0.25, "
+            "'end_s': 0.5, 'caption': 'Pick up the cup.', "
+            "'status': 'complete'}]}))"
+        )
+        return [sys.executable, "-c", code]
+
+    monkeypatch.setattr(flora_annotation, "command", fake_command)
+    finished = runner.run(row)
+    assert finished["state"] == "COMPLETED"
+    assert finished["episodes_done"] == 1
+    detail = runner.episode(finished["id"], "episode_000000")
+    assert [segment["start_s"] for segment in detail["segments"]] == [2.75]
+    assert detail["segments"][0]["caption"] == "Pick up the cup."
+    assert finished["cost_usd"] == 0
+    exported = runner.export(finished["id"])
+    assert exported["annotation"]["engine"] == "flora"
+    assert exported["episodes"][0]["segments"][0]["caption"] == (
+        "Pick up the cup."
+    )
+    assert "argus" not in exported
+
+
+def test_flora_resume_needs_neither_argus_credentials_nor_usd_budget(
+    service, monkeypatch
+):
+    runner, _store, _src, data = service
+    enable_flora(runner, data)
+    monkeypatch.delenv("PIPELINE_ARGUS_API_KEY", raising=False)
+    monkeypatch.delenv("OPENROUTER_API_KEYS", raising=False)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    row = runner.enqueue("job-1", engine="flora")
+    runner.cancel(row["id"])
+    resumed = runner.resume(row["id"])
+    assert resumed["state"] == "QUEUED"
+    assert resumed["engine"] == "flora"
+    assert resumed["id"] not in runner.credentials
+
+
+def test_flora_resume_skips_completed_episode_sidecars(service, monkeypatch):
+    runner, _store, _src, data = service
+    enable_flora(runner, data)
+    row = runner.enqueue("job-1", engine="flora")
+    work = runner.work(row)
+    work.mkdir(parents=True, exist_ok=True)
+    completed = flora_annotation.normalize_result(
+        {
+            "duration_s": 1,
+            "segments": [
+                {
+                    "start_s": 0,
+                    "end_s": 1,
+                    "caption": "Already complete.",
+                    "status": "complete",
+                }
+            ],
+        },
+        "episode_000000",
+    )
+    (work / "episode_000000.result.json").write_text(json.dumps(completed))
+    prepared = data.parent / "prepared.mp4"
+    prepared.write_bytes(b"video")
+    episodes = [
+        flora_media_worker.EpisodeMedia(
+            episode_id=f"episode_{index:06d}",
+            episode_index=index,
+            duration_s=1,
+            cameras={
+                "main": flora_media_worker.CameraClip(prepared, 0, 1),
+            },
+        )
+        for index in range(2)
+    ]
+    monkeypatch.setattr(
+        flora_media_worker,
+        "load_episode_manifest",
+        lambda *args, **kwargs: episodes,
+    )
+    monkeypatch.setattr(
+        flora_media_worker,
+        "prepare_episode_slices",
+        lambda episode, *_args, **_kwargs: [
+            {
+                "id": f"{episode.episode_id}_slice_000",
+                "episode_id": episode.episode_id,
+                "episode_index": episode.episode_index,
+                "slice_index": 0,
+                "offset_s": 0,
+                "duration_s": 1,
+                "main": str(prepared),
+            }
+        ],
+    )
+    invoked = []
+
+    def fake_command(_settings, _annotation, media, target):
+        invoked.append(media["episode_id"])
+        output = target / f"{media['id']}.result.json"
+        output.write_text(
+            json.dumps(
+                {
+                    "duration_s": 1,
+                    "segments": [
+                        {
+                            "start_s": 0,
+                            "end_s": 1,
+                            "caption": "New result.",
+                            "status": "complete",
+                        }
+                    ],
+                }
+            )
+        )
+        return [sys.executable, "-c", "pass"]
+
+    monkeypatch.setattr(flora_annotation, "command", fake_command)
+    finished = runner.run(row)
+    assert invoked == ["episode_000001"]
+    assert finished["state"] == "COMPLETED"
+    assert [item["episode_id"] for item in runner.episodes(row["id"])] == [
+        "episode_000000",
+        "episode_000001",
+    ]
+
+
+def test_flora_resume_reruns_episode_with_incomplete_segments(
+    service, monkeypatch
+):
+    runner, _store, _src, data = service
+    enable_flora(runner, data)
+    row = runner.enqueue("job-1", engine="flora")
+    work = runner.work(row)
+    work.mkdir(parents=True, exist_ok=True)
+    (work / "episode_000000.result.json").write_text(
+        json.dumps(
+            {
+                "duration_s": 1,
+                "segments": [
+                    {
+                        "start_s": 0,
+                        "end_s": 0.5,
+                        "caption": "Keep this until retry completes.",
+                        "status": "complete",
+                    },
+                    {
+                        "start_s": 0.5,
+                        "end_s": 1,
+                        "caption": "",
+                        "status": "caption_failed",
+                    },
+                ],
+            }
+        )
+    )
+    prepared = data.parent / "prepared-incomplete.mp4"
+    prepared.write_bytes(b"video")
+    episode = flora_media_worker.EpisodeMedia(
+        episode_id="episode_000000",
+        episode_index=0,
+        duration_s=1,
+        cameras={
+            "main": flora_media_worker.CameraClip(prepared, 0, 1),
+        },
+    )
+    monkeypatch.setattr(
+        flora_media_worker,
+        "load_episode_manifest",
+        lambda *args, **kwargs: [episode],
+    )
+    monkeypatch.setattr(
+        flora_media_worker,
+        "prepare_episode_slices",
+        lambda *_args, **_kwargs: [
+            {
+                "id": "episode_000000_slice_000",
+                "episode_id": "episode_000000",
+                "episode_index": 0,
+                "slice_index": 0,
+                "offset_s": 0,
+                "duration_s": 1,
+                "main": str(prepared),
+            }
+        ],
+    )
+    invoked = []
+
+    def fake_command(_settings, _annotation, media, target):
+        invoked.append(media["episode_id"])
+        (target / f"{media['id']}.result.json").write_text(
+            json.dumps(
+                {
+                    "duration_s": 1,
+                    "segments": [
+                        {
+                            "start_s": 0,
+                            "end_s": 1,
+                            "caption": "Retry completed.",
+                            "status": "complete",
+                        }
+                    ],
+                }
+            )
+        )
+        return [sys.executable, "-c", "pass"]
+
+    monkeypatch.setattr(flora_annotation, "command", fake_command)
+    finished = runner.run(row)
+    assert invoked == ["episode_000000"]
+    assert finished["state"] == "COMPLETED"
+    segment = runner.episode(row["id"], "episode_000000")["segments"][0]
+    assert segment["caption"] == "Retry completed."
+
+
+def test_flora_cancel_terminates_the_active_slurm_process(service, monkeypatch):
+    runner, store, _src, data = service
+    enable_flora(runner, data)
+    row = runner.enqueue("job-1", engine="flora")
+    prepared = data.parent / "prepared-cancel.mp4"
+    prepared.write_bytes(b"video")
+    episode = flora_media_worker.EpisodeMedia(
+        episode_id="episode_000000",
+        episode_index=0,
+        duration_s=1,
+        cameras={
+            "main": flora_media_worker.CameraClip(prepared, 0, 1),
+        },
+    )
+    monkeypatch.setattr(
+        flora_media_worker,
+        "load_episode_manifest",
+        lambda *args, **kwargs: [episode],
+    )
+    monkeypatch.setattr(
+        flora_media_worker,
+        "prepare_episode_slices",
+        lambda *_args, **_kwargs: [
+            {
+                "id": "episode_000000_slice_000",
+                "episode_id": episode.episode_id,
+                "episode_index": 0,
+                "slice_index": 0,
+                "offset_s": 0,
+                "duration_s": 1,
+                "main": str(prepared),
+            }
+        ],
+    )
+    monkeypatch.setattr(
+        flora_annotation,
+        "command",
+        lambda *_args, **_kwargs: [
+            sys.executable,
+            "-c",
+            "import time; time.sleep(60)",
+        ],
+    )
+    thread = threading.Thread(target=runner.run, args=(row,), daemon=True)
+    thread.start()
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        current = store.get("annotation", row["id"])
+        if current["stage"] == "Flora 推理":
+            break
+        time.sleep(0.02)
+    runner.cancel(row["id"])
+    thread.join(timeout=10)
+    assert not thread.is_alive()
+    assert store.get("annotation", row["id"])["state"] == "CANCELLED"
 
 
 def test_options_never_default_to_a_model_outside_the_allowlist(service):
@@ -1097,6 +1502,17 @@ def test_api_model_list_returns_gateway_catalogue(service, monkeypatch):
             "base_url": "https://gateway.example/v1",
         }
         assert "api-secret" not in response.text
+
+
+def test_web_annotation_form_exposes_both_engines_and_sends_selection():
+    root = Path(__file__).parents[1]
+    html = (root / "pipeline/web/index.html").read_text()
+    script = (root / "pipeline/web/annotations.js").read_text()
+    assert 'id="annotation-engine"' in html
+    assert 'value="argus"' in html and 'value="flora"' in html
+    assert "data-annotation-argus-only" in html
+    assert 'const body = { job_id: jobId, engine };' in script
+    assert 'node.hidden = !argus;' in script
 
 
 def test_unavailable_toolchain_disables_enqueue(settings_factory, tmp_path):

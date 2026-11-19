@@ -191,6 +191,57 @@ def test_plan_reports_coverage_vocabulary_and_skips(subtask_app):
     assert plan["unannotated_text"] == UNANNOTATED_TEXT
 
 
+def test_plan_accepts_flora_caption_segments(subtask_app):
+    seed_job(subtask_app)
+    settings = subtask_app.state.runner.settings
+    store = subtask_app.state.runner.store
+    job = store.get("job", "source")
+    work = settings.root / "annotations" / "flora-ann"
+    work.mkdir(parents=True)
+    (work / "episode_000000.result.json").write_text(
+        json.dumps(
+            {
+                "duration_s": 0.6,
+                "segments": [
+                    {
+                        "start_s": 0.0,
+                        "end_s": 0.3,
+                        "caption": "Pick up the cup.",
+                        "status": "complete",
+                    },
+                    {
+                        "start_s": 0.3,
+                        "end_s": 0.6,
+                        "caption": "Caption failed.",
+                        "status": "caption_failed",
+                    },
+                ],
+            }
+        )
+    )
+    row = {
+        "id": "flora-ann",
+        "job_id": job["id"],
+        "dataset_name": job["dataset_name"],
+        "dataset_path": str(dataset_for_job(settings, job)),
+        "engine": "flora",
+        "robot_type": job["robot_type"],
+        "state": "COMPLETED",
+        "work_path": str(work),
+        "episodes_done": 1,
+    }
+    store.put("annotation", row["id"], row)
+
+    plan = build_plan(settings, row)
+    assert plan["coverage"]["annotated_episodes"] == 1
+    assert plan["coverage"]["labelled_frames"] == 3
+    assert plan["vocabulary"] == [
+        {"subtask": "Pick up the cup.", "subtask_index": 0}
+    ]
+    assert plan["episodes"][0]["episode_index"] == 0
+    assert plan["episodes"][0]["segments"] == [[0, 3, 0]]
+
+
 def test_plan_skips_failed_labels_and_unknown_episodes(subtask_app):
     seed_job(subtask_app)
     row = seed_annotation(subtask_app, episodes={})

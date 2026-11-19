@@ -369,6 +369,9 @@ class Settings:
             "enabled",
             "src",
             "python",
+            "srun",
+            "ffmpeg",
+            "ffprobe",
             "model_cache",
             "hf_home",
             "partition",
@@ -382,7 +385,16 @@ class Settings:
             raise ValueError(f"flora 包含未知字段：{', '.join(sorted(unknown))}")
         if not isinstance(self.flora.get("enabled", False), bool):
             raise ValueError("flora.enabled 必须为布尔值")
-        for key in ("src", "python", "model_cache", "hf_home", "partition"):
+        for key in (
+            "src",
+            "python",
+            "srun",
+            "ffmpeg",
+            "ffprobe",
+            "model_cache",
+            "hf_home",
+            "partition",
+        ):
             if key in self.flora and not isinstance(self.flora[key], str):
                 raise ValueError(f"flora.{key} 必须是字符串")
         for key, default, low, high in (

@@ -18,6 +18,8 @@ class AnnotationBackend(Protocol):
 
     def available(self, settings) -> tuple[bool, str]: ...
 
+    def results(self, work) -> dict[str, dict]: ...
+
 
 class ArgusBackend:
     id = "argus"
@@ -27,6 +29,7 @@ class ArgusBackend:
         return argus_annotation.available(settings)
 
     outputs = staticmethod(argus_annotation.outputs)
+    results = staticmethod(argus_annotation.episode_results)
     episode = staticmethod(argus_annotation.episode)
     clips = staticmethod(argus_annotation.clips)
     clip = staticmethod(argus_annotation.clip)
@@ -45,6 +48,7 @@ class FloraBackend:
         return flora_annotation.available(settings)
 
     outputs = staticmethod(flora_annotation.outputs)
+    results = staticmethod(flora_annotation.results)
     episode = staticmethod(flora_annotation.episode)
     clips = staticmethod(flora_annotation.clips)
     clip = staticmethod(flora_annotation.clip)

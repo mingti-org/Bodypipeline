@@ -1,10 +1,11 @@
-"""Export an Argus annotation as an independent LeRobot dataset with subtasks.
+"""Export an annotation as an independent LeRobot dataset with subtasks.
 
-Argus labels each arm's steps in seconds; a LeRobot frame carries exactly one
-``subtask_index``.  This module turns the two arm timelines into one
-non-overlapping, gap-aware frame sequence, keeps the vocabulary stable across
-the whole dataset, and drives the copy / conversion / patch / verify pipeline
-that publishes the result as a separately registered dataset.
+Argus emits arm timelines and Flora emits caption segments, both with second
+timestamps. A LeRobot frame carries exactly one ``subtask_index``. This module
+turns either result shape into one non-overlapping, gap-aware frame sequence,
+keeps the vocabulary stable across the whole dataset, and drives the copy /
+conversion / patch / verify pipeline that publishes the result as a separately
+registered dataset.
 
 Planning is pure Python: the frame ranges are derived from the episode's own
 frame count and FPS, so the page can show the coverage before any Parquet file
@@ -28,6 +29,7 @@ from pipeline.shared.core import DomainError, atomic_json, digest, executable_pa
 from pipeline.shared.identity import Principal
 
 from . import argus_annotation
+from .annotation_backends import backend_for
 from .datasets import TARGET_FORMATS, dataset_for_job
 from .merges import source_snapshot
 from .recycle import dataset_lock
@@ -100,6 +102,9 @@ def _contexts(work: Path) -> dict[str, dict]:
 
 
 def _segment_text(event: dict) -> str:
+    caption = str(event.get("caption") or "").strip()
+    if caption:
+        return caption[:MAX_SEGMENT_TEXT]
     verb = str(event.get("verb_class") or "").strip()
     obj = str(event.get("object") or "").strip()
     if not obj or obj.lower() in verb.lower():
@@ -125,12 +130,19 @@ def _segment_text(event: dict) -> str:
 
 def _events(data: dict) -> list[dict]:
     labels = data.get("labels") if isinstance(data.get("labels"), dict) else {}
-    timeline = data.get("event_labels") or labels.get("timeline") or []
+    timeline = (
+        data.get("event_labels")
+        or labels.get("timeline")
+        or data.get("segments")
+        or []
+    )
     rows = []
     for order, event in enumerate(timeline if isinstance(timeline, list) else []):
         if not isinstance(event, dict):
             continue
-        start = _number(event.get("t_s"))
+        if str(event.get("status") or "complete").strip() != "complete":
+            continue
+        start = _number(event.get("t_s", event.get("start_s")))
         if start is None:
             continue
         rows.append(
@@ -237,6 +249,8 @@ def _episode_index(episode_id: str, context: dict) -> tuple[int | None, str]:
 
 
 def _labels_available(data: dict) -> bool:
+    if isinstance(data.get("labels_available"), bool):
+        return data["labels_available"]
     return argus_annotation.labels_available(data)
 
 
@@ -248,7 +262,7 @@ def build_plan(settings, row) -> dict:
     """
 
     work = annotation_work(settings, row)
-    payloads = argus_annotation.episode_results(work)
+    payloads = backend_for(row).results(work)
     contexts = _contexts(work)
     dataset = _read_json(Path(row["dataset_path"]) / "meta/info.json")
     total_episodes = dataset.get("total_episodes")
