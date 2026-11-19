@@ -51,6 +51,30 @@ if [[ ! -x "$FLORA_PYTHON" ]]; then
   exit 1
 fi
 
+FLORA_TEMPSEG_MODEL="$FLORA_TEMPSEG_MODEL" \
+FLORA_CAPTIONER_MODEL="$FLORA_CAPTIONER_MODEL" \
+  "$FLORA_PYTHON" - <<'PY'
+import os
+from pathlib import Path
+
+before = "use_cache=True, max_time=300)"
+after = (
+    'use_cache=True, max_time=int('
+    'os.environ.get("FLORA_GENERATION_MAX_SECONDS", "900")))'
+)
+for variable in ("FLORA_TEMPSEG_MODEL", "FLORA_CAPTIONER_MODEL"):
+    root = Path(os.environ[variable])
+    path = root / "batch_utils/models.py"
+    if not path.is_file():
+        continue
+    text = path.read_text()
+    if after in text:
+        continue
+    if before not in text:
+        raise SystemExit(f"Unsupported Flora generation timeout in {path}")
+    path.write_text(text.replace(before, after))
+PY
+
 link_model_repository() {
   local kind="$1"
   local source="$2"
