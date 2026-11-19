@@ -103,6 +103,15 @@ def test_availability_reports_incomplete_model_cache(tmp_path, settings_factory)
     assert "tempseg_base" in reason
 
 
+def test_availability_accepts_a_peft_adapter_repository(tmp_path, settings_factory):
+    settings = flora_settings(settings_factory, tmp_path)
+    tempseg = tmp_path / "models/tempseg"
+    (tempseg / "config.json").unlink()
+    (tempseg / "adapter_config.json").write_text("{}")
+
+    assert flora_annotation.available(settings) == (True, "")
+
+
 def test_command_runs_one_three_camera_episode_on_one_slurm_gpu(
     tmp_path, settings_factory
 ):

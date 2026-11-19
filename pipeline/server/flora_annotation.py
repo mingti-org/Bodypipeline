@@ -43,7 +43,10 @@ def infer_script(settings) -> Path:
 
 
 def _model_directory_ready(path: Path) -> bool:
-    return (path / "config.json").is_file() and any(path.glob("*.safetensors"))
+    has_config = (path / "config.json").is_file() or (
+        path / "adapter_config.json"
+    ).is_file()
+    return has_config and any(path.glob("*.safetensors"))
 
 
 def _base_model_ready(settings, model_cache: Path) -> bool:

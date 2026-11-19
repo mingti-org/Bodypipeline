@@ -8,12 +8,13 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 FLORA_ROOT="${FLORA_ROOT:-$ROOT/.runtime/flora}"
-FLORA_SRC="${FLORA_SRC:-/workspace/flora/Flora-TempSeg}"
+FLORA_SRC="${FLORA_SRC:-/workspace/flora/Flora-Captioner}"
 FLORA_PYTHON="${FLORA_PYTHON:-/workspace/flora/.venv-annotation/bin/python}"
 FLORA_MODEL_CACHE="${FLORA_MODEL_CACHE:-/workspace/flora/models}"
 FLORA_HF_HOME="${FLORA_HF_HOME:-/workspace/flora/huggingface}"
 FLORA_TEMPSEG_MODEL="${FLORA_TEMPSEG_MODEL:-$FLORA_SRC}"
 FLORA_CAPTIONER_MODEL="${FLORA_CAPTIONER_MODEL:-/workspace/flora/Flora-Captioner}"
+FLORA_TEMPSEG_BASE_MODEL="${FLORA_TEMPSEG_BASE_MODEL:-$FLORA_HF_HOME/hub/models--Qwen--Qwen3.5-9B/snapshots/c202236235762e1c871ad0ccb60c8ee5ba337b9a}"
 FLORA_REV="${FLORA_REV:-d8b755e}"
 
 if [[ ! -f "$FLORA_SRC/captioner/infer.py" && ! -f "$FLORA_SRC/infer.py" ]]; then
@@ -33,8 +34,15 @@ if [[ "${FLORA_CREATE_ENV:-0}" == "1" && ! -x "$FLORA_PYTHON" ]]; then
   "$FLORA_PYTHON" -m pip install \
     torch==2.11.0 torchvision==0.26.0 \
     --index-url https://download.pytorch.org/whl/cu128
-  "$FLORA_PYTHON" -m pip install \
-    -r "$FLORA_SRC/captioner/batch_utils/requirements.txt"
+  requirements="$FLORA_SRC/captioner/batch_utils/requirements.txt"
+  if [[ ! -f "$requirements" ]]; then
+    requirements="$FLORA_SRC/batch_utils/requirements.txt"
+  fi
+  if [[ ! -f "$requirements" ]]; then
+    echo "Flora batch requirements are missing under: $FLORA_SRC" >&2
+    exit 1
+  fi
+  "$FLORA_PYTHON" -m pip install -r "$requirements"
 fi
 
 if [[ ! -x "$FLORA_PYTHON" ]]; then
@@ -47,9 +55,9 @@ link_model_repository() {
   local kind="$1"
   local source="$2"
   local target="$FLORA_MODEL_CACHE/$kind"
-  if [[ ! -f "$source/config.json" ]] ||
+  if [[ ! -f "$source/config.json" && ! -f "$source/adapter_config.json" ]] ||
     ! compgen -G "$source/*.safetensors" >/dev/null; then
-    echo "Model repository is missing config or safetensors: $source" >&2
+    echo "Model repository is missing model config or safetensors: $source" >&2
     return 1
   fi
   if [[ -e "$target" || -L "$target" ]]; then
@@ -64,6 +72,11 @@ if [[ "${FLORA_LINK_MODELS:-0}" == "1" ]]; then
   mkdir -p "$FLORA_MODEL_CACHE"
   link_model_repository tempseg "$FLORA_TEMPSEG_MODEL"
   link_model_repository captioner "$FLORA_CAPTIONER_MODEL"
+  if [[ -d "$FLORA_TEMPSEG_BASE_MODEL" ]]; then
+    if [[ ! -e "$FLORA_MODEL_CACHE/tempseg_base" && ! -L "$FLORA_MODEL_CACHE/tempseg_base" ]]; then
+      ln -s "$(cd "$FLORA_TEMPSEG_BASE_MODEL" && pwd -P)" "$FLORA_MODEL_CACHE/tempseg_base"
+    fi
+  fi
 fi
 
 if [[ "${FLORA_SKIP_SYSTEM_CHECK:-0}" != "1" ]]; then
@@ -97,8 +110,8 @@ if [[ "${FLORA_SKIP_MODEL_CHECK:-0}" != "1" ]]; then
       missing=1
       continue
     fi
-    if [[ ! -f "$directory/config.json" ]]; then
-      echo "Missing config.json in model cache: $directory" >&2
+    if [[ ! -f "$directory/config.json" && ! -f "$directory/adapter_config.json" ]]; then
+      echo "Missing model config in model cache: $directory" >&2
       missing=1
     fi
     if ! compgen -G "$directory/*.safetensors" >/dev/null; then

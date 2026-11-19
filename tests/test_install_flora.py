@@ -122,6 +122,23 @@ def test_installer_links_preexisting_model_repository_directories(tmp_path):
     ).resolve()
 
 
+def test_installer_links_peft_and_verified_qwen_base_directories(tmp_path):
+    completed = run_installer(
+        tmp_path,
+        base_in_hf_cache=True,
+        link_models=True,
+        model_repository_root=True,
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert (tmp_path / "models/tempseg").is_symlink()
+    assert (tmp_path / "models/tempseg_base").is_symlink()
+    assert (tmp_path / "models/tempseg_base").resolve() == (
+        tmp_path
+        / "hf/hub/models--Qwen--Qwen3.5-9B/snapshots/"
+        "c202236235762e1c871ad0ccb60c8ee5ba337b9a"
+    ).resolve()
+
+
 def test_installer_rejects_incomplete_model_cache(tmp_path):
     models = tmp_path / "models"
     for kind in ("tempseg", "captioner", "tempseg_base"):
