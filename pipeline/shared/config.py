@@ -407,6 +407,22 @@ class Settings:
                 raise ValueError(
                     f"flora.profiles[{provider!r}].yam32 必须为布尔值"
                 )
+            camera_roles = spec.get("camera_roles", {})
+            if not isinstance(camera_roles, dict):
+                raise ValueError(
+                    f"flora.profiles[{provider!r}].camera_roles 必须是对象"
+                )
+            if set(camera_roles) - {"main", "left_wrist", "right_wrist"}:
+                raise ValueError(
+                    f"flora.profiles[{provider!r}].camera_roles 包含未知角色"
+                )
+            if not all(
+                isinstance(role, str) and isinstance(camera, str) and camera
+                for role, camera in camera_roles.items()
+            ):
+                raise ValueError(
+                    f"flora.profiles[{provider!r}].camera_roles 包含无效相机"
+                )
 
     def _validate_runtime_configuration(self):
         if not isinstance(self.profiles, dict):
