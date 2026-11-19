@@ -29,7 +29,7 @@ from .datasets import dataset_for_job
 from .merges import source_snapshot
 from .providers import get_provider
 from .providers.base import ANNOTATION_RIGS
-from .storage import data_directory, storage_path
+from .storage import data_directory, share_data_tree, storage_path
 from .task_annotations import TemplateLibrary
 from .template_annotation import SPEC_NAME, retry_manifest
 
@@ -825,7 +825,22 @@ class AnnotationRunner:
                 cancel_requested=False,
             )
         if row.get("engine") == "flora":
-            return self._run_flora(row, event)
+            try:
+                if self.runner is None:
+                    return self._run_flora(row, event)
+                with self.runner.bind_record_session(row):
+                    return self._run_flora(row, event)
+            except Exception as exc:
+                self.cancel_events.pop(row["id"], None)
+                self._running = False
+                return self.save(
+                    row,
+                    state=FAILED,
+                    stage="标注失败",
+                    error=str(exc),
+                    finished_at=now(),
+                    cancel_requested=False,
+                )
         work = storage_path(self.settings, row, "annotations", row["id"])
         log = work / "logs/run.log"
         state = RUNNING
@@ -1146,6 +1161,7 @@ class AnnotationRunner:
                     ffmpeg=str(self.settings.flora.get("ffmpeg") or "ffmpeg"),
                     ffprobe=str(self.settings.flora.get("ffprobe") or "ffprobe"),
                 )
+                share_data_tree(work)
                 segments = []
                 revisions = {}
                 profile = None
@@ -1176,7 +1192,12 @@ class AnnotationRunner:
                             ).encode()
                         )
                         out.flush()
-                        process = subprocess.Popen(
+                        popen = (
+                            self.runner._popen
+                            if self.runner is not None
+                            else subprocess.Popen
+                        )
+                        process = popen(
                             argv,
                             stdout=out,
                             stderr=subprocess.STDOUT,
@@ -1184,6 +1205,7 @@ class AnnotationRunner:
                             start_new_session=True,
                             cwd=source,
                             env=env,
+                            **({"remote_env": env} if self.runner is not None else {}),
                         )
                         deadline = time.monotonic() + timeout
                         while process.poll() is None:
@@ -1318,6 +1340,13 @@ class AnnotationRunner:
                 work_path=str(work),
             )
         finally:
+            if self.runner is not None:
+                try:
+                    self.runner._share_user_work(work)
+                except Exception:
+                    # Preserve the primary inference error; a failed publish is
+                    # still visible when a later export or cleanup needs access.
+                    pass
             self.cancel_events.pop(row["id"], None)
             with self.lock:
                 self._running = False

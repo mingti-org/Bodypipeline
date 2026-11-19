@@ -2,10 +2,12 @@
 
 import io
 import json
+import subprocess
 import sys
 import threading
 import time
 import urllib.error
+from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
@@ -310,9 +312,29 @@ def test_flora_run_merges_slice_time_into_one_episode_result(
         )
         return [sys.executable, "-c", code]
 
+    class SessionRunner:
+        def __init__(self):
+            self.bound = []
+            self.remote_env = None
+            self.published = []
+
+        @contextmanager
+        def bind_record_session(self, annotation):
+            self.bound.append(annotation["id"])
+            yield object()
+
+        def _popen(self, argv, *, remote_env=None, **kwargs):
+            self.remote_env = remote_env
+            return subprocess.Popen(argv, **kwargs)
+
+        def _share_user_work(self, work):
+            self.published.append(work)
+
+    session_runner = SessionRunner()
+    runner.runner = session_runner
     monkeypatch.setattr(flora_annotation, "command", fake_command)
     finished = runner.run(row)
-    assert finished["state"] == "COMPLETED"
+    assert finished["state"] == "COMPLETED", finished.get("error")
     assert finished["episodes_done"] == 1
     detail = runner.episode(finished["id"], "episode_000000")
     assert [segment["start_s"] for segment in detail["segments"]] == [2.75]
@@ -324,6 +346,11 @@ def test_flora_run_merges_slice_time_into_one_episode_result(
         "Pick up the cup."
     )
     assert "argus" not in exported
+    assert session_runner.bound == [row["id"]]
+    assert session_runner.remote_env["FLORA_MODEL_CACHE"] == str(
+        data.parent / "flora-models"
+    )
+    assert session_runner.published == [runner.work(row)]
 
 
 def test_flora_resume_needs_neither_argus_credentials_nor_usd_budget(
@@ -420,7 +447,9 @@ def test_flora_resume_skips_completed_episode_sidecars(service, monkeypatch):
 
     monkeypatch.setattr(flora_annotation, "command", fake_command)
     finished = runner.run(row)
-    assert invoked == ["episode_000001"]
+    assert invoked == ["episode_000001"], runner.store.get(
+        "annotation", row["id"]
+    ).get("error")
     assert finished["state"] == "COMPLETED"
     assert [item["episode_id"] for item in runner.episodes(row["id"])] == [
         "episode_000000",
@@ -510,7 +539,9 @@ def test_flora_resume_reruns_episode_with_incomplete_segments(
 
     monkeypatch.setattr(flora_annotation, "command", fake_command)
     finished = runner.run(row)
-    assert invoked == ["episode_000000"]
+    assert invoked == ["episode_000000"], runner.store.get(
+        "annotation", row["id"]
+    ).get("error")
     assert finished["state"] == "COMPLETED"
     segment = runner.episode(row["id"], "episode_000000")["segments"][0]
     assert segment["caption"] == "Retry completed."
