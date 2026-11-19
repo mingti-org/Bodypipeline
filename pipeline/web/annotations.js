@@ -1,7 +1,7 @@
 "use strict";
-// Automatic annotation page: create Argus review tasks over registered datasets,
-// follow their progress and inspect per-episode labels. Everything robot-specific
-// arrives from the server's Provider/Profile, never from this page.
+// Automatic annotation page: create Argus or local Flora tasks over registered
+// datasets, follow their progress and inspect per-episode labels. Everything
+// robot-specific arrives from the server's Provider/Profile, never this page.
 (() => {
   const $ = (id) => document.getElementById(id);
   const ACTIVE = new Set(["QUEUED", "RUNNING"]);
@@ -30,6 +30,10 @@
     partial: "部分完成",
     failure: "未完成",
     unclear: "无法判断",
+  };
+  const ENGINE_LABELS = {
+    argus: "Argus 云端",
+    flora: "Flora 本地",
   };
   const panel = $("annotation-list")?.closest("[data-server-panel]");
   if (!panel) return;
@@ -89,6 +93,18 @@
   function selectedCandidate() {
     return candidates.find((item) => item.job_id === $("annotation-dataset").value) || null;
   }
+  function selectedEngine() {
+    return $("annotation-engine")?.value || options?.default_engine || "argus";
+  }
+  function engineConfig(id = selectedEngine()) {
+    return options?.engines?.[id] || { id, available: false, reason: "引擎未配置" };
+  }
+  function engineLabel(id) {
+    return options?.engines?.[id]?.label || ENGINE_LABELS[id] || id || "—";
+  }
+  function anyEngineAvailable() {
+    return Object.values(options?.engines || {}).some((item) => item?.available);
+  }
 
   function renderTemplates() {
     const select = $("annotation-template");
@@ -131,7 +147,7 @@
   }
 
   function canFetchModels() {
-    if (!options?.available) return false;
+    if (selectedEngine() !== "argus" || !engineConfig("argus").available) return false;
     const { baseUrl, apiKey } = modelInputs();
     return Boolean(
       (baseUrl || options.gateway_configured) &&
@@ -145,7 +161,7 @@
 
   function updateModelControls() {
     const button = $("annotation-model-refresh");
-    const enabled = Boolean(options?.available) && canFetchModels() && !modelFetching;
+    const enabled = canFetchModels() && !modelFetching;
     button.disabled = !enabled;
     button.textContent = modelFetching ? "正在获取…" : "获取模型列表";
     updateSubmit();
@@ -253,7 +269,7 @@
     clearTimeout(modelFetchTimer);
     modelFetchTimer = null;
     updateModelControls();
-    if (!options?.available) return;
+    if (selectedEngine() !== "argus" || !engineConfig("argus").available) return;
     const { baseUrl, apiKey } = modelInputs();
     if (!(baseUrl || options.gateway_configured) || !(apiKey || options.api_key_configured)) {
       setModelStatus("填写 baseURL 与 API Key 后自动获取网关模型；未填写时使用服务器允许列表。");
@@ -278,6 +294,10 @@
 
   function bind() {
     $("annotation-form").addEventListener("submit", submit);
+    $("annotation-engine").addEventListener("change", () => {
+      capTouched = false;
+      applyEngineState();
+    });
     $("annotation-template").addEventListener("change", () => {
       templateChoiceInitialized = true;
       renderTemplateSummary();
@@ -351,7 +371,7 @@
       }
       const resume = event.target.closest("[data-annotation-resume]");
       if (resume) {
-        openResume(resume.dataset.annotationResume);
+        void openResume(resume.dataset.annotationResume);
         return;
       }
       if (event.target.closest("[data-annotation-reload]")) {
@@ -432,8 +452,9 @@
     }
   }
 
-  function setFormEnabled(enabled) {
+  function disableForm() {
     [
+      "annotation-engine",
       "annotation-dataset",
       "annotation-template",
       "annotation-model",
@@ -448,14 +469,93 @@
       "annotation-field-dictionary",
       "annotation-note",
     ].forEach((id) => {
-      $(id).disabled = !enabled;
+      $(id).disabled = true;
     });
+    $("annotation-template-refresh").disabled = true;
     updateSubmit();
     updateModelControls();
   }
 
+  function renderEngineOptions() {
+    const select = $("annotation-engine");
+    const previous = select.value;
+    const entries = Object.values(options?.engines || {});
+    select.innerHTML = entries
+      .map((item) => {
+        const reason = item.available ? "" : " · 未就绪";
+        return `<option value="${esc(item.id)}">${esc(item.label || engineLabel(item.id))}${esc(reason)}</option>`;
+      })
+      .join("");
+    const ids = entries.map((item) => item.id);
+    const fallback = ids.includes(options?.default_engine)
+      ? options.default_engine
+      : entries.find((item) => item.available)?.id || ids[0] || "argus";
+    select.value = ids.includes(previous) ? previous : fallback;
+    select.disabled = entries.length === 0;
+  }
+
+  function applyEngineState() {
+    if (!options) {
+      disableForm();
+      return;
+    }
+    const engine = selectedEngine();
+    const config = engineConfig(engine);
+    const argus = engine === "argus";
+    const ready = Boolean(config.available);
+    $("annotation-engine").disabled = !Object.keys(options.engines || {}).length;
+    $("annotation-dataset").disabled = !ready;
+    $("annotation-note").disabled = !ready;
+    document.querySelectorAll("[data-annotation-argus-only]").forEach((node) => {
+      node.hidden = !argus;
+    });
+    [
+      "annotation-template",
+      "annotation-model",
+      "annotation-base-url",
+      "annotation-api-key",
+      "annotation-cap",
+      "annotation-concurrency",
+      "annotation-reasoning",
+      "annotation-inspection",
+      "annotation-sample-fps",
+      "annotation-max-tokens",
+      "annotation-field-dictionary",
+    ].forEach((id) => {
+      $(id).disabled = !argus || !ready;
+    });
+    $("annotation-template-refresh").disabled = !argus || !ready;
+    $("annotation-api-key").required = argus && !options.api_key_configured;
+    $("annotation-api-key-required").hidden =
+      !argus || Boolean(options.api_key_configured);
+    $("annotation-engine-summary").textContent = argus
+      ? "Argus 使用模型网关生成自由分析或固定模板初稿，费用受本次上限和每日预算约束。"
+      : "Flora 在本机 Slurm GPU 上运行 TempSeg + Captioner；首期仅使用自由字幕 Segment，不使用共享模板。";
+    $("annotation-engine-status").textContent = ready
+      ? (argus
+          ? "云端网关已配置；提交时再校验本次凭据和模型单价。"
+          : "本地执行环境已就绪；每个 Episode 使用独立的 Slurm GPU 分配。")
+      : (config.reason || "当前引擎未就绪");
+    const box = $("annotation-unavailable");
+    box.hidden = ready;
+    if (!ready) {
+      box.textContent = `${engineLabel(engine)}暂不可用：${config.reason || "部署配置不完整"}`;
+    }
+    $("annotation-help").textContent = !ready
+      ? "请按部署文档补齐该引擎所需的源码、解释器、模型与 Slurm 配置。"
+      : argus
+        ? (options.api_key_configured
+            ? "提交后在独立队列执行，不会阻塞转换或 Doctor；服务器已配置默认模型密钥，本次可留空。"
+            : "提交后在独立队列执行，不会阻塞转换或 Doctor；请填写本次任务的模型 API Key。")
+        : "提交后在独立队列逐 Episode 运行本地 Flora；不消耗模型 API 费用，取消后可从已完成 Episode 继续。";
+    renderBudget();
+    updateModelControls();
+    updateSubmit();
+  }
+
   function applyOptions() {
     if (!options) return;
+    renderEngineOptions();
     renderTemplates();
     const defaults = options.defaults || {};
     $("annotation-model").innerHTML = (options.models || [])
@@ -482,18 +582,8 @@
       ? "留空使用服务器默认 baseURL"
       : "https://gateway.example.com/v1";
     capTouched = false;
-    const available = Boolean(options.available);
-    setFormEnabled(available);
-    if (available) {
-      $("annotation-unavailable").hidden = true;
-      $("annotation-help").textContent = options.api_key_configured
-        ? "提交后在独立队列执行，不会阻塞转换或 Doctor；服务器已配置默认模型密钥，本次可留空。"
-        : "提交后在独立队列执行，不会阻塞转换或 Doctor；请填写本次任务的模型 API Key。";
-    } else {
-      showUnavailable(options.reason || "服务器未找到可用的 Argus");
-    }
-    renderBudget();
-    updateModelControls();
+    applyEngineState();
+    const available = engineConfig("argus").available;
     if (
       available &&
       options.gateway_configured &&
@@ -505,11 +595,12 @@
   }
 
   function showUnavailable(reason) {
-    setFormEnabled(false);
+    disableForm();
     const box = $("annotation-unavailable");
     box.hidden = false;
-    box.textContent = "自动标注暂不可用：" + reason;
-    $("annotation-help").textContent = "部署 Argus 后重启 Server 即可使用。";
+    box.textContent = "自动标注配置读取失败：" + reason;
+    $("annotation-engine-status").textContent = reason;
+    $("annotation-help").textContent = "请检查 Server 自动标注配置后重试。";
     setModelStatus("自动标注不可用，无法获取模型列表。");
   }
 
@@ -552,7 +643,7 @@
       return;
     }
     const last = item.annotation_last
-      ? `<span class="sub">上次任务：${esc(STATE_LABELS[item.annotation_last.state] || item.annotation_last.state)} · ${esc(item.annotation_last.model || "—")} · ${money(item.annotation_last.cost_usd)}</span>`
+      ? `<span class="sub">上次任务：${esc(STATE_LABELS[item.annotation_last.state] || item.annotation_last.state)} · ${esc(engineLabel(item.annotation_last.engine))} · ${esc(item.annotation_last.model || "—")} · ${money(item.annotation_last.cost_usd)}</span>`
       : "";
     box.innerHTML =
       `<strong>${esc(item.dataset_name)}</strong>` +
@@ -565,6 +656,11 @@
     const box = $("annotation-budget");
     if (!options) {
       box.textContent = "正在读取预算…";
+      return;
+    }
+    if (selectedEngine() === "flora") {
+      box.textContent =
+        "Flora 本地推理不产生模型 API 费用；每个 Episode 使用独立 Slurm GPU 分配，执行时长取决于模型和视频长度。";
       return;
     }
     if (options.unlimited) {
@@ -598,11 +694,20 @@
 
   function updateSubmit() {
     const button = $("annotation-submit");
+    const engine = selectedEngine();
+    const ready = Boolean(engineConfig(engine).available);
+    const dataset = Boolean($("annotation-dataset").value);
+    if (engine === "flora") {
+      const usable = ready && dataset && !submitting;
+      button.disabled = !usable;
+      button.textContent = submitting ? "正在提交…" : "提交 Flora 本地标注";
+      return;
+    }
     const needsKey = !options?.api_key_configured;
     const model = $("annotation-model").value;
     const usable =
-      Boolean(options?.available) &&
-      Boolean($("annotation-dataset").value) &&
+      ready &&
+      dataset &&
       Boolean(model) &&
       (options?.unlimited || modelPriced(model)) &&
       (!$("annotation-template").value || (options?.template_available && templateLibrary.templates.some((t) => t.id === $("annotation-template").value))) &&
@@ -610,7 +715,7 @@
       !modelFetching &&
       !submitting;
     button.disabled = !usable;
-    button.textContent = submitting ? "正在提交…" : "提交自动标注";
+    button.textContent = submitting ? "正在提交…" : "提交 Argus 云端标注";
   }
 
   async function refresh() {
@@ -652,13 +757,11 @@
       if (force || revision !== lastRevision || Date.now() - optionsAt >= 30000) {
         const fresh = await session.api("/api/annotations/options");
         if (ui !== session || $("server-robot-type").value !== scope) return;
-        const wasAvailable = Boolean(options?.available);
         options = fresh || options;
         optionsAt = Date.now();
+        renderEngineOptions();
         renderTemplates();
-        if (!options.available) showUnavailable(options.reason || "服务器未找到可用的 Argus");
-        else if (!wasAvailable) applyOptions();
-        renderBudget();
+        applyEngineState();
       }
       if (ui !== session || $("server-robot-type").value !== scope) return;
       if (selectedId && (force || lastRevision !== revision || ACTIVE.has(detailRow?.state))) await loadDetail(false);
@@ -696,9 +799,9 @@
               .join("");
             return `<tr>
               <td><strong class="task-name">${esc(row.dataset_name)}</strong><span class="sub">${esc(row.id.slice(0, 12))} · ${time(row.created_at)}</span><span class="sub">${esc(row.robot_type || "未知机器人")} · ${esc(row.rig || "")}</span></td>
-              <td>${esc(row.model || "—")}<span class="sub">${esc(row.note ? row.note.slice(0, 48) : "无额外说明")}</span></td>
+              <td><strong>${esc(engineLabel(row.engine))}</strong><span class="sub">${esc(row.model || "—")}</span><span class="sub">${esc(row.note ? row.note.slice(0, 48) : "无额外说明")}</span></td>
               <td>${esc(progress)}<span class="sub">${esc(row.stage || "")}</span><div class="progress"><span data-annotation-width="${percent}"></span></div></td>
-              <td>${money(row.cost_usd)}<span class="sub">${row.cap_usd == null ? "不限额" : `上限 ${money(row.cap_usd)}`}</span></td>
+              <td>${row.engine === "flora" ? "本地" : money(row.cost_usd)}<span class="sub">${row.engine === "flora" ? "无模型 API 费用" : row.cap_usd == null ? "不限额" : `上限 ${money(row.cap_usd)}`}</span></td>
               <td>${stateBadge(row.state)}${row.error ? `<span class="sub job-error">${esc(row.error.slice(0, 120))}</span>` : ""}</td>
               <td><div class="action-row">${actions}</div></td>
             </tr>`;
@@ -762,13 +865,13 @@
       <div class="annotation-summary">
         <div><span class="small muted">状态</span><div>${stateBadge(row.state)} ${esc(row.stage || "")}</div></div>
         <div><span class="small muted">进度</span><div>${done} / ${total || "?"} Episodes</div><div class="progress"><span data-annotation-width="${percent}"></span></div></div>
-        <div><span class="small muted">已结算费用</span><div>${money(row.cost_usd)} / ${row.cap_usd == null ? "不限额" : `上限 ${money(row.cap_usd)}`}</div><span class="sub">${row.cost_complete ? "费用完整" : "费用仍在结算或为估算"} · 预留 ${money(row.reserved_cost_usd)}</span></div>
+        <div><span class="small muted">${row.engine === "flora" ? "执行费用" : "已结算费用"}</span><div>${row.engine === "flora" ? "本地推理" : `${money(row.cost_usd)} / ${row.cap_usd == null ? "不限额" : `上限 ${money(row.cap_usd)}`}`}</div><span class="sub">${row.engine === "flora" ? "无模型 API 费用" : `${row.cost_complete ? "费用完整" : "费用仍在结算或为估算"} · 预留 ${money(row.reserved_cost_usd)}`}</span></div>
         <div><span class="small muted">Episode 失败</span><div>${row.episodes_failed || 0}</div><span class="sub">退出码 ${esc(row.exit_code ?? "—")}</span></div>
       </div>
       <div class="annotation-meta small muted">
         <span>数据集：${esc(row.dataset_name)} · ${esc(row.robot_type || "未知机器人")} · rig ${esc(row.rig || "—")}</span>
-        <span>模型：${esc(row.model || "—")} · 并发 ${esc(row.concurrency ?? "—")} · 推理 ${esc(row.reasoning || "默认")} · 采样 ${esc(row.sample_fps || "默认")}</span>
-        <span>模板：${esc(row.task_template?.name || "自由分析")} ${row.task_template ? `· 模板库版本 ${esc(row.template_library_revision)} · AI 初稿待人工确认` : ""}</span>
+        <span>引擎：${esc(engineLabel(row.engine))} · 模型：${esc(row.model || "—")} · 并发 ${esc(row.concurrency ?? "—")} · 推理 ${esc(row.reasoning || "默认")} · 采样 ${esc(row.sample_fps || "默认")}</span>
+        <span>${row.engine === "flora" ? "Flora 首期输出按时间分段的字幕，不使用共享模板。" : `模板：${esc(row.task_template?.name || "自由分析")} ${row.task_template ? `· 模板库版本 ${esc(row.template_library_revision)} · AI 初稿待人工确认` : ""}`}</span>
         <span>路径：${esc(row.dataset_path || "—")}</span>
         <span>创建 ${time(row.created_at)} · 开始 ${time(row.started_at)} · 结束 ${time(row.finished_at)}</span>
       </div>
@@ -971,28 +1074,43 @@
   function renderEpisodes() {
     const body = $("annotation-episode-list");
     const count = episodes.length;
+    const engine = detailRow?.engine || "argus";
+    const isFlora = engine === "flora";
     $("annotation-episode-count").textContent = count ? `${count} 个 Episode` : "尚无结果";
     if (!count) {
-      body.innerHTML = '<tr><td colspan="6" class="empty">Argus 尚未生成可读取的 Episode 标注。运行中可稍后刷新。</td></tr>';
+      body.innerHTML = `<tr><td colspan="6" class="empty">${esc(engineLabel(engine))} 尚未生成可读取的 Episode 标注。运行中可稍后刷新。</td></tr>`;
       return;
     }
     body.innerHTML = episodes
       .map((item) => {
+        const segments = Array.isArray(item.segments) ? item.segments : [];
+        const captions = segments
+          .map((segment) => String(segment?.caption || "").trim())
+          .filter(Boolean);
         const outcome =
           item.outcome ||
           (item.completed === true ? "success" : item.completed === false ? "failure" : "");
-        const completion = outcome
-          ? (OUTCOME_LABELS[outcome] || outcome) +
-            (item.failure_kind ? ` · ${esc(item.failure_kind)}` : "")
-          : "—";
+        const completion = isFlora
+          ? (item.completed
+              ? "全部 Segment 已生成"
+              : item.labels_available
+                ? "部分 Segment 未完成"
+                : "字幕生成失败")
+          : outcome
+            ? (OUTCOME_LABELS[outcome] || outcome) +
+              (item.failure_kind ? ` · ${esc(item.failure_kind)}` : "")
+            : "—";
         const labels = item.labels_available
           ? "可用"
-          : `<span class="job-error">${esc(item.label_failure?.why || "标注失败")}</span>`;
+          : `<span class="job-error">${esc(item.label_failure?.why || item.label_failure?.status || "标注失败")}</span>`;
+        const prompt = isFlora
+          ? captions.slice(0, 2).join(" · ") || "—"
+          : item.prompt || "—";
         return `<tr>
           <td><strong class="task-name">${esc(item.episode_id || item.id)}</strong><span class="sub">${esc(item.id)} · ${esc(item.duration_s ? Number(item.duration_s).toFixed(1) + " 秒" : "时长未知")}</span></td>
-          <td>${esc(item.prompt || "—")}</td>
+          <td>${esc(prompt)}</td>
           <td>${esc(completion)}</td>
-          <td>${esc(item.events || 0)} 事件<span class="sub">${esc(item.key_events || 0)} 关键动作 · ${esc(item.state_changes || 0)} 状态变化</span></td>
+          <td>${esc(isFlora ? segments.length : item.events || 0)} ${isFlora ? "Segment" : "事件"}<span class="sub">${isFlora ? `${esc(captions.length)} 条已生成字幕` : `${esc(item.key_events || 0)} 关键动作 · ${esc(item.state_changes || 0)} 状态变化`}</span></td>
           <td>${esc(item.model || "—")}</td>
           <td>${labels}<div class="action-row">${item.labels_available ? `<button class="secondary" type="button" data-annotation-episode="${esc(item.id)}">查看预览</button>` : ""}<button class="text-button" type="button" data-annotation-episode-json="${esc(item.id)}">原始结果</button></div></td>
         </tr>`;
@@ -1033,6 +1151,9 @@
     for (const row of viewerRows("event_labels")) {
       values.push(number(row.t_s ?? row.start_s, 0), number(row.end_s, 0));
     }
+    for (const row of viewerRows("segments")) {
+      values.push(number(row.start_s, 0), number(row.end_s, 0));
+    }
     for (const row of [...viewerRows("key_events"), ...viewerRows("state_changes")]) {
       values.push(number(row.t_s, 0));
     }
@@ -1042,7 +1163,10 @@
 
   function viewerEvents() {
     const duration = viewerDuration();
-    const rows = viewerRows("event_labels").map((row) => {
+    const source = viewerRows("event_labels").length
+      ? viewerRows("event_labels")
+      : viewerRows("segments");
+    const rows = source.map((row) => {
       const start = Math.max(0, number(row.t_s ?? row.start_s, 0));
       const end = number(row.end_s, 0);
       return { ...row, start, end: end > start ? end : null };
@@ -1070,9 +1194,21 @@
     const completion = viewerCompletion();
     const outcome = viewerOutcome();
     const model = viewerData._meta?.model || viewerData.model || "—";
-    const prompt = viewerData.episode_prompt || viewerData.labels?.task_summary || "未记录任务描述";
+    const isFlora = detailRow?.engine === "flora";
+    const captionPrompt = viewerRows("segments")
+      .map((row) => String(row.caption || "").trim())
+      .filter(Boolean)
+      .slice(0, 3)
+      .join(" · ");
+    const prompt =
+      viewerData.episode_prompt ||
+      viewerData.labels?.task_summary ||
+      captionPrompt ||
+      "未记录任务描述";
     $("annotation-viewer-title").textContent = `Episode ${viewerEpisode} 可视化`;
-    $("annotation-viewer-meta").textContent = `${seconds(duration)} · ${OUTCOME_LABELS[outcome] || "未判断"} · ${model}`;
+    $("annotation-viewer-meta").textContent = isFlora
+      ? `${seconds(duration)} · ${viewerData.completed ? "全部字幕已完成" : "部分字幕未完成"} · ${model}`
+      : `${seconds(duration)} · ${OUTCOME_LABELS[outcome] || "未判断"} · ${model}`;
 
     const percent = (value) => Math.min(100, Math.max(0, (100 * number(value, 0)) / duration));
     const video = viewerClips.length
@@ -1091,7 +1227,7 @@
         const target = [event.object, event.carry_phase].filter(Boolean).join(" · ");
         return `<button type="button" class="viewer-event" data-viewer-seek="${event.start}" data-viewer-start="${event.start}" data-viewer-end="${event.end}">
           <span class="viewer-event-time">${seconds(event.start)}</span>
-          <span class="viewer-event-body"><strong>${esc(event.verb_class || "未描述动作")}</strong>${target ? `<span class="sub">${esc(target)}</span>` : ""}${viewerData.task_document ? `<span class="sub">${esc(templateValues(event.values, "attempt"))}</span>` : ""}</span>
+          <span class="viewer-event-body"><strong>${esc(event.caption || event.verb_class || "未描述动作")}</strong>${target ? `<span class="sub">${esc(target)}</span>` : ""}${viewerData.task_document ? `<span class="sub">${esc(templateValues(event.values, "attempt"))}</span>` : ""}</span>
           <span class="viewer-event-tag">${esc([arm, event.contribution].filter(Boolean).join(" · "))}</span>
         </button>`;
       })
@@ -1326,49 +1462,64 @@
   async function submit(event) {
     event.preventDefault();
     if (submitting) return;
+    const engine = selectedEngine();
+    if (!engineConfig(engine).available) {
+      ui.notice(`${engineLabel(engine)}尚未就绪，请检查部署配置。`, true);
+      return;
+    }
     const jobId = $("annotation-dataset").value;
     if (!jobId) {
       ui.notice("请先选择数据集。", true);
       return;
     }
-    if (canFetchModels() && modelFetchedFor !== modelSignature()) {
+    if (engine === "argus" && canFetchModels() && modelFetchedFor !== modelSignature()) {
       // Do not submit a model from a previous gateway or a stale field value.
       await fetchModels(false);
     }
-    if (!$("annotation-model").value) {
+    if (engine === "argus" && !$("annotation-model").value) {
       ui.notice("请先获取并选择标注模型。", true);
       return;
     }
-    const sample = $("annotation-sample-fps").value;
-    const sampleFps = sample === "" ? null : Number(sample);
-    const baseUrl = $("annotation-base-url").value.trim();
-    const apiKey = $("annotation-api-key").value.trim();
-    const body = {
-      job_id: jobId,
-      template_id: $("annotation-template").value || null,
-      template_revision: $("annotation-template").value ? templateLibrary.revision : null,
-      model: $("annotation-model").value,
-      cap_usd: options?.unlimited ? null : Number($("annotation-cap").value),
-      concurrency: Number($("annotation-concurrency").value),
-      reasoning: $("annotation-reasoning").value || null,
-      inspection: $("annotation-inspection").value,
-      sample_fps: sampleFps && sampleFps > 0 ? sampleFps : null,
-      field_dictionary: $("annotation-field-dictionary").checked,
-      max_tokens: Number($("annotation-max-tokens").value),
-      note: $("annotation-note").value.trim() || null,
-      base_url: baseUrl || null,
-      api_key: apiKey || null,
-    };
+    const body = { job_id: jobId, engine };
+    const note = $("annotation-note").value.trim();
+    if (note) body.note = note;
+    if (engine === "argus") {
+      const sample = $("annotation-sample-fps").value;
+      const sampleFps = sample === "" ? null : Number(sample);
+      const baseUrl = $("annotation-base-url").value.trim();
+      const apiKey = $("annotation-api-key").value.trim();
+      Object.assign(body, {
+        template_id: $("annotation-template").value || null,
+        template_revision: $("annotation-template").value ? templateLibrary.revision : null,
+        model: $("annotation-model").value,
+        cap_usd: options?.unlimited ? null : Number($("annotation-cap").value),
+        concurrency: Number($("annotation-concurrency").value),
+        reasoning: $("annotation-reasoning").value || null,
+        inspection: $("annotation-inspection").value,
+        sample_fps: sampleFps && sampleFps > 0 ? sampleFps : null,
+        field_dictionary: $("annotation-field-dictionary").checked,
+        max_tokens: Number($("annotation-max-tokens").value),
+        base_url: baseUrl || null,
+        api_key: apiKey || null,
+      });
+    }
     submitting = true;
     updateSubmit();
     try {
       const row = await ui.api("/api/annotations", "POST", body);
       // The key is not part of the task record; do not keep it in the page
       // either once the server has accepted the run.
-      $("annotation-api-key").value = "";
+      if (engine === "argus") $("annotation-api-key").value = "";
       updateModelControls();
       selectedId = row.id;
-      ui.notice(`已提交「${row.dataset_name}」自动标注：${row.model}，${row.cap_usd == null ? "费用不限额" : `费用上限 ${money(row.cap_usd)}`}。`);
+      ui.notice(
+        `已提交「${row.dataset_name}」${engineLabel(row.engine)}标注：${row.model}` +
+          (row.engine === "flora"
+            ? "，本地推理无模型 API 费用。"
+            : row.cap_usd == null
+              ? "，费用不限额。"
+              : `，费用上限 ${money(row.cap_usd)}。`),
+      );
       await refresh();
       selectAnnotation(row.id);
     } catch (error) {
@@ -1391,9 +1542,20 @@
     }
   }
 
-  function openResume(id) {
+  async function openResume(id) {
     const row = rows.find((item) => item.id === id) || detailRow;
     if (!row) return;
+    if ((row.engine || "argus") === "flora") {
+      try {
+        await ui.api(`/api/annotations/${id}/resume`, "POST", {});
+        ui.notice("已重新加入 Flora 本地标注队列，将跳过已完成的 Episode。");
+        await refresh();
+        if (selectedId === id) await loadDetail(true);
+      } catch (error) {
+        ui.notice(error.message, true);
+      }
+      return;
+    }
     resumeTarget = id;
     const configured = Boolean(options?.api_key_configured);
     $("annotation-resume-base-url").value = row.base_url || "";
