@@ -160,6 +160,7 @@ def patch_presentation(cache: Path):
         "episode-score-filter-model.ts": "src/utils/episode-score-filter-model.ts",
         "subtask-review-model.ts": "src/utils/subtask-review-model.ts",
         "annotation-review-client.ts": "src/utils/annotation-review-client.ts",
+        "task-review-client.ts": "src/utils/task-review-client.ts",
         "use-annotation-review.ts": "src/utils/use-annotation-review.ts",
         "instruction-model.ts": "src/utils/instruction-model.ts",
         "instruction-editor.tsx": "src/components/instruction-editor.tsx",
