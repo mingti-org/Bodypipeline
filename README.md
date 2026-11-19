@@ -32,7 +32,7 @@ Unitree G1（SONIC 1.1 / BrainCo）新增独立 raw subscriber 的 Client 适配
 | 已有数据集版本转换 | 从已转换、已导入或已合并的数据集中选择来源，使用 LeTools 在 v2.1 与 v3.0 之间双向转换并生成独立结果 |
 | 时间对齐 | 固定输出帧率、有界相机最近帧、因果关节保持和逐 episode 诊断 |
 | 质量检查 | 转换结构检查、LeRobot deep validate、11 项 LeRobot Doctor 检查 |
-| 自动标注 | 用固定版本 Argus `review` 为已登记数据集生成逐 Episode 任务描述、事件与完成情况；独立队列、费用上限、取消与续跑 |
+| 自动标注 | 用 Argus 云端模型或本地 Flora-TempSeg + Captioner 为已登记数据集生成逐 Episode 标注；共享队列、取消与续跑 |
 | 数据预览 | Server 页面直接启动无鉴权只读 Visualizer，支持多相机视频 Range |
 | 历史数据导入 | 原地登记旧原始采集或已有 LeRobot 数据集，不复制、不移动、不改写 |
 | 文件持久化 | 业务状态保存为 JSON，原始数据、对齐结果、转换结果和报告按目录组织 |
@@ -249,7 +249,9 @@ Server 当前白名单示例：
 │   ├── checks/<check_id>/          # 独立质检日志与报告
 │   └── *.json / *.log              # lineage、对齐、Doctor 与运行日志
 └── annotations/<annotation_id>/
-    ├── argus/                      # Argus review 原始输出与 qa
+    ├── argus/                      # Argus 输出（Argus 任务）
+    ├── flora/                      # Flora 视频切片与运行信息（Flora 任务）
+    ├── episode_*.result.json       # Flora 逐 Episode 标准化结果
     ├── context.json                # 来源、模型、预算与 Provider 上下文
     └── logs/run.log                # 执行日志
 ```

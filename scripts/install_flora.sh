@@ -1,0 +1,165 @@
+#!/usr/bin/env bash
+# Validate and optionally install the isolated Flora-TempSeg + Captioner runtime.
+#
+# This script never downloads model weights. Set FLORA_CREATE_ENV=1 to create
+# the Python 3.12 environment; download and authenticate model checkpoints
+# separately after reviewing NVIDIA's research-only license.
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+FLORA_ROOT="${FLORA_ROOT:-$ROOT/.runtime/flora}"
+FLORA_SRC="${FLORA_SRC:-/workspace/flora/Flora-TempSeg}"
+FLORA_PYTHON="${FLORA_PYTHON:-/workspace/flora/.venv-annotation/bin/python}"
+FLORA_MODEL_CACHE="${FLORA_MODEL_CACHE:-/workspace/flora/models}"
+FLORA_HF_HOME="${FLORA_HF_HOME:-/workspace/flora/huggingface}"
+FLORA_TEMPSEG_MODEL="${FLORA_TEMPSEG_MODEL:-$FLORA_SRC}"
+FLORA_CAPTIONER_MODEL="${FLORA_CAPTIONER_MODEL:-/workspace/flora/Flora-Captioner}"
+FLORA_REV="${FLORA_REV:-d8b755e}"
+
+if [[ ! -f "$FLORA_SRC/captioner/infer.py" && ! -f "$FLORA_SRC/infer.py" ]]; then
+  echo "Flora source is missing or incomplete: $FLORA_SRC" >&2
+  echo "Set FLORA_SRC to an NVIDIA/Flora checkout at revision $FLORA_REV." >&2
+  exit 1
+fi
+
+if [[ "${FLORA_CREATE_ENV:-0}" == "1" && ! -x "$FLORA_PYTHON" ]]; then
+  command -v python3.12 >/dev/null || {
+    echo "Python 3.12 is required to create the Flora environment." >&2
+    exit 1
+  }
+  mkdir -p "$(dirname "$FLORA_PYTHON")/.."
+  python3.12 -m venv "$(dirname "$FLORA_PYTHON")/.."
+  "$FLORA_PYTHON" -m pip install --upgrade pip
+  "$FLORA_PYTHON" -m pip install \
+    torch==2.11.0 torchvision==0.26.0 \
+    --index-url https://download.pytorch.org/whl/cu128
+  "$FLORA_PYTHON" -m pip install \
+    -r "$FLORA_SRC/captioner/batch_utils/requirements.txt"
+fi
+
+if [[ ! -x "$FLORA_PYTHON" ]]; then
+  echo "Flora Python interpreter is missing: $FLORA_PYTHON" >&2
+  echo "Create it with FLORA_CREATE_ENV=1 or set FLORA_PYTHON." >&2
+  exit 1
+fi
+
+link_model_repository() {
+  local kind="$1"
+  local source="$2"
+  local target="$FLORA_MODEL_CACHE/$kind"
+  if [[ ! -f "$source/config.json" ]] ||
+    ! compgen -G "$source/*.safetensors" >/dev/null; then
+    echo "Model repository is missing config or safetensors: $source" >&2
+    return 1
+  fi
+  if [[ -e "$target" || -L "$target" ]]; then
+    return 0
+  fi
+  local source_abs
+  source_abs="$(cd "$source" && pwd -P)"
+  ln -s "$source_abs" "$target"
+}
+
+if [[ "${FLORA_LINK_MODELS:-0}" == "1" ]]; then
+  mkdir -p "$FLORA_MODEL_CACHE"
+  link_model_repository tempseg "$FLORA_TEMPSEG_MODEL"
+  link_model_repository captioner "$FLORA_CAPTIONER_MODEL"
+fi
+
+if [[ "${FLORA_SKIP_SYSTEM_CHECK:-0}" != "1" ]]; then
+  for command in srun ffmpeg ffprobe; do
+    command -v "$command" >/dev/null || {
+      echo "$command is required on the Server host and PATH." >&2
+      exit 1
+    }
+  done
+fi
+
+PYTHONPATH="$FLORA_SRC" "$FLORA_PYTHON" - <<'PY'
+import av
+import accelerate
+import huggingface_hub
+import numpy
+import peft
+import torch
+import transformers
+
+assert torch.__version__.startswith("2.11.")
+print("Flora Python environment imports ok")
+PY
+
+if [[ "${FLORA_SKIP_MODEL_CHECK:-0}" != "1" ]]; then
+  missing=0
+  for kind in tempseg captioner; do
+    directory="$FLORA_MODEL_CACHE/$kind"
+    if [[ ! -d "$directory" ]]; then
+      echo "Missing model cache directory: $directory" >&2
+      missing=1
+      continue
+    fi
+    if [[ ! -f "$directory/config.json" ]]; then
+      echo "Missing config.json in model cache: $directory" >&2
+      missing=1
+    fi
+    if ! compgen -G "$directory/*.safetensors" >/dev/null; then
+      echo "Missing safetensors in model cache: $directory" >&2
+      missing=1
+    fi
+  done
+  base_ready=0
+  for directory in \
+    "$FLORA_MODEL_CACHE/tempseg_base" \
+    "$FLORA_HF_HOME"/hub/models--Qwen--Qwen3.5-9B/snapshots/*; do
+    [[ -d "$directory" ]] || continue
+    [[ -f "$directory/config.json" ]] || continue
+    compgen -G "$directory/*.safetensors" >/dev/null || continue
+    base_ready=1
+    break
+  done
+  if (( ! base_ready )); then
+    echo "Missing Qwen3.5-9B base model in $FLORA_MODEL_CACHE/tempseg_base" >&2
+    echo "or the Hugging Face cache under $FLORA_HF_HOME." >&2
+    missing=1
+  fi
+  if (( missing )); then
+    echo "Flora weights are incomplete. Download them separately; this script never fetches them." >&2
+    exit 1
+  fi
+fi
+
+mkdir -p "$FLORA_HF_HOME"
+cat <<EOF
+
+Flora annotation backend is ready.
+
+  "flora": {
+    "enabled": true,
+    "src": "$FLORA_SRC",
+    "python": "$FLORA_PYTHON",
+    "srun": "srun",
+    "ffmpeg": "ffmpeg",
+    "ffprobe": "ffprobe",
+    "model_cache": "$FLORA_MODEL_CACHE",
+    "hf_home": "$FLORA_HF_HOME",
+    "partition": "dev",
+    "gpus": 1,
+    "cpus_per_task": 8,
+    "timeout_seconds": 14400,
+    "profiles": {
+      "<provider>": {
+        "profile": "yam",
+        "yam32": false,
+        "camera_roles": {
+          "main": "observation.images.front",
+          "left_wrist": "observation.images.left_wrist",
+          "right_wrist": "observation.images.right_wrist"
+        }
+      }
+    }
+  }
+
+The selected Provider must explicitly declare one camera for role "main";
+wrist roles are optional. The output is for non-commercial research and
+evaluation under NVIDIA's Flora model license. Verify that the Server account
+can read all configured paths and submit srun jobs before enabling this block.
+EOF

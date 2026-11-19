@@ -542,6 +542,102 @@ Server 内存中，任务结束、取消或 Server 重启后清除；不会写�
 - 标注任务运行期间不能永久删除来源数据集；任务结束后标注结果独立保留，不随
   数据集删除而移除。Doctor 质检逻辑和结论不受影响。
 
+#### Flora 本地自动标注
+
+自动标注页与 `/api/annotations` 的 `engine` 字段可选择 `argus` 或 `flora`。
+旧任务和未指定 `engine` 的请求继续使用 Argus。两种引擎共用任务记录、取消、
+续跑、日志、Episode 查看、导出和 Subtask 数据集队列，但执行、凭据与结果格式
+彼此隔离。Flora 不读取 Argus/OpenAI 密钥，也不检查 USD 预算。
+
+首期只接入 **Flora-TempSeg + Flora-Captioner**，不启用 Flora-Rewarder，也不支持
+Argus 共享任务模板。Flora 在 H800 上通过 `srun` 运行，每个 Episode 申请一个
+GPU；视频会先按 120 秒、7200 帧上限切分，模型输出再合并回 Episode 时间轴。
+输出为带 `start_s`、`end_s`、`caption`、`status` 的 Segment，可继续使用现有
+Subtask 数据集生成功能。
+
+先按 NVIDIA 的模型许可和下载说明准备三份本地模型缓存：TempSeg adapter、
+Qwen3.5-9B base 和 Captioner。`src` 既可以是 Flora GitHub checkout，也可以
+是只下载了模型文件且根目录包含 `infer.py` 的模型仓库。安装检查不会自动下载权重：
+
+```bash
+FLORA_SRC=/workspace/flora/Flora-TempSeg \
+FLORA_PYTHON=/workspace/flora/.venv-annotation/bin/python \
+FLORA_MODEL_CACHE=/workspace/flora/models \
+FLORA_HF_HOME=/workspace/flora/huggingface \
+bash scripts/install_flora.sh
+```
+
+当前 H800 的 `/workspace/flora/Flora-TempSeg` 和
+`/workspace/flora/Flora-Captioner` 已经是模型仓库目录。可让安装器在
+`FLORA_MODEL_CACHE` 下建立两个稳定名称的符号链接，避免复制约 100 GB 权重：
+
+```bash
+FLORA_SRC=/workspace/flora/Flora-TempSeg \
+FLORA_PYTHON=/workspace/flora/.venv-annotation/bin/python \
+FLORA_TEMPSEG_MODEL=/workspace/flora/Flora-TempSeg \
+FLORA_CAPTIONER_MODEL=/workspace/flora/Flora-Captioner \
+FLORA_MODEL_CACHE=/workspace/flora/models \
+FLORA_HF_HOME=/workspace/flora/huggingface \
+FLORA_LINK_MODELS=1 \
+bash scripts/install_flora.sh
+```
+
+安装后目录契约是 `models/tempseg`、`models/captioner`，以及
+`huggingface/hub/models--Qwen--Qwen3.5-9B` 中的 Qwen 基座快照；也可把基座
+直接放在 `models/tempseg_base`。Flora 官方代码会从 `FLORA_MODEL_CACHE` 加载前
+两类模型，并从标准 Hugging Face 缓存加载 Qwen 基座。
+
+缺 Python 环境时可在首次安装显式设置 `FLORA_CREATE_ENV=1`。脚本会检查源码、
+Python 3.12/CUDA 依赖、`srun`、FFmpeg、FFprobe 和三份模型缓存；它不会创建
+RPC 服务，也不会下载 100 GB 以上的权重。受许可限制，Flora 模型仅按 NVIDIA
+研究许可证用于非商业研究和评估。
+
+在 Server 配置中按 Provider 建立受信任映射。`camera_roles` 使用数据集中真实的
+LeRobot video feature；至少配置 `main`，腕部相机可省略：
+
+```json
+{
+  "flora": {
+    "enabled": true,
+    "src": "/workspace/flora/Flora-TempSeg",
+    "python": "/workspace/flora/.venv-annotation/bin/python",
+    "srun": "srun",
+    "ffmpeg": "ffmpeg",
+    "ffprobe": "ffprobe",
+    "model_cache": "/workspace/flora/models",
+    "hf_home": "/workspace/flora/huggingface",
+    "partition": "dev",
+    "gpus": 1,
+    "cpus_per_task": 8,
+    "timeout_seconds": 14400,
+    "profiles": {
+      "agilex": {
+        "profile": "yam",
+        "yam32": false,
+        "camera_roles": {
+          "main": "observation.images.front",
+          "left_wrist": "observation.images.left_wrist",
+          "right_wrist": "observation.images.right_wrist"
+        }
+      }
+    }
+  }
+}
+```
+
+运行前应确认：
+
+- 启动 Server 的账号能读取上述路径，并能向配置分区提交 `srun` 作业。
+- 三路相机具有相同 FPS、帧数和时间戳；不满足时任务会明确失败，不会静默
+  选错相机或拉伸视频。
+- 同一块 80 GB GPU 不要并发运行多个 Flora 切片。官方样例在单张 H100 上处理
+  107 秒视频约需 23 分钟，实际耗时受模型缓存、视频和节点状态影响。
+- Flora 任务的产品位于 `annotations/<annotation_id>/flora/`，标准化结果位于
+  `annotations/<annotation_id>/episode_*.result.json`。续跑会跳过已经完成的
+  Episode；来源数据集在任务提交后发生变化时拒绝续跑。
+- Provider 配置由部署管理员维护；页面和 API 不按机器人型号猜测相机或 Flora
+  Profile。未绑定 Profile 的 Provider 会在提交时返回 422。
+
 ### 6.4.2 从标注生成 Subtask 数据集
 
 标注完成后，详情页的“Subtask 数据集”面板
