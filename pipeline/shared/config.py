@@ -378,6 +378,7 @@ class Settings:
             "partition",
             "gpus",
             "cpus_per_task",
+            "generation_timeout_seconds",
             "timeout_seconds",
             "profiles",
         }
@@ -402,6 +403,7 @@ class Settings:
         for key, default, low, high in (
             ("gpus", 1, 1, 1),
             ("cpus_per_task", 8, 1, 128),
+            ("generation_timeout_seconds", 900, 60, 3600),
             ("timeout_seconds", 14400, 60, 7 * 24 * 3600),
         ):
             value = self.flora.get(key, default)

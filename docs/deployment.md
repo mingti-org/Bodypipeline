@@ -610,6 +610,7 @@ LeRobot video feature；至少配置 `main`，腕部相机可省略：
     "partition": "dev",
     "gpus": 1,
     "cpus_per_task": 8,
+    "generation_timeout_seconds": 900,
     "timeout_seconds": 14400,
     "profiles": {
       "agilex": {

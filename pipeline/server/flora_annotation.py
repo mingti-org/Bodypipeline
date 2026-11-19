@@ -210,6 +210,9 @@ def environment(settings) -> dict:
     if config.get("hf_endpoint"):
         env["HF_ENDPOINT"] = str(config["hf_endpoint"])
     env["HF_HUB_DISABLE_TELEMETRY"] = "1"
+    env["FLORA_GENERATION_MAX_SECONDS"] = str(
+        int(config.get("generation_timeout_seconds") or 900)
+    )
     env["PYTHONPATH"] = str(source_path(settings))
     env.setdefault("MALLOC_ARENA_MAX", "2")
     return env

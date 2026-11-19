@@ -209,6 +209,7 @@ Flora annotation backend is ready.
     "partition": "dev",
     "gpus": 1,
     "cpus_per_task": 8,
+    "generation_timeout_seconds": 900,
     "timeout_seconds": 14400,
     "profiles": {
       "<provider>": {
