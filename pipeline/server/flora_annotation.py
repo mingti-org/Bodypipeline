@@ -169,6 +169,9 @@ def environment(settings) -> dict:
         Path(str(config.get("model_cache") or "")).expanduser()
     )
     env["HF_HOME"] = str(Path(str(config.get("hf_home") or "")).expanduser())
+    if config.get("hf_endpoint"):
+        env["HF_ENDPOINT"] = str(config["hf_endpoint"])
+    env["HF_HUB_DISABLE_TELEMETRY"] = "1"
     env["PYTHONPATH"] = str(source_path(settings))
     env.setdefault("MALLOC_ARENA_MAX", "2")
     return env

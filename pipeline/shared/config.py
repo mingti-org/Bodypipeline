@@ -374,6 +374,7 @@ class Settings:
             "ffprobe",
             "model_cache",
             "hf_home",
+            "hf_endpoint",
             "partition",
             "gpus",
             "cpus_per_task",
@@ -393,6 +394,7 @@ class Settings:
             "ffprobe",
             "model_cache",
             "hf_home",
+            "hf_endpoint",
             "partition",
         ):
             if key in self.flora and not isinstance(self.flora[key], str):

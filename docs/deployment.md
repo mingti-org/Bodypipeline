@@ -606,6 +606,7 @@ LeRobot video feature；至少配置 `main`，腕部相机可省略：
     "ffprobe": "ffprobe",
     "model_cache": "/workspace/flora/models",
     "hf_home": "/workspace/flora/huggingface",
+    "hf_endpoint": "https://hf-mirror.com",
     "partition": "dev",
     "gpus": 1,
     "cpus_per_task": 8,

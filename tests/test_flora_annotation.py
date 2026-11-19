@@ -50,6 +50,7 @@ def flora_settings(settings_factory, tmp_path):
             "ffprobe": str(tools["ffprobe"]),
             "model_cache": str(models),
             "hf_home": str(tmp_path / "hf"),
+            "hf_endpoint": "https://hf-mirror.example",
             "partition": "dev",
             "gpus": 1,
             "timeout_seconds": 14400,
@@ -186,6 +187,8 @@ def test_environment_is_isolated_and_uses_flora_caches(tmp_path, settings_factor
     env = flora_annotation.environment(settings)
     assert env["FLORA_MODEL_CACHE"] == str(tmp_path / "models")
     assert env["HF_HOME"] == str(tmp_path / "hf")
+    assert env["HF_ENDPOINT"] == "https://hf-mirror.example"
+    assert env["HF_HUB_DISABLE_TELEMETRY"] == "1"
     assert env["CUDA_VISIBLE_DEVICES"] == "0"
     assert not any(name.startswith("PIPELINE_ARGUS_") for name in env)
     assert not any(name.startswith("OPENAI_") for name in env)

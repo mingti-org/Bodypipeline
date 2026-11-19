@@ -154,6 +154,7 @@ Flora annotation backend is ready.
     "ffprobe": "ffprobe",
     "model_cache": "$FLORA_MODEL_CACHE",
     "hf_home": "$FLORA_HF_HOME",
+    "hf_endpoint": "https://hf-mirror.com",
     "partition": "dev",
     "gpus": 1,
     "cpus_per_task": 8,
