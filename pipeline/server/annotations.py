@@ -708,7 +708,10 @@ class AnnotationRunner:
                 budget = self.budget(
                     row["job_id"], int(row.get("input_episode_count") or 1)
                 )
-                if budget["available_usd"] <= 0:
+                if (
+                    budget["available_usd"] is not None
+                    and budget["available_usd"] <= 0
+                ):
                     raise BudgetExceeded(
                         "今日或本数据集的自动标注预算已用尽，不能续跑"
                     )
