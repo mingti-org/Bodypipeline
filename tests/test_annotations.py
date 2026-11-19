@@ -105,6 +105,8 @@ def test_options_and_candidates_come_from_registered_datasets(service):
     runner, store, _src, data = service
     options = runner.options()
     assert options["available"] is True
+    assert options["engines"]["argus"]["available"] is True
+    assert options["engines"]["flora"]["available"] is False
     assert options["models"]
     assert options["defaults"]["concurrency"] == 4
     candidates = runner.candidates()
@@ -152,6 +154,18 @@ def test_enqueue_validates_model_budget_and_is_idempotent(service):
         runner.enqueue("job-1", concurrency=0)
     with pytest.raises(DomainError):
         runner.enqueue("unknown-job")
+
+
+def test_legacy_annotations_default_to_argus_and_unknown_engines_are_rejected(
+    service,
+):
+    runner, store, _src, _data = service
+    row = runner.enqueue("job-1")
+    assert row["engine"] == "argus"
+
+    store.put("annotation", row["id"], dict(row, state="CANCELLED"))
+    with pytest.raises(DomainError, match="标注引擎"):
+        runner.enqueue("job-1", engine="unknown")
 
 
 def test_options_never_default_to_a_model_outside_the_allowlist(service):

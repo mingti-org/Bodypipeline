@@ -24,6 +24,7 @@ from pipeline.shared.core import DomainError, atomic_json, digest, now
 from pipeline.shared.identity import Principal
 
 from . import argus_annotation
+from .annotation_backends import BACKENDS, DEFAULT_ENGINE, backend_for
 from .datasets import dataset_for_job
 from .merges import source_snapshot
 from .providers import get_provider
@@ -129,6 +130,16 @@ class AnnotationRunner:
         )
         return {
             "available": ok,
+            "default_engine": DEFAULT_ENGINE,
+            "engines": {
+                backend.id: {
+                    "id": backend.id,
+                    "label": backend.label,
+                    "available": backend.available(self.settings)[0],
+                    "reason": backend.available(self.settings)[1],
+                }
+                for backend in BACKENDS.values()
+            },
             "template_available": argus_annotation.template_available(self.settings),
             "template_library": TemplateLibrary(self.store).read(),
             "reason": why,
@@ -286,9 +297,12 @@ class AnnotationRunner:
         api_key: str | None = None,
         template_id: str | None = None,
         template_revision: int | None = None,
+        engine: str = DEFAULT_ENGINE,
         principal: Principal | None = None,
     ):
         with self.lock:
+            if engine not in BACKENDS:
+                raise DomainError(f"未知标注引擎：{engine}", 400)
             job = self.store.get("job", job_id)
             data = dataset_for_job(self.settings, job)
             ok, why = self.available()
@@ -402,6 +416,7 @@ class AnnotationRunner:
             row = {
                 "id": str(uuid.uuid4()),
                 "job_id": job_id,
+                "engine": engine,
                 "state": QUEUED,
                 "stage": "等待自动标注",
                 "created_at": now(),
@@ -973,30 +988,30 @@ class AnnotationRunner:
         work = self.work(row)
         if not work.is_dir():
             return []
-        return argus_annotation.outputs(work)
+        return backend_for(row).outputs(work)
 
     def episode(self, aid: str, episode_id: str) -> dict:
         row = self.store.get("annotation", aid)
-        result = argus_annotation.episode(self.work(row), episode_id)
+        result = backend_for(row).episode(self.work(row), episode_id)
         if result is None:
             raise DomainError("标注 Episode 不存在", 404)
         return result
 
     def clips(self, aid: str, episode_id: str) -> list[dict]:
         row = self.store.get("annotation", aid)
-        return argus_annotation.clips(self.work(row), episode_id)
+        return backend_for(row).clips(self.work(row), episode_id)
 
     def clip(self, aid: str, episode_id: str, camera: str) -> Path | None:
         row = self.store.get("annotation", aid)
-        return argus_annotation.clip(self.work(row), episode_id, camera)
+        return backend_for(row).clip(self.work(row), episode_id, camera)
 
     def log_names(self, aid: str) -> list[str]:
         row = self.store.get("annotation", aid)
-        return argus_annotation.log_names(self.work(row))
+        return backend_for(row).log_names(self.work(row))
 
     def log(self, aid: str, name: str) -> str:
         row = self.store.get("annotation", aid)
-        text = argus_annotation.read_log(self.work(row), name)
+        text = backend_for(row).read_log(self.work(row), name)
         secret = str((self.credentials.get(aid) or {}).get("api_key") or "")
         return argus_annotation.redact(text, secret)
 

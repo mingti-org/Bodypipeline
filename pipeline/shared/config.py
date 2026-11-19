@@ -158,6 +158,7 @@ class Settings:
     argus_annotation_inspection: str = "auto"
     argus_annotation_field_dictionary: bool = False
     argus_annotation_note: str = ""
+    flora: dict = field(default_factory=dict)
     user_sessions: dict = field(default_factory=dict)
     slurm: dict = field(default_factory=dict)
     # Trusted deployment setting, not a user-supplied conversion option.
@@ -193,6 +194,7 @@ class Settings:
 
         ExecutionBudget.resolve(self.slurm)
         self._validate_user_sessions_configuration()
+        self._validate_flora_configuration()
 
     @classmethod
     def load(cls, role: str, path: str | None = None):
@@ -249,6 +251,7 @@ class Settings:
             raise ValueError("argus_models 必须是模型标识符列表")
         settings.argus_prices = validate_argus_prices(settings.argus_prices)
         settings._validate_user_sessions_configuration()
+        settings._validate_flora_configuration()
         if settings.argus_annotation_timeout < 60:
             raise ValueError("argus_annotation_timeout 不能小于 60 秒")
         if not 1 <= settings.argus_annotation_concurrency <= 64:
@@ -356,6 +359,54 @@ class Settings:
             raise ValueError(
                 "user_sessions.strict_host_key_checking 必须为 yes、accept-new 或 no"
             )
+
+    def _validate_flora_configuration(self):
+        if not isinstance(self.flora, dict):
+            raise ValueError("flora 必须是对象")
+        if not self.flora:
+            return
+        allowed = {
+            "enabled",
+            "src",
+            "python",
+            "model_cache",
+            "hf_home",
+            "partition",
+            "gpus",
+            "cpus_per_task",
+            "timeout_seconds",
+            "profiles",
+        }
+        unknown = set(self.flora) - allowed
+        if unknown:
+            raise ValueError(f"flora 包含未知字段：{', '.join(sorted(unknown))}")
+        if not isinstance(self.flora.get("enabled", False), bool):
+            raise ValueError("flora.enabled 必须为布尔值")
+        for key in ("src", "python", "model_cache", "hf_home", "partition"):
+            if key in self.flora and not isinstance(self.flora[key], str):
+                raise ValueError(f"flora.{key} 必须是字符串")
+        for key, default, low, high in (
+            ("gpus", 1, 1, 1),
+            ("cpus_per_task", 8, 1, 128),
+            ("timeout_seconds", 14400, 60, 7 * 24 * 3600),
+        ):
+            value = self.flora.get(key, default)
+            if type(value) is not int or not low <= value <= high:
+                raise ValueError(f"flora.{key} 必须在 {low} 到 {high} 之间")
+        profiles = self.flora.get("profiles", {})
+        if not isinstance(profiles, dict):
+            raise ValueError("flora.profiles 必须是 provider -> profile 对象")
+        for provider, spec in profiles.items():
+            if not isinstance(provider, str) or not provider:
+                raise ValueError("flora.profiles 包含空 Provider")
+            if not isinstance(spec, dict):
+                raise ValueError(f"flora.profiles[{provider!r}] 必须是对象")
+            if spec.get("profile") not in {"human", "yam", "dex", "tianji"}:
+                raise ValueError(f"flora.profiles[{provider!r}].profile 无效")
+            if type(spec.get("yam32", False)) is not bool:
+                raise ValueError(
+                    f"flora.profiles[{provider!r}].yam32 必须为布尔值"
+                )
 
     def _validate_runtime_configuration(self):
         if not isinstance(self.profiles, dict):

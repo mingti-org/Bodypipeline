@@ -120,6 +120,7 @@ class AnalysisRequest(BaseModel):
 class AnnotationRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     job_id: str = Field(min_length=1, max_length=128)
+    engine: Literal["argus", "flora"] = "argus"
     note: str | None = Field(default=None, max_length=4000)
     model: str | None = Field(default=None, min_length=1, max_length=200)
     cap_usd: float | None = Field(default=None, gt=0, le=1_000_000)
@@ -990,6 +991,7 @@ def create_app(settings, background=True):
             api_key=body.api_key,
             template_id=body.template_id,
             template_revision=body.template_revision,
+            engine=body.engine,
             principal=principal(request),
         )
 
