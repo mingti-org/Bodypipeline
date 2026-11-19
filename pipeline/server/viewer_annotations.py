@@ -15,6 +15,51 @@ def _replace(path, before, after):
 def patch_annotations(cache: Path):
     source = cache / "source/src"
     page = source / "app/[org]/[dataset]/[episode]/episode-viewer.tsx"
+    _replace(
+        page,
+        'import { AnnotationsPanel } from "@/components/annotations-panel";',
+        'import { AnnotationsPanel } from "@/components/annotations-panel";\n'
+        "import {\n"
+        "  initialEpisodePage,\n"
+        "  pageForEpisode,\n"
+        '} from "@/utils/episode-navigation-state";',
+    )
+    _replace(
+        page,
+        "  const pageSize = 100;\n"
+        "  const [currentPage, setCurrentPage] = useState(1);",
+        "  const pageSize = 100;\n"
+        "  // bodypipeline: restore the last browsed page for this dataset and episode\n"
+        "  const [currentPage, setCurrentPage] = useState(() =>\n"
+        "    initialEpisodePage(\n"
+        "      typeof window === \"undefined\" ? null : sessionStorage,\n"
+        "      datasetInfo.repoId,\n"
+        "      episodes,\n"
+        "      episodeId,\n"
+        "      pageSize,\n"
+        "    ),\n"
+        "  );",
+    )
+    _replace(
+        page,
+        "  // Initialize page based on the current episode. Splitting this out from\n"
+        "  // the keyboard listener effect lets the listener attach exactly once.\n"
+        "  useEffect(() => {\n"
+        "    const episodeIndex = episodes.indexOf(episodeId);\n"
+        "    if (episodeIndex !== -1) {\n"
+        "      setCurrentPage(Math.floor(episodeIndex / pageSize) + 1);\n"
+        "    }\n"
+        "  }, [episodes, episodeId, pageSize]);",
+        "  // bodypipeline: a changed episode takes precedence over the restored\n"
+        "  // browsing page. A refresh keeps the same episode on its saved page.\n"
+        "  const previousEpisodeIdRef = useRef(episodeId);\n"
+        "  useEffect(() => {\n"
+        "    if (previousEpisodeIdRef.current === episodeId) return;\n"
+        "    previousEpisodeIdRef.current = episodeId;\n"
+        "    const page = pageForEpisode(episodeId, episodes, pageSize);\n"
+        "    if (page !== null) setCurrentPage(page);\n"
+        "  }, [episodes, episodeId, pageSize]);",
+    )
     text = page.read_text()
     # Migrate the previous replacement UI without touching user annotation data.
     if "// bodypipeline: server-owned Subtask review v1" in text:

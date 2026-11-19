@@ -10,6 +10,19 @@ TARGET_FORMATS = ("v3.0", "v2.1")
 DATA_READY_STATES = {"CONVERTED", "SYNTHETIC_READY", "QUARANTINED", "COMPLETED"}
 
 
+def batch_name_for_job(job):
+    """Return display-only batch metadata for immutable delivery jobs."""
+    if not (job.get("immutable_delivery") or job.get("delivery_id")):
+        return None
+    recorded = job.get("batch_name")
+    if isinstance(recorded, str) and recorded.strip():
+        return recorded
+    dataset_path = job.get("dataset_path")
+    if not isinstance(dataset_path, str) or not dataset_path:
+        return None
+    return Path(dataset_path).parent.name or None
+
+
 def require_mutable_dataset(settings, path, job=None, *, store=None, jobs=None):
     """Do not mutate published deliveries, including aliases/manual imports."""
     resolved = Path(path).resolve()

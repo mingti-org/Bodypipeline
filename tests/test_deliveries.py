@@ -196,6 +196,38 @@ def setup_scanner(settings_factory, tmp_path, monkeypatch):
     return root, settings, app
 
 
+def test_delivery_import_persists_batch_name(settings_factory, tmp_path):
+    settings = settings_factory("server")
+    app = create_app(settings, background=False)
+    dataset = tmp_path / "batch-20261111-000005/lerobot"
+    (dataset / "meta").mkdir(parents=True)
+    (dataset / "meta/info.json").write_text(
+        json.dumps(
+            {
+                "codebase_version": "v3.0",
+                "robot_type": "sim",
+                "total_episodes": 2,
+                "total_frames": 5,
+            }
+        )
+    )
+    app.state.imports._import_lerobot(
+        dataset,
+        "sim",
+        delivery={
+            "delivery_id": "sim-drawer-cycle-20261111-000005",
+            "dataset_id": "sim-drawer-cycle",
+            "feature_schema_id": "joint-v1",
+            "manifest_sha256": "abc123",
+            "batch_name": "batch-20261111-000005",
+        },
+    )
+
+    job = app.state.ingest.store.all("job")[0]
+    assert job["dataset_name"] == "sim-drawer-cycle"
+    assert job["batch_name"] == "batch-20261111-000005"
+
+
 def test_incremental_registration_restart_and_read_only(
     settings_factory, tmp_path, monkeypatch
 ):
@@ -213,6 +245,7 @@ def test_incremental_registration_restart_and_read_only(
         assert job["robot_type"] == "sim" and job["immutable_delivery"]
         assert "runtime_id" not in job and "provider" not in job
         assert job["dataset_name"] == "sim-insert"
+        assert job["batch_name"] == "batch-001"
         assert (
             http.post(
                 "/api/imports", headers=auth, json={"path": str(batch / "lerobot")}

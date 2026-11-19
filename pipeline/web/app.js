@@ -9,14 +9,14 @@ const esc = (v) =>
       ],
   );
 const sessionCaptures = new Set();
-const previewFrameTimes = new Map();
+const datasetDescriptionDrafts = new Map();
 let config = null,
+  authOptions = null,
   captures = [],
   timer = null,
   frameTimer = null,
   healthTimer = null,
   clockTimer = null,
-  previewFpsTimer = null,
   frameController = null,
   frameFetching = false,
   previewPaused = false,
@@ -34,7 +34,7 @@ let config = null,
   serverDatasets = [],
   serverDeletions = [],
   serverAnnotations = [],
-  serverLoaded = new Set(),
+  serverRobotTypes = [],
   deletingDataset = null,
   selectedMergeDatasets = new Set(),
   activeVersionConversionSource = null,
@@ -56,9 +56,7 @@ const names = {
   STOPPING: "正在停止",
   RECOVERY_REQUIRED: "待恢复",
   REVIEW: "待确认保留",
-  SEALING: "待校验 / 封存中",
-  PAUSED: "已暂停",
-  SAVING: "保存中",
+  SEALING: "HDF5 打包中",
   SEALED: "已封存",
   DISCARDED: "已丢弃",
   QUEUED: "等待处理",
@@ -134,6 +132,9 @@ const manualTrimSummary = (job) => {
 const collectionLocation = (collection) => collection.target === "imported"
   ? collection.uploads?.[0]?.import_path || "历史数据目录"
   : `${collection.target}/${collection.prefix || ""}`;
+const collectionBatch = (collection) => collection.collection_date
+  ? ` / ${collection.collection_date}`
+  : "";
 const bytes = (n) =>
   n > 1024 ** 3
     ? (n / 1024 ** 3).toFixed(2) + " GB"
@@ -192,22 +193,74 @@ async function api(path, method = "GET", body) {  const controller = new AbortCo
 }
 function showLogin() {
   window.ClientReplay.deactivate();
-  window.ClientCaptureTelemetry?.stop();
   window.AnnotationUI?.hide();
   clearTimeout(timer);
   clearTimeout(frameTimer);
   clearTimeout(healthTimer);
   clearInterval(clockTimer);
-  clearInterval(previewFpsTimer);
-  resetPreviewFps();
   frameController?.abort();
   $("login-view").hidden = false;
   $("app-view").hidden = true;
+  $("account-badge").hidden = true;
+  $("login-password").value = "";
   config = null;
+  datasetDescriptionDrafts.clear();
+  $("dataset-description-form").hidden = true;
+  serverPages.clear();
+  serverApplied.clear();
+  serverStatusRequests.clear();
+  collectionDetails.clear();
+  serverRobotTypes = [];
+  serverStatus = null;
+  serverStatusType = null;
   captures = [];
   clientHealth = null;
   requestKey = null;
   setSidebarOpen(false);
+}
+async function configureLogin() {
+  try {
+    authOptions = await api("/api/auth-options");
+  } catch {
+    authOptions = { user_login: false, login_nodes: [] };
+  }
+  const userLogin = Boolean(authOptions.user_login);
+  $("h800-login-fields").hidden = !userLogin;
+  $("token-login-fields").hidden = userLogin;
+  for (const id of ("username login-password").split(" ")) {
+    $(id).required = userLogin;
+  }
+  $("token").required = !userLogin;
+  const nodes = Array.isArray(authOptions.login_nodes)
+    ? authOptions.login_nodes
+    : [];
+  if (userLogin && !$("login-node").value) {
+    $("login-node").value = nodes[0] || "";
+  }
+  const selected = $("login-node").value;
+  $("login-node-grid").replaceChildren(
+    ...nodes.map((node) => {
+      const button = document.createElement("button");
+      const active = node === selected;
+      button.type = "button";
+      button.className = "login-node-option";
+      button.setAttribute("role", "radio");
+      button.setAttribute("aria-checked", active ? "true" : "false");
+      button.dataset.node = node;
+      button.title = node;
+      button.textContent = node.replace(/^H800-/, "");
+      button.addEventListener("click", () => {
+        $("login-node").value = node;
+        for (const option of $("login-node-grid").children) {
+          const checked = option.dataset.node === node;
+          option.setAttribute("aria-checked", checked ? "true" : "false");
+          option.classList.toggle("active", checked);
+        }
+      });
+      button.classList.toggle("active", active);
+      return button;
+    }),
+  );
 }
 async function action(fn) {
   if (busy) {
@@ -219,33 +272,40 @@ async function action(fn) {
   if (client) {
     clearTimeout(frameTimer);
     frameController?.abort();
-    renderPreviewFps();
     renderClientCaptures();
   }
   try {
     await fn();
-    if (!client) await refresh();
+    if (!client) await refresh(true);
   } catch (e) {
     notice(e.message, true);
   } finally {
     busy = false;
     if (config?.role === "server") { updateConversionSelection(); updateMergeSelection(); updateVersionConversionSelection(); updateTrimSelection(); renderDatasetManagement(); if ($("dataset-delete-dialog").open) $("dataset-delete-confirmation").oninput(); }
     if (client && config?.role === "client") {
-      renderPreviewFps();
       renderClientCaptures();
       void refresh();
       if (!frameFetching) {
         clearTimeout(frameTimer);
-        frameTimer = setTimeout(refreshFrames, config.capture_capabilities?.preview_stream ? 0 : 1500);
+        frameTimer = setTimeout(refreshFrames, 1500);
       }
     }
   }
 }
 $("login-form").addEventListener("submit", async (e) => {
   e.preventDefault();
+  $("login-error").textContent = "";
   try {
-    await api("/api/login", "POST", { token: $("token").value });
+    const body = authOptions?.user_login
+      ? {
+          username: $("username").value.trim(),
+          password: $("login-password").value,
+          login_node: $("login-node").value.trim(),
+        }
+      : { token: $("token").value };
+    await api("/api/login", "POST", body);
     $("token").value = "";
+    $("login-password").value = "";
     await boot();
   } catch (err) {
     $("login-error").textContent = err.message;
@@ -264,7 +324,6 @@ async function boot() {
   $("login-view").hidden = true;
   $("app-view").hidden = false;
   const client = config.role === "client";
-  $("logout").hidden = client;
   $("client-nav").hidden = !client;
   $("server-nav").hidden = client;
   $("current-page").textContent = client ? "采集工作台" : "数据转换";
@@ -287,6 +346,13 @@ async function boot() {
     : config.processing_mode === "demo"
       ? "DEMO · 演示处理"
       : "SERVER · 中心服务";
+  const user = config.current_user;
+  $("account-badge").hidden = !user;
+  $("account-badge").textContent = user
+    ? user.is_admin
+      ? "ADMIN · 服务账号"
+      : `H800 · ${user.username}`
+    : "";
   if (client) {
     $("mock-warning").hidden = config.mode !== "mock";
     $("robot-label").textContent = config.robot_id;
@@ -299,28 +365,12 @@ async function boot() {
       $("target-note").textContent = "远端目标暂未更新，请检查连接后刷新页面。";
     });
     $("camera-count").textContent = config.profile.cameras.length;
-    $("preview-quality").disabled = !!config.capture_capabilities?.preview_passthrough;
-    $("preview-quality").innerHTML = config.capture_capabilities?.preview_passthrough
-      ? '<option value="full">相机原图</option>'
-      : '<option value="low">省流预览 · 320px</option><option value="full">清晰预览 · 640px</option>';
-    window.ClientCaptureService.configure({config, api, action, notice, refreshHealth: refreshClientHealth});
-    window.ClientCaptureTelemetry?.configure({
-      config,
-      api,
-      notice,
-      esc,
-      isActive: () => clientTab === "capture",
-      service: () => clientHealth?.capture_service,
-    });
     $("camera-grid").innerHTML = config.profile.cameras
       .map(
         (c) =>
-          `<div class="camera-tile"><img id="cam-${esc(c.id)}" alt="${esc(c.label)} 实时预览"><div class="camera-error" id="err-${esc(c.id)}">等待相机图像…</div><div class="camera-caption">${esc(c.label)} <span>${esc(c.id.toUpperCase())}</span></div><span class="camera-fps" id="fps-${esc(c.id)}" title="浏览器成功显示的预览帧率；录制帧率由采集配置决定">预览 -- FPS</span></div>`,
+          `<div class="camera-tile"><img id="cam-${esc(c.id)}" alt="${esc(c.label)} 实时预览"><div class="camera-error" id="err-${esc(c.id)}">等待相机图像…</div><div class="camera-caption">${esc(c.label)} <span>${esc(c.id.toUpperCase())}</span></div></div>`,
       )
       .join("");
-    resetPreviewFps();
-    clearInterval(previewFpsTimer);
-    previewFpsTimer = setInterval(renderPreviewFps, 1000);
     setClientTab(location.hash.slice(1) || "capture", false);
     clearTimeout(healthTimer);
     void refreshClientHealth();
@@ -337,7 +387,7 @@ async function boot() {
       ? `允许导入路径：${roots.join("、")}`
       : "管理员尚未配置 import_roots；配置后重启 Server 才能导入历史目录。";
     $("import-submit").disabled = !roots.length;
-    window.AnnotationUI?.configure({ api, notice, esc, bytes });
+    window.AnnotationUI?.configure({ api, notice, esc, bytes, refresh: () => refresh(true) });
     setServerTab(location.hash.slice(1) || serverTab, false);
   }
   void poll();
@@ -363,110 +413,45 @@ async function loadTargets() {
     ? "远端离线或不可达，使用缓存/待验证目标；不阻止本地录制。"
     : "目标由远端授权，路径不代表当前电脑文件夹。";
 }
-function resetPreviewFps(label = "预览 -- FPS") {
-  previewFrameTimes.clear();
-  document.querySelectorAll(".camera-fps").forEach((el) => { el.textContent = label; });
-}
-function renderPreviewFps() {
-  if (config?.role !== "client") return;
-  if (previewPaused || busy || document.hidden || clientTab !== "capture") {
-    resetPreviewFps(previewPaused ? "预览已暂停" : "预览暂停中");
-    return;
-  }
-  const now = performance.now();
-  for (const c of config.profile.cameras) {
-    const label = $("fps-" + c.id);
-    if (!label) continue;
-    const times = previewFrameTimes.get(c.id);
-    if (times?.length && now - times[times.length - 1] > 5000) times.length = 0;
-    label.textContent = times && !times.length
-      ? "预览 0.0 FPS"
-      : times?.length >= 2
-        ? `预览 ${((times.length - 1) * 1000 / (times[times.length - 1] - times[0])).toFixed(1)} FPS`
-        : "预览 -- FPS";
-  }
-}
-function recordPreviewFrame(cameraId) {
-  const now = performance.now();
-  const times = previewFrameTimes.get(cameraId) || [];
-  if (times.length && now - times[times.length - 1] > 5000) times.length = 0;
-  times.push(now);
-  // Retain one boundary sample so low-rate previews still have an interval.
-  while (times.length > 2 && times[1] < now - 5000) times.shift();
-  previewFrameTimes.set(cameraId, times);
-  renderPreviewFps();
-}
-document.addEventListener("visibilitychange", () => {
-  renderPreviewFps();
-  if (config?.role !== "client") return;
-  if (document.hidden) frameController?.abort();
-  else void refreshFrames();
-});
-async function displayPreview(c, blob, signal) {
-  if (signal.aborted) return;
-  const im = $("cam-" + c.id);
-  const url = URL.createObjectURL(blob);
-  if (im.dataset.url) URL.revokeObjectURL(im.dataset.url);
-  im.dataset.url = url;
-  im.src = url;
-  await im.decode();
-  if (signal.aborted || !im.isConnected) return;
-  $("err-" + c.id).hidden = true;
-  recordPreviewFrame(c.id);
-}
-function previewFailed(c) {
-  const err = $("err-" + c.id);
-  err.textContent = "预览暂未更新";
-  err.hidden = false;
-  previewFrameTimes.set(c.id, []);
-  renderPreviewFps();
-}
 async function refreshFrames() {
   clearTimeout(frameTimer);
   if (!config || config.role !== "client" || frameFetching) return;
   if (clientTab !== "capture" || previewPaused || busy || document.hidden) {
-    renderPreviewFps();
     frameTimer = setTimeout(refreshFrames, 1500);
     return;
   }
   frameFetching = true;
   const controller = new AbortController();
   frameController = controller;
-  const streaming = config.capture_capabilities?.preview_stream;
-  const timeout = streaming ? null : setTimeout(() => controller.abort(), 8000);
+  const timeout = setTimeout(() => controller.abort(), 8000);
   try {
-    if (streaming) {
-      await Promise.all(config.profile.cameras.map(c => window.ClientPreviewStream.run({
-        url: "/api/cameras/" + encodeURIComponent(c.id) + "/stream",
-        signal: controller.signal,
-        display: (blob, signal) => displayPreview(c, blob, signal),
-        failed: () => previewFailed(c),
-      })));
-      return;
-    }
     await Promise.all(config.profile.cameras.map(async (c) => {
+      const im = $("cam-" + c.id), err = $("err-" + c.id);
       try {
         const mode = $("preview-quality").value;
         const r = await fetch("/api/cameras/" + encodeURIComponent(c.id) + "/frame?preview=" + mode, {signal: controller.signal});
         if (!r.ok) throw Error();
         const blob = await r.blob();
-        await displayPreview(c, blob, controller.signal);
+        if (controller.signal.aborted) return;
+        const url = URL.createObjectURL(blob);
+        if (im.dataset.url) URL.revokeObjectURL(im.dataset.url);
+        im.dataset.url = url;
+        im.src = url;
+        err.hidden = true;
       } catch {
-        if (!controller.signal.aborted) previewFailed(c);
+        if (!controller.signal.aborted) { err.textContent = "预览暂未更新"; err.hidden = false; }
       }
     }));
   } finally {
     clearTimeout(timeout);
     frameFetching = false;
-    if (config?.role === "client") frameTimer = setTimeout(refreshFrames, streaming ? 0 : 1500);
+    if (config?.role === "client") frameTimer = setTimeout(refreshFrames, 1500);
   }
 }
 $("preview-toggle").onclick = () => {
   previewPaused = !previewPaused;
   $("preview-toggle").textContent = previewPaused ? "恢复预览" : "暂停预览";
   $("preview-note").textContent = previewPaused ? "预览已暂停，原始录制不受影响" : "预览独立于原始录制；弱网时可暂停";
-  resetPreviewFps();
-  renderPreviewFps();
   if (previewPaused) frameController?.abort();
   else void refreshFrames();
 };
@@ -483,7 +468,7 @@ async function refreshClientHealth() {
   } finally {
     if (config?.role === "client") {
       renderClientCaptures();
-      healthTimer = setTimeout(refreshClientHealth, config.capture_capabilities?.external_trigger ? 2000 : 10000);
+      healthTimer = setTimeout(refreshClientHealth, 10000);
     }
   }
 }
@@ -499,7 +484,7 @@ function acceptCaptures(rows) {
 function currentCapture() {
   return (
     captures.find((c) =>
-      ["STARTING", "RECORDING", "STOPPING", "RECOVERY_REQUIRED", "PAUSED", "SAVING"].includes(c.state),
+      ["STARTING", "RECORDING", "STOPPING", "RECOVERY_REQUIRED"].includes(c.state),
     ) ||
     captures.find((c) => c.state === "REVIEW" && sessionCaptures.has(c.id))
   );
@@ -517,9 +502,7 @@ const normalizedName = (v) => v.normalize("NFKC").trim().replace(/\s+/g, " ");
 function updateClientDatasetSummary() {
   const name = normalizedName($("dataset-name").value);
   $("capture-dataset-summary").textContent = name
-    ? config?.capture_capabilities?.service_control
-      ? `当前数据集：${name}。正常保存的每段采集自动加入上传队列。`
-      : `当前数据集：${name}。保留的每次采集作为一个 episode 加入，instruction 在 Server 转换时填写。`
+    ? `当前数据集：${name}。保留的每次采集作为一个 episode 加入，instruction 在 Server 转换时填写。`
     : "选择已有数据集或输入新名称；同名任务持续追加 episodes。";
 }
 $("dataset-name").oninput = updateClientDatasetSummary;
@@ -549,7 +532,6 @@ function captureBadge(c) {
     : badge(c.state);
 }
 function controls(c) {
-  if (c.external_trigger) return '<span class="small muted">手柄控制 · 自动保留正常保存的数据</span>';
   const buttons = [];
   if (["RECORDING", "RECOVERY_REQUIRED"].includes(c.state))
     buttons.push(
@@ -588,15 +570,6 @@ $("capture-form").onsubmit = (e) => {
     };
     $("start-button").disabled = true;
     notice("正在请求开始采集，等待机器人确认…");
-    if (config.capture_capabilities?.external_trigger) {
-      const serviceOptions = await window.ClientCaptureService.prepareForStart();
-      const batch = await api("/api/capture-batches", "POST", { ...data, instruction: data.dataset_name, ...serviceOptions });
-      requestKey = null;
-      await refreshClientHealth();
-      if (batch.state !== "ACTIVE") throw Error(batch.error || "作业状态待核实，勿重复启动");
-      notice(config.capture_capabilities.service_control?.start_notice || "采集作业已就绪：请使用手柄开始、结束或丢弃。后台校验和上传已暂停；本操作不会启动机器人控制器。");
-      return;
-    }
     const c = await api("/api/captures/start", "POST", data);
     acceptCaptures([c]);
     sessionCaptures.add(c.id);
@@ -607,19 +580,6 @@ $("capture-form").onsubmit = (e) => {
   });
 };
 document.addEventListener("click", (e) => {
-  const endBatch = e.target.closest("[data-end-batch]");
-  if (endBatch) action(async () => {
-    const force = endBatch.dataset.force === "true";
-    const confirmation = force
-      ? "确认强制停止本批次数采服务？尚未保存的当前段将被丢弃。此操作不是急停。"
-      : config.capture_capabilities.service_control?.end_confirmation || "确认结束本批次采集？请先用手柄保存当前段。本操作仅退出 raw 采集器，不停止机器人控制器。";
-    if (!confirm(confirmation)) return;
-    const result = await api(`/api/capture-batches/${endBatch.dataset.endBatch}/end`, "POST", {force});
-    await refreshClientHealth();
-    if (result.state === "STOPPING") { notice("正在退出本批次数采服务；退出并核对完成后自动上传。"); return; }
-    if (result.state !== "ENDED") throw Error(result.error || "采集器退出尚未确认，上传仍暂停");
-    notice("本批次采集结束，资源空闲后自动校验与上传。");
-  });
   const copy = e.target.closest("[data-copy-path]");
   if (copy) {
     copyText(copy.dataset.copyPath).then((copied) =>
@@ -674,6 +634,19 @@ document.addEventListener("click", (e) => {
     selectJob(d.dataset.detail);
     setServerTab("results");
     action(showJob);
+  }
+  const description = e.target.closest("[data-description]");
+  if (description) {
+    const id = description.dataset.description;
+    selectJob(id);
+    setServerTab("results");
+    action(async () => {
+      await showJob();
+      if (selectedJob === id && !$("dataset-description-form").hidden) {
+        $("dataset-description-form").scrollIntoView({behavior: "smooth", block: "center"});
+        $("dataset-description").focus({preventScroll: true});
+      }
+    });
   }
   const closePreview = e.target.closest("[data-close-preview]");
   if (closePreview)
@@ -758,13 +731,13 @@ function renderClientCaptures() {
   const rows = captures;
   renderClientDatasets();
   const active = rows.find((c) =>
-    ["STARTING", "RECORDING", "STOPPING", "RECOVERY_REQUIRED", "PAUSED", "SAVING"].includes(
+    ["STARTING", "RECORDING", "STOPPING", "RECOVERY_REQUIRED"].includes(
       c.state,
     ),
   );
   for (const row of rows)
     if (
-      ["STARTING", "RECORDING", "STOPPING", "RECOVERY_REQUIRED", "PAUSED", "SAVING"].includes(
+      ["STARTING", "RECORDING", "STOPPING", "RECOVERY_REQUIRED"].includes(
         row.state,
       )
     )
@@ -775,27 +748,14 @@ function renderClientCaptures() {
   const current =
     active ||
     rows.find((c) => c.state === "REVIEW" && sessionCaptures.has(c.id));
-  const external = !!config?.capture_capabilities?.external_trigger;
-  const managed = config?.capture_capabilities?.service_control;
-  const batch = clientHealth?.batch;
-  window.ClientCaptureService.render(clientHealth, busy);
-  $("start-button").disabled = !!active || busy || (external && (!clientHealth || !!batch));
-  $("start-button").textContent = managed?.start_label || (external ? "进入手柄采集作业" : "● 采集下一个 episode");
-  $("external-batch-actions").hidden = !external;
-  $("external-batch-actions").innerHTML = external && batch
-    ? `<p class="small">作业 ${esc(batch.state)} · ${esc(batch.adapter_status?.state || "等待就绪")} · ${batch.episode_count || 0} 段</p>${batch.error ? `<p class="error">${esc(batch.error)}</p>` : ""}<div class="action-row"><button class="secondary" type="button" data-end-batch="${esc(batch.id)}" ${busy || batch.state === "STOPPING" ? "disabled" : ""}>${esc(managed?.end_label || "结束本批次采集")}</button>${config.capture_capabilities.force_end ? `<button class="danger" type="button" data-end-batch="${esc(batch.id)}" data-force="true" ${busy || batch.state === "STOPPING" ? "disabled" : ""}>强制停止服务</button>` : ""}</div>`
-    : external && !managed ? '<p class="small muted">进入作业后使用遥操手柄；正常保存自动入队，丢弃不上传。机器人控制由现场单独启动。</p>' : "";
-  const transfer = clientHealth?.background_transfer;
-  const pendingBytes = rows.filter(c => c.upload_state !== "ACKED" && c.state !== "DISCARDED").reduce((n, c) => n + (c.total_bytes || 0), 0);
-  $("background-transfer-status").textContent = transfer?.enabled
-    ? `待处理 ${bytes(pendingBytes)} · ${transfer.allowed ? "资源空闲，后台处理可运行" : transfer.reason}` : "";
+  $("start-button").disabled = !!active || busy;
   $("health-label").textContent = active
     ? "● " + (names[active.state] || active.state)
     : clientHealth?.ready
       ? "● 采集适配器就绪"
       : clientHealth ? "○ 适配器尚未就绪" : "○ 健康检查待更新";
   $("capture-state").textContent = !current
-    ? (external && batch ? (names[batch.adapter_status?.state] || "作业就绪 · 等待手柄") : "就绪")
+    ? "就绪"
     : current.capture_failed
       ? "采集失败，只能丢弃"
       : names[current.state];
@@ -812,7 +772,7 @@ function renderClientCaptures() {
                 Math.round((100 * (c.uploaded_bytes || 0)) / c.total_bytes),
               )
             : 0;
-          return `<tr><td><strong class="task-name">${esc(c.dataset_name || c.instruction)}</strong><span class="sub">${esc(c.id.slice(0, 8))} · ${new Date(c.created_at * 1000).toLocaleString("zh-CN")}</span>${c.error ? `<span class="sub job-error">${esc(c.error)}</span>` : ""}</td><td>${captureBadge(c)}</td><td>${esc(c.remote_target)}<span class="sub">${esc(c.remote_prefix || "/")}</span></td><td>${badge(c.upload_state)} ${c.total_bytes ? `<span class="small">${percent}% · ${bytes(c.total_bytes)}</span><div class="progress"><span data-width="${percent}"></span></div>` : ""}${c.background_wait ? `<span class="sub">${esc(c.background_wait)}</span>` : ""}${c.upload_error ? `<span class="sub job-error">${esc(c.upload_error)}</span>` : ""}</td><td>${controls(c)}</td></tr>`;
+          return `<tr><td><strong class="task-name">${esc(c.dataset_name || c.instruction)}</strong><span class="sub">${esc(c.id.slice(0, 8))} · ${new Date(c.created_at * 1000).toLocaleString("zh-CN")}</span>${c.error ? `<span class="sub job-error">${esc(c.error)}</span>` : ""}</td><td>${captureBadge(c)}</td><td>${esc(c.remote_target)}<span class="sub">${esc(c.remote_prefix || "/")}</span></td><td>${badge(c.upload_state)} ${c.total_bytes ? `<span class="small">${percent}% · ${bytes(c.total_bytes)}</span><div class="progress"><span data-width="${percent}"></span></div>` : ""}${c.upload_error ? `<span class="sub job-error">${esc(c.upload_error)}</span>` : ""}</td><td>${controls(c)}</td></tr>`;
         })
         .join("")
     : '<tr><td colspan="5" class="empty">还没有采集记录。填写任务描述，开始第一段示教。</td></tr>';
@@ -821,101 +781,229 @@ function renderClientCaptures() {
     .forEach((el) => (el.style.width = el.dataset.width + "%"));
 }
 let datasetManagementPolling = false;
-async function refreshDatasetManagement() {
-  if (config?.role !== "server" || serverTab !== "merge" || datasetManagementPolling) return;
-  datasetManagementPolling = true;
-  try {
-    const managed = await api("/api/datasets");
-    serverDatasets = managed.datasets;
-    serverDeletions = managed.deletions;
-    serverLoaded.add("datasets");
-    renderServer(serverUploads, serverJobs);
-  } catch (e) {
-    if (serverTab === "merge") notice(e.message, true);
-  } finally {
-    datasetManagementPolling = false;
-  }
+async function refreshDatasetManagement(force = false) {
+  if (config?.role === "server" && serverTab === "merge") await loadServerData("datasets", force);
 }
-// Each server panel declares the lists it renders. ``jobs`` is shared by every
-// panel, while candidates and annotations are only needed by the panel that
-// shows them.
 const SERVER_PANEL_DATA = {
   uploads: ["collections", "jobs", "deliveries"],
-  convert: ["collections", "jobs", "versionCandidates", "trimCandidates"],
-  results: ["jobs", "viewer"],
-  merge: ["jobs", "mergeCandidates"],
-  annotations: ["jobs", "annotations"],
+  convert: ["collections", "jobs"],
+  results: ["results", "viewer"],
+  merge: ["datasets", "mergeJobs"],
+  annotations: ["annotationCandidates", "annotations"],
 };
 const SERVER_DATA_REQUESTS = {
-  collections: "/api/collections?summary=true",
-  jobs: "/api/jobs?summary=true",
+  collections: "/api/listings/collections",
+  jobs: "/api/listings/jobs",
+  mergeJobs: "/api/listings/merge-jobs",
+  results: "/api/listings/results",
+  datasets: "/api/listings/datasets",
   viewer: "/api/viewer",
-  mergeCandidates: "/api/merge-candidates",
-  versionCandidates: "/api/version-conversion-candidates",
-  trimCandidates: "/api/trim-candidates",
-  annotations: "/api/annotations",
   deliveries: "/api/deliveries",
+  mergeCandidates: "/api/listings/merge-candidates",
+  versionCandidates: "/api/listings/version-conversion-candidates",
+  trimCandidates: "/api/listings/trim-candidates",
+  annotationCandidates: "/api/listings/annotation-candidates",
+  annotations: "/api/listings/annotations",
 };
-async function refresh() {
-  if (!config || polling) return;
-  const session = config, tab = serverTab;
-  polling = true;
-  try {
-    if (config.role === "client") {
-      const rows = await api("/api/capture-status");
-      if (config?.role === "client") acceptCaptures(rows);
-    } else {
-      // Fetch only the lists the current panel renders. Candidates and
-      // annotations are expensive, and the merge-candidates endpoint can take
-      // seconds, so hidden panels must not pay for them every polling cycle.
-      const keys = SERVER_PANEL_DATA[tab] || SERVER_PANEL_DATA.convert;
-      const settled = await Promise.allSettled(
-        keys.map((key) => api(SERVER_DATA_REQUESTS[key])),
-      );
-      if (config !== session) return;
-      let failure = null;
-      settled.forEach((entry, index) => {
-        const key = keys[index];
-        if (entry.status === "rejected") {
-          failure = failure || entry.reason;
-          return;
-        }
-        const value = entry.value;
-        serverLoaded.add(key);
-        if (key === "collections") {
-          serverCollections = value;
-          serverUploads = value.flatMap((c) => c.uploads);
-        } else if (key === "jobs") serverJobs = value;
-        else if (key === "viewer") renderViewerStatus(value);
-        else if (key === "mergeCandidates") serverMergeCandidates = value;
-        else if (key === "versionCandidates") serverVersionConversionCandidates = value;
-        else if (key === "trimCandidates") serverTrimCandidates = value;
-        else if (key === "annotations") serverAnnotations = value;
-        else if (key === "deliveries") renderDeliveries(value);
-      });
+const serverPages = new Map();
+const serverApplied = new Map();
+const serverStatusRequests = new Map();
+const collectionDetails = new Map();
+let serverRefreshEpoch = 0;
+let serverStatus = null, serverStatusType = null, robotTypesPromise = null, robotsAt = 0;
+function serverPage(key) {
+  const scope = `${$("server-robot-type").value}:${key}`;
+  if (!serverPages.has(scope)) serverPages.set(scope, {offset: 0, limit: 50, total: 0, q: "", kind: "", at: 0, pending: null, data: null});
+  return serverPages.get(scope);
+}
+function serverKeys() {
+  const keys = [...(SERVER_PANEL_DATA[serverTab] || [])];
+  if (serverTab === "convert" && $("version-conversion-section")?.open) keys.push("versionCandidates");
+  if (serverTab === "convert" && $("trim-section")?.open) keys.push("trimCandidates");
+  if (serverTab === "merge" && $("merge-section")?.open) keys.push("mergeCandidates");
+  return keys;
+}
+function applyServerData(key, data) {
+  if (!serverKeys().includes(key) || serverApplied.get(key) === data) return;
+  serverApplied.set(key, data);
+  const value = data.items;
+  if (key === "collections") {
+    serverCollections = value;
+    serverUploads = value.flatMap((c) => c.uploads);
+  } else if (key === "jobs" || key === "mergeJobs" || key === "results") serverJobs = value;
+  else if (key === "viewer") renderViewerStatus(data);
+  else if (key === "deliveries") renderDeliveries(data);
+  else if (key === "datasets") { serverDatasets = value; serverDeletions = data.deletions || []; }
+  else if (key === "mergeCandidates") {
+    const selected = serverMergeCandidates.filter((row) => selectedMergeDatasets.has(row.id) && !value.some((fresh) => fresh.id === row.id));
+    serverMergeCandidates = [...selected, ...value];
+  } else if (key === "versionCandidates") serverVersionConversionCandidates = value;
+  else if (key === "trimCandidates") serverTrimCandidates = value;
+  else if (key === "annotations" || key === "annotationCandidates") window.AnnotationUI?.acceptList(key, data);
+}
+function renderServerPages() {
+  document.querySelectorAll("[data-list-controls]").forEach((el) => {
+    const key = el.dataset.listControls, state = serverPage(key);
+    el.hidden = !$("server-robot-type").value;
+    if (el.hidden) return;
+    const label = state.pending ? "加载中…" : `共 ${state.total} 项 · ${state.total ? state.offset + 1 : 0}–${Math.min(state.offset + state.limit, state.total)}`;
+    el.querySelector("[data-list-count]").textContent = label;
+    el.querySelector("[data-list-prev]").disabled = Boolean(state.pending) || !state.offset;
+    el.querySelector("[data-list-next]").disabled = Boolean(state.pending) || state.offset + state.limit >= state.total;
+    const search = el.querySelector("[data-list-search]");
+    if (search && search !== document.activeElement) search.value = state.q;
+  });
+}
+async function loadServerData(key, force = false) {
+  const type = $("server-robot-type").value, session = config;
+  if (!type || session?.role !== "server") return;
+  const state = serverPage(key);
+  if (state.pending) {
+    if (force) state.reload = true;
+    return state.pending;
+  }
+  if (!force && state.data && Date.now() - state.at < 30000) {
+    if (serverKeys().includes(key) && serverApplied.get(key) !== state.data) {
+      applyServerData(key, state.data);
       renderServer(serverUploads, serverJobs);
-      if (
-        serverTab === "convert" &&
-        activeTrimPreviewId &&
-        !["COMPLETED", "FAILED", "INTERRUPTED"].includes(trimPreview?.state)
-      ) {
-        await refreshTrimPreview();
+    }
+    return;
+  }
+  const params = new URLSearchParams({robot_type: type, offset: state.offset, limit: state.limit, q: state.q});
+  if (state.kind) params.set("kind", state.kind);
+  const signature = params.toString();
+  let retry = false;
+  state.pending = (async () => {
+    try {
+      const data = await api(SERVER_DATA_REQUESTS[key] + (["viewer", "deliveries"].includes(key) ? "" : "?" + signature));
+      if (state.offset !== Number(params.get("offset")) || state.q !== params.get("q") || state.kind !== (params.get("kind") || "")) { retry = true; return; }
+      if (!["viewer", "deliveries"].includes(key) && state.offset && state.offset >= data.total) {
+        state.offset = Math.max(0, Math.floor((data.total - 1) / state.limit) * state.limit);
+        retry = true; return;
       }
-      if (serverTab === "merge") void refreshDatasetManagement();
-      if (selectedJob && serverTab === "results") await showJob();
-      if (failure && serverTab === tab) {
-        notice(failure.message, true);
-        $("notice").dataset.pollError = "true";
-      } else if (!failure && $("notice").dataset.pollError) {
-        $("notice").hidden = true;
-        delete $("notice").dataset.pollError;
+      state.data = data; state.total = data.total || 0; state.at = Date.now();
+      if (config !== session || $("server-robot-type").value !== type) return;
+      if (serverKeys().includes(key)) {
+        applyServerData(key, data);
+        renderServer(serverUploads, serverJobs);
+      }
+    } catch (error) {
+      if (config === session && $("server-robot-type").value === type) notice(error.message, true);
+    } finally {
+      state.pending = null;
+      renderServerPages();
+      if ((retry || state.reload) && config === session && $("server-robot-type").value === type && serverKeys().includes(key)) {
+        state.reload = false;
+        void loadServerData(key, true);
       }
     }
+  })();
+  renderServerPages();
+  return state.pending;
+}
+async function loadServerRobots(force = false) {
+  if (!force && serverRobotTypes.length && Date.now() - robotsAt < 30000) return;
+  const session = config;
+  if (!robotTypesPromise) robotTypesPromise = api("/api/listings/robots").then((data) => {
+    if (config !== session) return;
+    serverRobotTypes = data.robot_types;
+    robotsAt = Date.now();
+    if (config?.role === "server") renderServer(serverUploads, serverJobs);
+  }).finally(() => { robotTypesPromise = null; });
+  await robotTypesPromise;
+}
+const serverSearchTimers = new Map();
+for (const [key, anchorId] of [
+  ["collections", "upload-list"], ["collections", "conversion-upload"],
+  ["jobs", "job-list"], ["results", "result-list"], ["datasets", "dataset-list"],
+  ["mergeJobs", "merge-job-list"],
+  ["mergeCandidates", "merge-source-list"], ["versionCandidates", "version-conversion-source"],
+  ["trimCandidates", "trim-source"],
+  ["annotationCandidates", "annotation-dataset"], ["annotations", "annotation-list"],
+]) {
+  const anchor = $(anchorId);
+  if (!anchor) continue;
+  const controls = document.createElement("div");
+  controls.className = "server-list-controls";
+  controls.dataset.listControls = key;
+  controls.hidden = true;
+  controls.innerHTML = `${key === "datasets" ? "" : `<label>搜索<input type="search" data-list-search="${key}" placeholder="名称或 ID" /></label>`}<span class="small muted" data-list-count></span><div class="action-row"><button type="button" class="secondary" data-list-prev="${key}" aria-label="上一页" title="上一页">←</button><button type="button" class="secondary" data-list-next="${key}" aria-label="下一页" title="下一页">→</button><button type="button" class="text-button" data-list-refresh="${key}">刷新</button></div>`;
+  (anchor.closest(".table-scroll") || anchor).after(controls);
+}
+document.addEventListener("click", (event) => {
+  const button = event.target.closest("[data-list-prev], [data-list-next], [data-list-refresh]");
+  if (!button) return;
+  const key = button.dataset.listPrev || button.dataset.listNext || button.dataset.listRefresh;
+  const state = serverPage(key);
+  if (button.dataset.listPrev) state.offset = Math.max(0, state.offset - state.limit);
+  if (button.dataset.listNext) state.offset += state.limit;
+  state.at = 0;
+  void loadServerData(key, true);
+});
+document.addEventListener("input", (event) => {
+  const key = event.target.dataset.listSearch;
+  if (!key) return;
+  const state = serverPage(key);
+  state.q = event.target.value.trim(); state.offset = 0; state.at = 0;
+  clearTimeout(serverSearchTimers.get(key));
+  serverSearchTimers.set(key, setTimeout(() => void loadServerData(key, true), 300));
+});
+document.addEventListener("keydown", (event) => {
+  if (event.target.dataset.listSearch && event.key === "Enter") event.preventDefault();
+});
+for (const [id, key] of [["version-conversion-section", "versionCandidates"], ["trim-section", "trimCandidates"], ["merge-section", "mergeCandidates"]]) {
+  $(id)?.addEventListener("toggle", () => {
+    if ($(id).open) void loadServerData(key);
+  });
+}
+async function refresh(force = false) {
+  if (!config || (polling && config.role === "client")) return;
+  const session = config;
+  if (config.role === "server") {
+    const epoch = ++serverRefreshEpoch;
+    try {
+      await loadServerRobots(force);
+      const type = $("server-robot-type").value;
+      if (!type) return;
+      await Promise.allSettled(serverKeys().map((key) => loadServerData(key, force)));
+      if (config !== session || $("server-robot-type").value !== type) return;
+      let pending = serverStatusRequests.get(type);
+      if (!pending) {
+        pending = api(`/api/listings/status?robot_type=${encodeURIComponent(type)}`).finally(() => serverStatusRequests.delete(type));
+        serverStatusRequests.set(type, pending);
+      }
+      const fresh = await pending;
+      if (config !== session || $("server-robot-type").value !== type || epoch !== serverRefreshEpoch) return;
+      const previous = serverStatusType === type ? serverStatus : null;
+      serverStatus = fresh; serverStatusType = type;
+      const changed = (kind) => previous && previous.revisions[kind] !== fresh.revisions[kind];
+      const reload = new Set();
+      if (changed("upload")) { reload.add("collections"); reload.add("datasets"); }
+      if (changed("job")) { reload.add("jobs"); reload.add("mergeJobs"); reload.add("results"); }
+      if (changed("dataset_description")) reload.add("results");
+      if (changed("dataset_deletion")) reload.add("datasets");
+      if (changed("annotation")) { reload.add("annotations"); reload.add("annotationCandidates"); }
+      if ((previous && previous.datasets_revision !== fresh.datasets_revision) || changed("recycle")) {
+        ["datasets", "mergeCandidates", "versionCandidates", "trimCandidates", "annotationCandidates"].forEach((key) => reload.add(key));
+      }
+      for (const key of reload) serverPage(key).at = 0;
+      await Promise.allSettled(serverKeys().filter((key) => reload.has(key)).map((key) => loadServerData(key, true)));
+      if (config !== session || $("server-robot-type").value !== type || epoch !== serverRefreshEpoch) return;
+      renderServerCounts();
+      if (serverTab === "annotations") await window.AnnotationUI?.update(fresh, force);
+      if (selectedJob && serverTab === "results" && (force || changed("job") || changed("check") || changed("dataset_description") || !detailSignature)) await showJob();
+      if (serverTab === "convert" && activeTrimPreviewId && !["COMPLETED", "FAILED", "INTERRUPTED"].includes(trimPreview?.state)) await refreshTrimPreview();
+    } catch (error) { if (config === session) notice(error.message, true); }
+    return;
+  }
+  polling = true;
+  try {
+    const rows = await api("/api/capture-status");
+    if (config === session) acceptCaptures(rows);
   } catch (e) {
     notice(e.message, true);
   } finally {
     polling = false;
-    if (config?.role === "server" && config === session && serverTab !== tab) void refresh();
   }
 }
 function setSidebarOpen(open, restoreFocus = false) {
@@ -955,8 +1043,6 @@ function setClientTab(value, updateHistory = true) {
   if (updateHistory && location.hash !== "#" + value) { location.hash = value; return; }
   $("client-view").hidden = tab !== "capture";
   $("client-replay-panel").hidden = tab !== "replay";
-  if (tab === "capture") window.ClientCaptureTelemetry?.refresh();
-  else window.ClientCaptureTelemetry?.stop();
   document.querySelectorAll("[data-client-tab]").forEach((button) => {
     const active = button.dataset.clientTab === tab;
     button.classList.toggle("active", active);
@@ -964,20 +1050,15 @@ function setClientTab(value, updateHistory = true) {
     if (active) button.setAttribute("aria-current", "page");
     else button.removeAttribute("aria-current");
   });
-  const title =
-    tab === "replay"
-      ? "数据回放"
-      : "采集工作台";
+  const title = tab === "replay" ? "数据回放" : "采集工作台";
   $("page-title").textContent = $("current-page").textContent = title;
-  document.title = title + " · BodyPipeline";
+  document.title = title + " · imply";
   $("page-eyebrow").textContent = tab === "replay" ? "ROBOT REPLAY" : "TELEOPERATION COLLECTION";
   $("page-description").textContent = tab === "replay"
     ? "选择本机 Episode，查看轨迹信息、执行进度和日志。"
     : "在机器人本地录制，确认保留后可靠上传。";
   $("notice").hidden = true;
   clearTimeout(frameTimer); frameController?.abort();
-  resetPreviewFps();
-  renderPreviewFps();
   if (tab === "replay") void window.ClientReplay.activate(api, config.robot_id);
   else {
     window.ClientReplay.deactivate();
@@ -989,6 +1070,7 @@ function setClientTab(value, updateHistory = true) {
 }
 function setServerTab(tab, updateHistory = true) {
   if (!["uploads", "convert", "results", "merge", "annotations"].includes(tab)) tab = "convert";
+  if (serverTab !== tab) serverApplied.clear();
   serverTab = tab;
   if (location.hash === "#replay") history.replaceState(null, "", "#" + tab);
   if (updateHistory && location.hash !== "#" + tab) location.hash = tab;
@@ -1011,7 +1093,7 @@ function setServerTab(tab, updateHistory = true) {
     merge: "按机器人管理原始数据与转换结果，或合并生成新的 LeRobot 数据集。",
     annotations: "调用 Argus review 为已登记的数据集生成逐 Episode 标注，并跟踪费用与结果。",
   }[tab];
-  document.title = title + " · BodyPipeline";
+  document.title = title + " · imply";
   $("job-detail-panel").hidden = !selectedJob || tab !== "results";
   $("demo-warning").hidden = config?.processing_mode !== "demo" || ["merge", "annotations"].includes(tab);
   $("mode-badge").textContent = config?.processing_mode === "demo" ? "DEMO · 演示处理" : "SERVER · 中心服务";
@@ -1026,6 +1108,7 @@ function setServerTab(tab, updateHistory = true) {
 }
 function selectJob(id) {
   if (id !== selectedJob) {
+    $("dataset-description-form").hidden = true;
     selectedCheck = null;
     logText = "选择日志查看执行诊断。";
   }
@@ -1047,6 +1130,7 @@ function replaceOptions(element, options, selected) {
   }
 }
 $("server-robot-type").onchange = () => {
+  serverApplied.clear();
   selectedMergeDatasets.clear();
   activeVersionConversionSource = null;
   $("conversion-upload").value = "";
@@ -1057,7 +1141,17 @@ $("server-robot-type").onchange = () => {
   detailSignature = null;
   $("job-detail-panel").hidden = true;
   $("notice").hidden = true;
+  serverCollections = []; serverUploads = []; serverJobs = [];
+  serverDatasets = []; serverDeletions = [];
+  serverMergeCandidates = []; serverVersionConversionCandidates = []; serverTrimCandidates = [];
+  serverStatus = null; serverStatusType = null;
+  const datasetPage = serverPage("datasets");
+  $("dataset-kind").value = datasetPage.kind;
+  $("dataset-search").value = datasetPage.q;
+  window.AnnotationUI?.resetScope();
   renderServer(serverUploads, serverJobs);
+  void refresh();
+  if (serverTab === "annotations") window.AnnotationUI?.show();
 };
 function conversionCorrectionSummary(job) {
   const options = job.conversion_options?.gripper_closure;
@@ -1073,6 +1167,32 @@ function conversionCorrectionSummary(job) {
 }
 function chosenCollection() {
   return serverCollections.find((c) => c.id === $("conversion-upload").value && rowRobotType(c) === $("server-robot-type").value);
+}
+function ensureCollectionDetail(collection) {
+  if (!collection?.conversion_checks_pending || collection.conversion_checks_error) return;
+  const session = config, type = $("server-robot-type").value;
+  const key = `${type}:${collection.id}:${collection.revision}`;
+  let entry = collectionDetails.get(key);
+  if (entry?.data && Date.now() - entry.at < 30000) {
+    Object.assign(collection, entry.data);
+    return;
+  }
+  if (entry?.pending) return;
+  entry = {pending: true};
+  collectionDetails.set(key, entry);
+  while (collectionDetails.size > 200) collectionDetails.delete(collectionDetails.keys().next().value);
+  const params = new URLSearchParams({robot_type: type, id: collection.id});
+  void api(`/api/listings/collection-detail?${params}`).then((data) => {
+    entry.data = data; entry.at = Date.now();
+    if (config !== session || $("server-robot-type").value !== type) return;
+    const current = serverCollections.find((row) => row.id === collection.id && row.revision === collection.revision);
+    if (current) { Object.assign(current, data); renderServer(serverUploads, serverJobs); }
+  }).catch((error) => {
+    collectionDetails.delete(key);
+    if (config !== session || $("server-robot-type").value !== type) return;
+    const current = serverCollections.find((row) => row.id === collection.id && row.revision === collection.revision);
+    if (current) { current.conversion_checks_error = error.message; updateConversionSelection(); }
+  }).finally(() => { entry.pending = false; });
 }
 let conversionOptionsRuntime = null;
 function selectedConversionRuntime() {
@@ -1117,6 +1237,7 @@ function selectedConversionOptions() {
 }
 function updateConversionSelection() {
   const type = $("server-robot-type").value, c = chosenCollection();
+  ensureCollectionDetail(c);
   if (activeCollection !== (c?.id || null)) {
     activeCollection = c?.id || null;
     selectedEpisodes = new Set((c?.uploads || []).filter((u) => u.state === "COMMITTED").map((u) => u.id));
@@ -1137,7 +1258,7 @@ function updateConversionSelection() {
   }
   if ($("conversion-trim").checked) $("conversion-static").checked = false;
   $("conversion-source").innerHTML = c
-    ? `<strong>${esc(c.dataset_name)}</strong><br>${c.ready_count} / ${c.episode_count} 个 episode 已接收 · ${bytes(c.total_bytes)}<br><span class="path-hint">数据集 ${esc(c.id)} · ${esc(collectionLocation(c))}</span>`
+    ? `<strong>${esc(c.dataset_name + collectionBatch(c))}</strong><br>${c.ready_count} / ${c.episode_count} 个 episode 已接收 · ${bytes(c.total_bytes)}<br><span class="path-hint">数据集 ${esc(c.id)} · ${esc(c.batch_id || "未分批")} · ${esc(collectionLocation(c))}</span>`
     : "请选择原始数据集；同一任务的多次采集将合并转换。";
   $("episode-picker").hidden = !c;
   const selected = ready.filter((u) => selectedEpisodes.has(u.id));
@@ -1153,6 +1274,7 @@ function updateConversionSelection() {
   $("episode-all").disabled = busy || !ready.length;
   $("episode-selection-count").textContent = `已选 ${selected.length} / ${ready.length} 段可转换采集`;
   const problems = [...new Set(selected.flatMap((u) => (u.conversion_blockers || []).map((b) => b.message)))];
+  if (c?.conversion_checks_pending) problems.push(c.conversion_checks_error || "正在读取所选数据集的转换配置…");
   if (config.processing_mode === "real" && !config.letools_available) problems.push("服务器尚未配置可执行的 letools。");
   $("conversion-warning").hidden = !problems.length;
   $("conversion-warning").innerHTML = problems.length ? `<strong>转换前需要完成以下配置：</strong><ul>${problems.map((message) => `<li>${esc(message)}</li>`).join("")}</ul>` : "";
@@ -1222,7 +1344,9 @@ $("import-form").onsubmit = (event) => {
         path: $("import-path").value.trim(),
         robot_type: $("import-robot-type").value.trim() || null,
       });
+      await loadServerRobots(true);
       $("server-robot-type").value = row.robot_type;
+      $("server-robot-type").dispatchEvent(new Event("change"));
       $("import-path").value = "";
       $("import-robot-type").value = "";
       await refresh();
@@ -1479,7 +1603,7 @@ $("trim-form").onsubmit = (event) => {
   });
 };
 function renderServer(uploads, jobs) {
-  const runtimeTypes = (config.runtimes || []).map((r) => r.robot_type).filter(Boolean);
+  const runtimeTypes = [...serverRobotTypes, ...(config.runtimes || []).map((r) => r.robot_type)].filter(Boolean);
   const types = [...new Set([...runtimeTypes, ...uploads.map(rowRobotType), ...jobs.map(rowRobotType), ...serverDatasets.map(rowRobotType), ...serverDeletions.map(rowRobotType)])].sort();
   const oldType = $("server-robot-type").value;
   const type = types.includes(oldType) ? oldType : "";
@@ -1494,22 +1618,10 @@ function renderServer(uploads, jobs) {
   $("robot-scope-hint").textContent = type ? `当前范围：${robotTypeLabel(type)}。下方数据、任务、结果仅显示此类型；同类型多台设备通过设备 ID 区分。` : "选择后，再选择该类型下的数据集。原始数据、转换任务、合并任务和预览结果会一起筛选。";
   uploads = uploads.filter((u) => rowRobotType(u) === type);
   jobs = jobs.filter((j) => rowRobotType(j) === type);
-  $("metric-uploads").textContent = uploads.filter((x) => x.state === "COMMITTED").length;
   const conversions = jobs.filter((j) => j.operation !== "merge");
-  $("metric-jobs").textContent = conversions.length;
-  $("nav-job-count").textContent = conversions.length;
-  if (serverLoaded.has("datasets")) {
-    $("nav-merge-count").textContent = serverDatasets.filter((d) => rowRobotType(d) === type).length;
-  }
-  $("nav-result-count").textContent = jobs.filter((j) => j.dataset_available && !isInPlaceManualTrim(j)).length;
-  if (serverLoaded.has("annotations")) {
-    $("nav-annotation-count").textContent = serverAnnotations.filter((a) => ["QUEUED", "RUNNING"].includes(a.state)).length;
-  }
-  $("metric-completed").textContent = jobs.filter((x) => x.dataset_available && !isInPlaceManualTrim(x)).length;
   const collections = serverCollections.filter((c) => rowRobotType(c) === type);
-  if (serverLoaded.has("collections")) $("nav-upload-count").textContent = collections.length;
   const selected = $("conversion-upload").value;
-  const options = '<option value="">请选择数据集</option>' + collections.map((c) => `<option value="${esc(c.id)}">${c.capture_mode === "mock" ? "[模拟] " : ""}${esc(c.dataset_name)} · ${c.ready_count}/${c.episode_count} episodes · ${esc(c.target)}/${esc(c.prefix)} · ${esc(c.id.slice(0, 6))}</option>`).join("");
+  const options = '<option value="">请选择数据集</option>' + collections.map((c) => `<option value="${esc(c.id)}">${c.capture_mode === "mock" ? "[模拟] " : ""}${esc(c.dataset_name + collectionBatch(c))} · ${c.ready_count}/${c.episode_count} episodes · ${esc(c.target)}/${esc(c.prefix)} · ${esc(c.id.slice(0, 6))}</option>`).join("");
   replaceOptions($("conversion-upload"), options, collections.some((c) => c.id === selected) ? selected : "");
   updateConversionSelection();
   const versionSources = serverVersionConversionCandidates.filter((source) => rowRobotType(source) === type);
@@ -1539,25 +1651,44 @@ function renderServer(uploads, jobs) {
   );
   updateTrimSelection();
   $("upload-list").innerHTML = collections.length ? collections.map((c) =>
-    `<tr><td><strong class="task-name">${esc(c.dataset_name)}</strong><span class="sub">${esc(c.id.slice(0, 12))} · ${esc(collectionLocation(c))}</span></td><td>${esc([...new Set(c.uploads.map((u) => u.robot_id))].join(", "))} ${c.capture_mode === "mock" ? badge("MOCK") : c.target === "imported" ? badge("IMPORTED") : ""}</td><td>${bytes(c.total_bytes)}<span class="sub">${c.episode_count} 个 episodes</span></td><td>${c.ready_count} / ${c.episode_count}</td><td><button class="secondary" data-process="${esc(c.id)}">查看 / 批量转换</button></td></tr>`
+    `<tr><td><strong class="task-name">${esc(c.dataset_name + collectionBatch(c))}</strong><span class="sub">${esc(c.id.slice(0, 12))} · ${esc(c.batch_id || "未分批")} · ${esc(collectionLocation(c))}</span></td><td>${esc([...new Set(c.uploads.map((u) => u.robot_id))].join(", "))} ${c.capture_mode === "mock" ? badge("MOCK") : c.target === "imported" ? badge("IMPORTED") : ""}</td><td>${bytes(c.total_bytes)}<span class="sub">${c.episode_count} 个 episodes</span></td><td>${c.ready_count} / ${c.episode_count}</td><td><button class="secondary" data-process="${esc(c.id)}">查看 / 批量转换</button></td></tr>`
   ).join("") : '<tr><td colspan="5" class="empty">请选择机器人类型；该类型的数据集将在此显示。</td></tr>';
   $("job-list").innerHTML = conversions.length ? conversions.map((j) =>
-    `<tr><td><strong class="task-name">${esc(j.dataset_name || j.instruction || j.id.slice(0, 12))}</strong><span class="sub">${esc(j.id.slice(0, 12))} · ${esc(jobOriginSummary(j))}</span>${j.operation === "version_conversion" ? `<span class="sub">来源：${esc(j.source_dataset_name)} · ${esc(j.source_format)} → ${esc(j.target_format)}</span>` : ""}${j.operation === "subtask_export" ? `<span class="sub">Subtask：${esc(j.source_dataset_name)} · 标注 ${esc(String(j.source_annotation_id || j.annotation_id || "").slice(0, 12))} · 覆盖 ${esc(Math.round(100 * (j.subtask_summary?.ratio ?? 0)))}%</span>` : ""}${j.operation === "stationary_trim" ? `<span class="sub">首尾裁剪：${esc(j.source_dataset_name)} · 计划删除 ${esc(j.trim_summary?.frames_removed ?? "?")} 帧</span>` : ""}${j.operation === "manual_trim" ? `<span class="sub">手动裁剪：${esc(j.source_dataset_name)} · Episode ${esc(j.manual_episode ?? "?")} · 删除 ${esc(j.manual_removed_frames ?? "?")} 帧</span>` : ""}${manualTrimSummary(j)}${j.trim_idle_frames ? `<span class="sub">转换时首尾裁剪：删除 ${esc(j.trim_summary?.frames_removed ?? "?")} 帧</span>` : ""}${j.trim_static_intervals ? `<span class="sub">转换时静止帧裁剪：删除 ${esc(j.interval_summary?.frames_removed ?? "?")} 帧 · ${esc(j.interval_summary?.static_intervals ?? "?")} 段静止帧</span>` : ""}</td><td>LeRobot ${esc(j.target_format)}<span class="sub">${esc(j.operation === "subtask_export" ? "复制并写入 subtask_index + 深度验证" : j.run_doctor === false ? "仅转换 + 深度验证" : "转换 + Doctor")}</span></td><td>${esc(jobStageText(j))}${j.error ? `<span class="sub job-error">${esc(j.error)}</span>` : ""}</td><td>${jobBadge(j)} ${sourceBadge(j)} ${trimmedBadge(j)}</td><td><button class="secondary" data-detail="${esc(j.id)}">详情与结果</button></td></tr>`
+    `<tr><td><strong class="task-name">${esc(datasetLabel(j) || j.id.slice(0, 12))}</strong><span class="sub">${esc(j.id.slice(0, 12))} · ${esc(jobOriginSummary(j))}</span>${j.operation === "version_conversion" ? `<span class="sub">来源：${esc(j.source_dataset_name)} · ${esc(j.source_format)} → ${esc(j.target_format)}</span>` : ""}${j.operation === "subtask_export" ? `<span class="sub">Subtask：${esc(j.source_dataset_name)} · 标注 ${esc(String(j.source_annotation_id || j.annotation_id || "").slice(0, 12))} · 覆盖 ${esc(Math.round(100 * (j.subtask_summary?.ratio ?? 0)))}%</span>` : ""}${j.operation === "stationary_trim" ? `<span class="sub">首尾裁剪：${esc(j.source_dataset_name)} · 计划删除 ${esc(j.trim_summary?.frames_removed ?? "?")} 帧</span>` : ""}${j.operation === "manual_trim" ? `<span class="sub">手动裁剪：${esc(j.source_dataset_name)} · Episode ${esc(j.manual_episode ?? "?")} · 删除 ${esc(j.manual_removed_frames ?? "?")} 帧</span>` : ""}${manualTrimSummary(j)}${j.trim_idle_frames ? `<span class="sub">转换时首尾裁剪：删除 ${esc(j.trim_summary?.frames_removed ?? "?")} 帧</span>` : ""}${j.trim_static_intervals ? `<span class="sub">转换时静止帧裁剪：删除 ${esc(j.interval_summary?.frames_removed ?? "?")} 帧 · ${esc(j.interval_summary?.static_intervals ?? "?")} 段静止帧</span>` : ""}</td><td>LeRobot ${esc(j.target_format)}<span class="sub">${esc(j.operation === "subtask_export" ? "复制并写入 subtask_index + 深度验证" : j.run_doctor === false ? "仅转换 + 深度验证" : "转换 + Doctor")}</span></td><td>${esc(jobStageText(j))}${j.error ? `<span class="sub job-error">${esc(j.error)}</span>` : ""}</td><td>${jobBadge(j)} ${sourceBadge(j)} ${trimmedBadge(j)}</td><td><button class="secondary" data-detail="${esc(j.id)}">详情与结果</button></td></tr>`
   ).join("") : '<tr><td colspan="5" class="empty">请选择机器人类型，查看该类型的转换任务。</td></tr>';
   const available = jobs.filter((j) => j.dataset_available && !isInPlaceManualTrim(j));
   $("result-list").innerHTML = available.length ? available.map((j) =>
-    `<tr><td><strong class="task-name">${esc(j.dataset_name || j.instruction || j.id.slice(0, 12))}</strong><span class="sub">${esc(j.id.slice(0, 12))} · ${esc(episodeSelectionSummary(j))}</span><span class="sub">${j.operation === "version_conversion" ? `版本转换：${esc(j.source_format)} → ${esc(j.target_format)}` : j.operation === "stationary_trim" ? `首尾裁剪：删除 ${esc(j.trim_summary?.frames_removed ?? "?")} 帧 · 保留 ${esc(j.trim_summary?.frames_kept ?? "?")} 帧` : j.operation === "manual_trim" ? `手动裁剪：Episode ${esc(j.manual_episode ?? "?")} · 删除 ${esc(j.manual_summary?.frames_removed ?? j.manual_removed_frames ?? "?")} 帧 · 保留 ${esc(j.manual_summary?.frames_kept ?? "?")} 帧` : esc(j.instruction)}</span>${manualTrimSummary(j)}${j.trim_idle_frames ? `<span class="sub">转换时首尾裁剪：删除 ${esc(j.trim_summary?.frames_removed ?? "?")} 帧 · 保留 ${esc(j.trim_summary?.frames_kept ?? "?")} 帧</span>` : ""}${j.trim_static_intervals ? `<span class="sub">转换时静止帧裁剪：删除 ${esc(j.interval_summary?.frames_removed ?? "?")} 帧 · 保留 ${esc(j.interval_summary?.frames_kept ?? "?")} 帧 · 保留片段前后直接相连</span>` : ""}</td><td>LeRobot ${esc(j.target_format)}</td><td>${jobBadge(j)} ${sourceBadge(j)} ${trimmedBadge(j)}</td><td>${datasetLocation(j)}</td><td><div class="action-row"><button class="primary" data-viewer="${esc(j.id)}">预览数据</button><button class="secondary" data-viewer="${esc(j.id)}" data-viewer-mode="batch">批量预览</button><button class="secondary" data-doctor="${esc(j.id)}">运行质检</button><button class="secondary" data-report-page="${esc(j.id)}">查看报告</button></div></td></tr>`
+    `<tr><td><strong class="task-name">${esc(datasetLabel(j) || j.id.slice(0, 12))}</strong><span class="sub dataset-description-preview${j.dataset_description_preview?.trim() ? "" : " muted"}">${esc(j.dataset_description_preview?.trim() ? j.dataset_description_preview : "暂无介绍")}</span><span class="sub">${esc(j.id.slice(0, 12))} · ${esc(episodeSelectionSummary(j))}</span><span class="sub">${j.operation === "version_conversion" ? `版本转换：${esc(j.source_format)} → ${esc(j.target_format)}` : j.operation === "stationary_trim" ? `首尾裁剪：删除 ${esc(j.trim_summary?.frames_removed ?? "?")} 帧 · 保留 ${esc(j.trim_summary?.frames_kept ?? "?")} 帧` : j.operation === "manual_trim" ? `手动裁剪：Episode ${esc(j.manual_episode ?? "?")} · 删除 ${esc(j.manual_summary?.frames_removed ?? j.manual_removed_frames ?? "?")} 帧 · 保留 ${esc(j.manual_summary?.frames_kept ?? "?")} 帧` : esc(j.instruction)}</span>${manualTrimSummary(j)}${j.trim_idle_frames ? `<span class="sub">转换时首尾裁剪：删除 ${esc(j.trim_summary?.frames_removed ?? "?")} 帧 · 保留 ${esc(j.trim_summary?.frames_kept ?? "?")} 帧</span>` : ""}${j.trim_static_intervals ? `<span class="sub">转换时静止帧裁剪：删除 ${esc(j.interval_summary?.frames_removed ?? "?")} 帧 · 保留 ${esc(j.interval_summary?.frames_kept ?? "?")} 帧 · 保留片段前后直接相连</span>` : ""}</td><td>LeRobot ${esc(j.target_format)}</td><td>${jobBadge(j)} ${sourceBadge(j)} ${trimmedBadge(j)}</td><td>${datasetLocation(j)}</td><td><div class="action-row"><button class="secondary" data-description="${esc(j.id)}">编辑介绍</button><button class="primary" data-viewer="${esc(j.id)}">预览数据</button><button class="secondary" data-viewer="${esc(j.id)}" data-viewer-mode="batch">批量预览</button><button class="secondary" data-doctor="${esc(j.id)}">运行质检</button><button class="secondary" data-report-page="${esc(j.id)}">查看报告</button></div></td></tr>`
   ).join("") : '<tr><td colspan="5" class="empty">请选择机器人类型，查看该类型已转换的数据集。受阻任务的原因可在“数据转换”查看。</td></tr>';
   updateMergeSelection();
   renderMergeJobs(jobs.filter((j) => j.operation === "merge"));
   renderDatasetManagement();
+  renderServerPages();
+  renderServerCounts();
+}
+function renderServerCounts() {
+  const type = $("server-robot-type").value;
+  const counts = serverStatusType === type ? serverStatus?.counts : null;
+  for (const [id, key] of [
+    ["metric-uploads", "committed"], ["metric-jobs", "jobs"], ["metric-completed", "results"],
+    ["nav-upload-count", "collections"], ["nav-job-count", "jobs"],
+    ["nav-result-count", "results"], ["nav-merge-count", "datasets"],
+  ]) $(id).textContent = counts ? counts[key] : "—";
+  $("nav-annotation-count").textContent = serverStatusType === type && serverStatus ? serverStatus.active_annotations.length : "—";
 }
 function renderDatasetManagement() {
   const type = $("server-robot-type").value, kind = $("dataset-kind").value;
   const search = $("dataset-search").value.trim().toLocaleLowerCase();
-  const rows = serverDatasets.filter((d) => rowRobotType(d) === type && (!kind || d.kind === kind) && (!search || `${d.dataset_name} ${d.id}`.toLocaleLowerCase().includes(search)));
+  const rows = serverDatasets.filter((d) => rowRobotType(d) === type && (!kind || d.kind === kind) && (!search || `${datasetLabel(d)} ${d.id}`.toLocaleLowerCase().includes(search)));
   const paths = (d) => !d.paths.length ? '<span class="small muted">范围见删除记录</span>' : `<code>${esc(d.paths[0])}</code>${d.paths.length > 1 ? `<details><summary>共 ${d.paths.length} 个路径</summary>${d.paths.slice(1).map((p) => `<div><code>${esc(p)}</code></div>`).join("")}</details>` : ""}`;
-  const html = rows.length ? rows.map((d) => `<tr><td><strong class="task-name">${esc(d.dataset_name)}</strong><span class="sub">${d.kind === "raw" ? "原始数据" : "LeRobot " + esc(d.target_format || "数据集")} · ${esc(d.id.slice(0, 12))}</span>${manualTrimSummary(d)}</td><td>${d.episode_count ?? "—"} episodes<span class="sub">${d.total_bytes == null ? "" : bytes(d.total_bytes)}</span></td><td class="dataset-paths">${paths(d)}</td><td>${badge(d.state)}${d.trimmed ? ' <span class="badge">已裁剪</span>' : ""}${d.reason ? `<span class="sub job-error">${esc(d.reason)}</span>` : ""}</td><td><button class="danger" data-delete-dataset="${esc(d.id)}" data-delete-kind="${d.kind}" ${busy || !d.deletable ? "disabled" : ""}>删除${d.kind === "raw" ? "原始数据" : "数据集"}</button></td></tr>`).join("") : '<tr><td colspan="5" class="empty">请选择机器人类型；可管理的原始数据和 LeRobot 数据集将在此显示。</td></tr>';
+  const html = rows.length ? rows.map((d) => {
+    const canDelete =
+      d.kind === "raw" ||
+      !config.current_user ||
+      config.current_user.is_admin ||
+      (d.owner_user_id && d.owner_user_id === config.current_user.username);
+    return `<tr><td><strong class="task-name">${esc(datasetLabel(d))}</strong><span class="sub">${d.kind === "raw" ? "原始数据" : "LeRobot " + esc(d.target_format || "数据集")} · ${esc(d.id.slice(0, 12))}${d.submitted_as ? " · " + esc(d.submitted_as) : ""}</span>${manualTrimSummary(d)}</td><td>${d.episode_count ?? "—"} episodes<span class="sub">${d.total_bytes == null ? "" : bytes(d.total_bytes)}</span></td><td class="dataset-paths">${paths(d)}</td><td>${badge(d.state)}${d.trimmed ? ' <span class="badge">已裁剪</span>' : ""}${d.reason ? `<span class="sub job-error">${esc(d.reason)}</span>` : ""}</td><td><button class="danger" data-delete-dataset="${esc(d.id)}" data-delete-kind="${d.kind}" ${busy || !d.deletable || !canDelete ? "disabled" : ""}>${canDelete ? `删除${d.kind === "raw" ? "原始数据" : "数据集"}` : "仅发起者可删除"}</button></td></tr>`;
+  }).join("") : '<tr><td colspan="5" class="empty">请选择机器人类型；可管理的原始数据和 LeRobot 数据集将在此显示。</td></tr>';
   const list = $("dataset-list");
   if (list.dataset.content !== html) {
     const focused = document.activeElement?.dataset.deleteDataset;
@@ -1569,16 +1700,35 @@ function renderDatasetManagement() {
   $("dataset-deletion-panel").hidden = !operations.length;
   $("dataset-deletion-list").innerHTML = operations.map((d) => `<tr><td><strong class="task-name">${esc(d.dataset_name)}</strong><span class="sub">${new Date(d.created_at * 1000).toLocaleString("zh-CN")}</span></td><td>${d.kind === "raw" ? "原始数据" : "LeRobot 数据集"}</td><td>${badge(d.state === "COMPLETED" ? "DELETED" : d.state === "FAILED" ? "DELETE_FAILED" : "DELETING")}</td><td>${d.state === "FAILED" ? `<span class="sub job-error">${esc(d.error)}</span><button class="secondary" data-retry-deletion="${esc(d.id)}" ${busy ? "disabled" : ""}>重试删除</button>` : d.state === "COMPLETED" ? "文件已删除，登记已更新" : "正在后台永久删除文件，请稍候"}</td></tr>`).join("");
 }
-$("dataset-kind").onchange = renderDatasetManagement;
-$("dataset-search").oninput = renderDatasetManagement;
-$("dataset-list").onclick = (event) => {
+$("dataset-kind").onchange = () => {
+  const state = serverPage("datasets");
+  state.kind = $("dataset-kind").value; state.offset = 0; state.at = 0;
+  void loadServerData("datasets", true);
+};
+let datasetSearchTimer;
+$("dataset-search").oninput = () => {
+  clearTimeout(datasetSearchTimer);
+  const state = serverPage("datasets");
+  state.q = $("dataset-search").value.trim(); state.offset = 0; state.at = 0;
+  datasetSearchTimer = setTimeout(() => void loadServerData("datasets", true), 300);
+};
+$("dataset-list").onclick = async (event) => {
   const button = event.target.closest("[data-delete-dataset]");
   if (!button || busy) return;
   const dataset = serverDatasets.find((d) => d.id === button.dataset.deleteDataset && d.kind === button.dataset.deleteKind);
   if (!dataset?.deletable) return;
-  deletingDataset = dataset;
+  button.disabled = true;
+  try {
+    const scope = $("server-robot-type").value;
+    const preview = await api(`/api/listings/deletion-preview?kind=${dataset.kind}&id=${encodeURIComponent(dataset.id)}`);
+    if ($("server-robot-type").value !== scope) return;
+    deletingDataset = {...dataset, ...preview};
+  } catch (error) {
+    notice(error.message, true);
+    return;
+  } finally { button.disabled = false; }
   $("dataset-delete-description").textContent = `${robotTypeLabel(dataset.robot_type)} · ${dataset.kind === "raw" ? "原始数据" : "LeRobot 数据集"} · ${dataset.dataset_name}。${dataset.kind === "raw" ? "已生成的转换结果会保留。导入的原始数据仅删除登记清单中的文件。" : "原始数据及已生成的独立合并结果会保留。"}`;
-  $("dataset-delete-paths").textContent = dataset.paths.join("\n");
+  $("dataset-delete-paths").textContent = deletingDataset.paths.join("\n");
   $("dataset-delete-confirmation").value = "";
   $("dataset-delete-confirmation").placeholder = dataset.dataset_name;
   $("dataset-delete-submit").disabled = true;
@@ -1706,11 +1856,103 @@ function doctorReport(report, gate) {
     ${gate?.skipped?.length ? `<div class="warning small">未覆盖项：${esc(gate.skipped.map((s) => s.check + "：" + s.reasons.join("；")).join("；"))}</div>` : ""}
     <details class="report-json"><summary>原始 Doctor 报告</summary><pre>${esc(JSON.stringify(report, null, 2))}</pre></details>`;
 }
+function renderDatasetDescription(id) {
+  const state = datasetDescriptionDrafts.get(id);
+  if (!state || selectedJob !== id || !config) return;
+  const form = $("dataset-description-form");
+  form.hidden = false;
+  form.dataset.job = id;
+  const input = $("dataset-description");
+  if (input.value !== state.draft) input.value = state.draft;
+  input.disabled = state.saving;
+  const dirty = state.draft !== state.saved.description;
+  $("dataset-description-save").disabled = state.saving || !dirty;
+  $("dataset-description-cancel").disabled = state.saving || (!dirty && !state.error);
+  const status = $("dataset-description-status");
+  status.textContent = state.saving ? "正在保存…" : state.error || (dirty
+    ? state.latest.revision !== state.saved.revision ? "其他用户已修改介绍，你的草稿已保留" : "有未保存的修改"
+    : state.saved.updated_at ? `已保存 · ${new Date(state.saved.updated_at * 1000).toLocaleString("zh-CN")}` : "尚未填写介绍");
+  status.className = state.error ? "small job-error" : "small muted";
+}
+function acceptDatasetDescription(id, row) {
+  let state = datasetDescriptionDrafts.get(id);
+  if (!state) {
+    state = {saved: row, latest: row, draft: row.description, saving: false, error: ""};
+    datasetDescriptionDrafts.set(id, state);
+  } else if (row.revision >= state.latest.revision) {
+    state.latest = row;
+    if (!state.saving && state.draft === state.saved.description) {
+      state.saved = row;
+      state.draft = row.description;
+    }
+  }
+  renderDatasetDescription(id);
+}
+$("dataset-description").oninput = () => {
+  const id = $("dataset-description-form").dataset.job;
+  const state = datasetDescriptionDrafts.get(id);
+  if (!state || state.saving) return;
+  state.draft = $("dataset-description").value;
+  state.error = "";
+  renderDatasetDescription(id);
+};
+$("dataset-description-form").onsubmit = async (event) => {
+  event.preventDefault();
+  const id = event.currentTarget.dataset.job, session = config;
+  const state = datasetDescriptionDrafts.get(id);
+  if (!state || state.saving || state.draft === state.saved.description) return;
+  state.saving = true;
+  state.error = "";
+  renderDatasetDescription(id);
+  try {
+    const row = await api(`/api/jobs/${id}/description`, "PUT", {
+      description: state.draft, revision: state.saved.revision,
+    });
+    state.saved = state.latest = row;
+    state.draft = row.description;
+    if (config === session && serverTab === "results") await loadServerData("results", true);
+  } catch (error) {
+    state.error = error.message;
+  } finally {
+    state.saving = false;
+    if (config === session) renderDatasetDescription(id);
+  }
+};
+$("dataset-description-cancel").onclick = async () => {
+  const id = $("dataset-description-form").dataset.job, session = config;
+  const state = datasetDescriptionDrafts.get(id);
+  if (!state || state.saving) return;
+  state.saving = true;
+  renderDatasetDescription(id);
+  try {
+    const row = await api(`/api/jobs/${id}/description`);
+    state.saved = state.latest = row;
+    state.draft = row.description;
+    state.error = "";
+  } catch (error) {
+    state.error = error.message;
+  } finally {
+    state.saving = false;
+    if (config === session) renderDatasetDescription(id);
+  }
+};
 async function showJob() {
   const id = selectedJob;
   if (!id) return;
+  const session = config;
   const [j, checks] = await Promise.all([api("/api/jobs/" + id), api(`/api/jobs/${id}/checks`)]);
-  if (selectedJob !== id) return;
+  if (selectedJob !== id || config !== session) return;
+  if (j.dataset_available) {
+    try {
+      const description = await api(`/api/jobs/${id}/description`);
+      if (selectedJob !== id || config !== session) return;
+      acceptDatasetDescription(id, description);
+    } catch (error) {
+      if (selectedJob !== id || config !== session) return;
+      $("dataset-description-form").hidden = true;
+      notice(error.message, true);
+    }
+  } else $("dataset-description-form").hidden = true;
   $("job-detail-panel").hidden = serverTab !== "results";
   const signature = JSON.stringify([j, checks, selectedCheck]);
   if (signature === detailSignature) return;
@@ -1719,9 +1961,14 @@ async function showJob() {
   const latest = selectedCheck === "automatic" ? null : checks.find((c) => c.id === selectedCheck) || checks[0];
   const report = latest ? latest.doctor_report : j.doctor_report;
   const gate = latest ? latest.quality_gate : j.quality_gate;
+  const canManage =
+    !config.current_user ||
+    config.current_user.is_admin ||
+    (j.owner_user_id && j.owner_user_id === config.current_user.username);
   $("job-detail").innerHTML = `
     <p class="small"><strong>${esc(j.dataset_name || "历史数据集")}</strong> · ${esc(episodeSelectionSummary(j))}</p>
     <p class="small">Instruction：${esc(j.instruction || "—")}</p>
+    ${j.submitted_as ? `<p class="small muted">提交账号：${esc(j.submitted_as)}${j.slurm_user ? ` · Slurm 用户 ${esc(j.slurm_user)}` : " · 服务账号兼容任务"}</p>` : ""}
     ${conversionCorrectionSummary(j)}
     ${renderEpisodeSelection(j)}
     ${j.operation === "version_conversion" ? `<p class="small">来源：<strong>${esc(j.source_dataset_name)}</strong>（任务 ${esc(j.source_job_id.slice(0, 12))}） · LeRobot ${esc(j.source_format)} → ${esc(j.target_format)}</p>` : ""}
@@ -1736,7 +1983,7 @@ async function showJob() {
     ${j.dataset_available ? "" : `<p class="small muted">${esc(j.dataset_unavailable_reason)}</p>`}
     ${j.work_path ? `<p class="path-hint">任务工作目录：${esc(j.work_path)}</p>` : ""}
     ${j.operation === "merge" ? `<h3 class="section-label">合并来源（拼接顺序）</h3><ol>${(j.merge_sources || []).map((s) => `<li>${esc(s.dataset_name)} · ${s.episode_count} episodes · ${s.frame_count} 帧</li>`).join("")}</ol>` : ""}
-    <div class="action-row">${j.dataset_available ? `<button class="primary" data-viewer="${esc(j.id)}">打开数据预览</button><button class="secondary" data-doctor="${esc(j.id)}">运行 / 重新运行质检</button>` : ""}<button class="secondary" data-report-page="${esc(j.id)}">打开独立报告页</button>${j.operation === "merge" ? '<button class="secondary" data-log="merge">合并日志</button>' : j.operation === "version_conversion" ? '<button class="secondary" data-log="environment">环境日志</button><button class="secondary" data-log="source-validate">来源验证日志</button><button class="secondary" data-log="convert">版本转换日志</button><button class="secondary" data-log="validate">结果验证日志</button><button class="secondary" data-log="doctor">自动质检日志</button>' : j.operation === "stationary_trim" ? '<button class="secondary" data-log="trim">裁剪日志</button><button class="secondary" data-log="validate">结果验证日志</button><button class="secondary" data-log="doctor">自动质检日志</button>' : `<button class="secondary" data-log="convert">转换日志</button>${j.trim_idle_frames ? '<button class="secondary" data-log="trim-detect">裁剪检测日志</button><button class="secondary" data-log="trim">裁剪日志</button>' : ""}${j.trim_static_intervals ? '<button class="secondary" data-log="trim-detect">静止帧检测日志</button><button class="secondary" data-log="trim">静止帧裁剪日志</button>' : ""}<button class="secondary" data-log="validate">验证日志</button><button class="secondary" data-log="doctor">自动质检日志</button>`}</div>
+    <div class="action-row">${j.dataset_available ? `<button class="primary" data-viewer="${esc(j.id)}">打开数据预览</button>${canManage ? `<button class="secondary" data-doctor="${esc(j.id)}">运行 / 重新运行质检</button>` : '<span class="small muted">只读：质检需由任务发起者或管理员运行</span>'}` : ""}<button class="secondary" data-report-page="${esc(j.id)}">打开独立报告页</button>${j.operation === "merge" ? '<button class="secondary" data-log="merge">合并日志</button>' : j.operation === "version_conversion" ? '<button class="secondary" data-log="environment">环境日志</button><button class="secondary" data-log="source-validate">来源验证日志</button><button class="secondary" data-log="convert">版本转换日志</button><button class="secondary" data-log="validate">结果验证日志</button><button class="secondary" data-log="doctor">自动质检日志</button>' : j.operation === "stationary_trim" ? '<button class="secondary" data-log="trim">裁剪日志</button><button class="secondary" data-log="validate">结果验证日志</button><button class="secondary" data-log="doctor">自动质检日志</button>' : `<button class="secondary" data-log="convert">转换日志</button>${j.trim_idle_frames ? '<button class="secondary" data-log="trim-detect">裁剪检测日志</button><button class="secondary" data-log="trim">裁剪日志</button>' : ""}${j.trim_static_intervals ? '<button class="secondary" data-log="trim-detect">静止帧检测日志</button><button class="secondary" data-log="trim">静止帧裁剪日志</button>' : ""}<button class="secondary" data-log="validate">验证日志</button><button class="secondary" data-log="doctor">自动质检日志</button>`}</div>
     <h3 class="section-label">LeRobot Doctor 质量报告</h3>
     <p class="small muted">Doctor 报告只用于展示数据质量，不会修改或删除已转换的数据集。模拟数据始终保留模拟标识。</p>
     <div class="action-row"><button class="secondary" data-report="automatic">转换时的报告</button>${checks.map((c) => `<button class="secondary" data-report="${esc(c.id)}">${esc(new Date(c.created_at * 1000).toLocaleTimeString("zh-CN"))} · ${esc(names[c.state] || c.state)}${c.severity ? " · " + esc(c.severity) : ""}</button>`).join("")}</div>
@@ -1765,20 +2012,21 @@ function renderViewerStatus(v) {
     (previews.length ? `<ul class="preview-list">${rows}</ul>` : '<span class="sub small muted">尚无打开的预览</span>') +
     (v.error ? `<p class="job-error">${esc(v.error)}</p>` : "");
 }
+let pollGeneration = 0;
 async function poll() {
+  const generation = ++pollGeneration;
+  clearTimeout(timer);
   if (!config) return;
-  // A hidden tab does no useful rendering; skip the network work and resume
-  // immediately when the user returns to it.
-  if (document.hidden) {
-    timer = setTimeout(poll, 5000);
-    return;
-  }
+  if (document.hidden) { timer = setTimeout(poll, 15000); return; }
   await refresh();
-  if (config) timer = setTimeout(poll, 2000);
+  if (generation !== pollGeneration) return;
+  const active = serverStatus?.active_jobs?.length || serverStatus?.active_annotations?.length || serverStatus?.active_checks?.length || serverStatus?.uploading || (activeTrimPreviewId && !["COMPLETED", "FAILED", "INTERRUPTED"].includes(trimPreview?.state));
+  if (config) timer = setTimeout(poll, config.role === "client" || active ? 2000 : 15000);
 }
 document.addEventListener("visibilitychange", () => {
-  if (document.hidden || !config) return;
-  clearTimeout(timer);
-  void poll();
+  if (!document.hidden && config) { clearTimeout(timer); void poll(); }
 });
-boot();
+void (async () => {
+  await configureLogin();
+  await boot();
+})();

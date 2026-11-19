@@ -7,10 +7,11 @@ import threading
 import uuid
 
 from pipeline.shared.core import DomainError, executable_path, now
+from pipeline.shared.identity import Principal
 
 from .datasets import dataset_for_job
 from .quality import DOCTOR_CHECK_IDS, doctor_gate
-from .storage import storage_path
+from .storage import data_directory
 
 
 class QualityRunner:
@@ -47,7 +48,7 @@ class QualityRunner:
                     finished_at=now(),
                 )
 
-    def enqueue(self, jid):
+    def enqueue(self, jid, *, principal: Principal | None = None):
         with self.lock:
             job = self.store.get("job", jid)
             dataset_for_job(self.settings, job)
@@ -64,6 +65,18 @@ class QualityRunner:
                 "created_at": now(),
                 "error": None,
                 "target_format": job.get("target_format", "v3.0"),
+                **(
+                    principal.job_metadata()
+                    if principal is not None
+                    else {
+                        "owner_user_id": job.get("owner_user_id"),
+                        "owner_uid": job.get("owner_uid"),
+                        "submitted_as": job.get("submitted_as"),
+                        "slurm_user": job.get("slurm_user"),
+                        "slurm_execution_id": job.get("slurm_execution_id"),
+                        "submission_auth": job.get("submission_auth"),
+                    }
+                ),
             }
             return self.save(row)
 
@@ -80,12 +93,13 @@ class QualityRunner:
         try:
             job = self.store.get("job", row["job_id"])
             data = dataset_for_job(self.settings, job)
-            work = (
-                storage_path(self.settings, job, "work", job["id"])
-                / "checks"
-                / row["id"]
+            work = data_directory(
+                self.settings,
+                job,
+                "work",
+                f"{job['id']}/checks/{row['id']}",
+                exist_ok=False,
             )
-            work.mkdir(parents=True, exist_ok=False)
             self.save(row, work_path=str(work), dataset_path=str(data))
             tool = executable_path(self.settings.letools_bin)
             if not tool:

@@ -12,6 +12,7 @@ from pipeline.shared.core import DomainError, atomic_json, digest
 from ..conversion_options import normalize_options
 from ..episode_validation import EpisodeValidationError
 from ..quality import robot_profile_blockers, validate_robot_policy
+from ..storage import share_data_path
 from .base import annotation_rig, configured_trim_policy
 from .g1_sonic_raw import (
     ACTION_NAMES,
@@ -255,6 +256,7 @@ class G1SONICProvider:
             )
         profile_path = source.parent / "g1-sonic-profile.json"
         atomic_json(profile_path, profile)
+        share_data_path(profile_path)
         return [
             str(python),
             str(Path(__file__).with_name("g1_sonic_source.py").absolute()),

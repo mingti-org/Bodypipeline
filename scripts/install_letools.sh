@@ -43,6 +43,10 @@ UV_PROJECT_ENVIRONMENT="$TOOL_ENV" uv sync \
   --project "$ROOT/environments/letools" --locked --no-dev --python "${UV_PYTHON:-3.12}"
 uv pip install --python "$TOOL_ENV/bin/python" \
   --editable "$PROVIDERS_SOURCE/tianji_provider"
+# Slurm steps run as the submitting H800 user, not the Server account. The
+# toolchain contains code only, so make it readable/traversable for those users
+# while leaving data directories to the shared-data helpers.
+chmod -R a+rX "$TOOL_ENV"
 "$TOOL_ENV/bin/letools" doctor environment
 "$TOOL_ENV/bin/letools" providers list
 printf '\nSet server config letools_bin to: %s\n' "$TOOL_ENV/bin/letools"

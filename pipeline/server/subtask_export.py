@@ -25,6 +25,7 @@ from pathlib import Path
 
 from pipeline.shared.collections import dataset_name
 from pipeline.shared.core import DomainError, atomic_json, digest, executable_path, now
+from pipeline.shared.identity import Principal
 
 from . import argus_annotation
 from .datasets import TARGET_FORMATS, dataset_for_job
@@ -502,7 +503,13 @@ class SubtaskExportRunner:
         return rows
 
     # ---------------------------------------------------------------- enqueue
-    def enqueue(self, aid: str, name: str | None = None):
+    def enqueue(
+        self,
+        aid: str,
+        name: str | None = None,
+        *,
+        principal: Principal | None = None,
+    ):
         tool = executable_path(self.settings.letools_bin)
         if not tool or not Path(tool).with_name("python").is_file():
             raise DomainError("生成 Subtask 数据集需要可执行的 LeTools Python 环境", 503)
@@ -538,6 +545,11 @@ class SubtaskExportRunner:
                     "dataset": str(source),
                     "name": output_name,
                     "plan": plan["digest"],
+                    "submitted_by": (
+                        "service-account"
+                        if principal is None or principal.is_admin
+                        else principal.username
+                    ),
                 }
             )
             for existing in self.store.all("job"):
@@ -577,6 +589,7 @@ class SubtaskExportRunner:
                     "source_count": plan["dataset"]["total_episodes"],
                     "episode_count": plan["dataset"]["total_episodes"],
                     "frame_count": None,
+                    **self.runner.submission_metadata(principal),
                 }
                 for field in ("runtime_id", "provider", "profile", "profile_hash"):
                     if source_job.get(field) is not None:
@@ -594,7 +607,13 @@ class SubtaskExportRunner:
                 return job
 
     # -------------------------------------------------------------------- run
-    def enqueue_review(self, dataset_id, body):
+    def enqueue_review(
+        self,
+        dataset_id,
+        body,
+        *,
+        principal: Principal | None = None,
+    ):
         """Freeze a saved human revision; subsequent draft edits cannot change it."""
         from .subtask_review import SubtaskReview
 
@@ -609,7 +628,18 @@ class SubtaskExportRunner:
                 source_job, source, snapshot, plan = review.export_plan(dataset_id, body)
                 source_name = source_job.get("dataset_name") or dataset_id
                 output_name = dataset_name(body.name or f"{str(source_name)[:1970]}-revised")
-                key = "subtask-review:" + digest({"source": str(source), "plan": plan["digest"], "name": output_name})
+                key = "subtask-review:" + digest(
+                    {
+                        "source": str(source),
+                        "plan": plan["digest"],
+                        "name": output_name,
+                        "submitted_by": (
+                            "service-account"
+                            if principal is None or principal.is_admin
+                            else principal.username
+                        ),
+                    }
+                )
                 for existing in self.store.all("job"):
                     if existing.get("key") == key and existing["state"] not in DEDUP_STATES:
                         return existing
@@ -630,6 +660,7 @@ class SubtaskExportRunner:
                     "processing_mode": "real", "run_doctor": False,
                     "source_count": plan["dataset"]["total_episodes"],
                     "episode_count": plan["dataset"]["total_episodes"], "frame_count": None,
+                    **self.runner.submission_metadata(principal),
                 }
                 for field in ("runtime_id", "provider", "profile", "profile_hash"):
                     if source_job.get(field) is not None:

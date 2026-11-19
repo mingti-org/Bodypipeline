@@ -9,7 +9,11 @@ import threading
 from contextlib import contextmanager
 from pathlib import Path
 
-from pipeline.shared.collections import collection_metadata, dataset_name
+from pipeline.shared.collections import (
+    collection_metadata,
+    dataset_name,
+    stored_collection_metadata,
+)
 from pipeline.shared.core import (
     DomainError,
     Store,
@@ -334,11 +338,15 @@ class IngestService:
             if row["state"] in {"DELETING", "DELETE_FAILED", "DELETED"}:
                 raise DomainError("原始采集已删除或正在删除", 410)
             root = self.root(row) / "data"
+            metadata = stored_collection_metadata(self.manifest(row), row)
             return {
                 "id": uid,
                 "state": row["state"],
                 "manifest_hash": row["manifest_hash"],
+                **metadata,
+                "session_id": row["session_id"],
                 "chunk_bytes": self.settings.chunk_bytes,
+                **({"raw_path": row["raw_path"]} if row.get("raw_path") else {}),
                 "offsets": [
                     confined(root, f["path"]).stat().st_size
                     if confined(root, f["path"]).exists()

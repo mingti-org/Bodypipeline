@@ -97,7 +97,7 @@ diff --git a/src/app/[org]/[dataset]/[episode]/episode-viewer.tsx b/src/app/[org
 -                  />
 -                </a>
 +              <div className="viewer-identity">
-+                <span className="viewer-identity-icon" aria-hidden="true">B</span>
++                <img className="viewer-identity-icon" src="/bodypipeline-mark.png" alt="" />
  
                  <div className="min-w-0">
 @@ -713,5 +704,5 @@

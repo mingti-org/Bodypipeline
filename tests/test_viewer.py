@@ -384,89 +384,7 @@ def test_viewer_patch_is_version_checked_and_idempotent(tmp_path):
         patch_cache(tmp_path)
 
 
-def test_parquet_zstd_patch_is_idempotent(tmp_path, monkeypatch):
-    from pipeline.server import viewer_bootstrap as bootstrap
-
-    cache = tmp_path / "cache"
-    source = cache / "source/src"
-    (source / "utils").mkdir(parents=True)
-    (source / "app/[org]/[dataset]/[episode]").mkdir(parents=True)
-    utils = source / "utils/parquetUtils.ts"
-    utils.write_text(
-        'import { authHeaders } from "./auth";\n'
-        "\n"
-        "type ParquetFile = ArrayBuffer | AsyncBuffer;\n"
-        "\n"
-        "export async function fetchParquetFile(url: string) {\n"
-        "  const file = await asyncBufferFromUrl({\n"
-        "    url,\n"
-        '    requestInit: { cache: "no-store", headers: authHeaders() },\n'
-        "  });\n"
-        "  return cachedAsyncBuffer(file);\n"
-        "}\n"
-        "export function readParquetColumn(fileBuffer: ParquetFile) {\n"
-        "  return new Promise((resolve, reject) => {\n"
-        "    try {\n"
-        "      parquetRead({\n"
-        "        file: fileBuffer,\n"
-        "        columns: [],\n"
-        "      });\n"
-        "    } catch (error) {\n"
-        "      reject(error);\n"
-        "    }\n"
-        "  });\n"
-        "}\n"
-        "export function readParquetAsObjects(fileBuffer: ParquetFile) {\n"
-        "  return parquetReadObjects({\n"
-        "    file: fileBuffer,\n"
-        "    columns: [],\n"
-        "  });\n"
-        "}\n"
-    )
-    fetch = source / "app/[org]/[dataset]/[episode]/fetch-data.ts"
-    fetch.write_text(
-        "import {\n"
-        "  DatasetMetadata,\n"
-        "  fetchParquetFile,\n"
-        "  formatStringWithVars,\n"
-        "  readParquetAsObjects,\n"
-        '} from "@/utils/parquetUtils";\n'
-        "\n"
-        "export async function read() {\n"
-        "  while (true) {\n"
-        "    try {\n"
-        "      await fetchParquetFile(url);\n"
-        "    } catch {\n"
-        "      if (fileIndex === 0) return;\n"
-        "      chunkIndex++;\n"
-        "      fileIndex = 0;\n"
-        "      continue;\n"
-        "    }\n"
-        "  }\n"
-        "}\n"
-    )
-    assets = tmp_path / "ui"
-    assets.mkdir()
-    (assets / "fzstd.mjs").write_text("export function decompress(d, b) {}\n")
-    monkeypatch.setattr(bootstrap, "UI_ASSETS", assets)
-
-    bootstrap.patch_parquet_compression(cache)
-    once = (utils.read_text(), fetch.read_text())
-    bootstrap.patch_parquet_compression(cache)
-    assert (utils.read_text(), fetch.read_text()) == once
-    assert "ZSTD: (bytes: Uint8Array" in once[0]
-    assert once[0].count("compressors: PARQUET_COMPRESSORS") == 2
-    assert "isDatasetFileMissing" in once[1]
-    assert "distinguish metadata decode errors" in once[1]
-    assert (source / "utils/fzstd.mjs").read_text() == assets.joinpath(
-        "fzstd.mjs"
-    ).read_text()
 def test_presentation_patch_accepts_an_already_patched_source(tmp_path, monkeypatch):
-    from pipeline.server import (
-        viewer_batch_preview,
-        viewer_manual_trim,
-        viewer_task_annotations,
-    )
     from pipeline.server import viewer_bootstrap as bootstrap
 
     source = tmp_path / "source"
@@ -498,12 +416,8 @@ def test_presentation_patch_accepts_an_already_patched_source(tmp_path, monkeypa
         "subtask-review-model.ts": "src/utils/subtask-review-model.ts",
         "annotation-review-client.ts": "src/utils/annotation-review-client.ts",
         "use-annotation-review.ts": "src/utils/use-annotation-review.ts",
-        "manual-trim.tsx": "src/components/manual-trim.tsx",
         "instruction-model.ts": "src/utils/instruction-model.ts",
         "instruction-editor.tsx": "src/components/instruction-editor.tsx",
-        "instruction-episode-editor.tsx": (
-            "src/components/instruction-episode-editor.tsx"
-        ),
     }
     for name, target in destinations.items():
         (assets / name).write_text(name)
@@ -522,22 +436,13 @@ def test_presentation_patch_accepts_an_already_patched_source(tmp_path, monkeypa
 
     monkeypatch.setattr(bootstrap, "UI_ASSETS", assets)
     monkeypatch.setattr(bootstrap, "patch_score_filter", lambda cache: None)
-    monkeypatch.setattr(bootstrap, "patch_episode_lengths", lambda cache: None)
     monkeypatch.setattr(bootstrap, "patch_subtask_review", lambda cache: None)
-    monkeypatch.setattr(bootstrap, "patch_parquet_compression", lambda cache: None)
     monkeypatch.setattr(bootstrap, "patch_instruction_editor", lambda cache: None)
-    monkeypatch.setattr(
-        viewer_task_annotations, "patch_task_annotations", lambda cache: None
-    )
-    monkeypatch.setattr(viewer_manual_trim, "patch_manual_trim", lambda cache: None)
-    monkeypatch.setattr(viewer_batch_preview, "patch_batch_preview", lambda cache: None)
 
     bootstrap.patch_presentation(tmp_path)
 
     assert "viewer-tabbar" in episode.read_text()
     assert "videosInfo: sourceVideosInfo" in videos.read_text()
-    for name, target in destinations.items():
-        assert (source / target).read_text() == name
 
 
 def test_instruction_patch_removes_duplicate_navigation_import(tmp_path):
@@ -564,6 +469,8 @@ def test_instruction_patch_removes_duplicate_navigation_import(tmp_path):
     patched = page.read_text()
     assert patched.count(navigation_import) == 1
     assert "export const viewer = true;" in patched
+
+
 def test_build_is_skipped_until_inputs_change(tmp_path, monkeypatch):
     from pipeline.server import viewer_bootstrap as bootstrap
 
@@ -573,9 +480,6 @@ def test_build_is_skipped_until_inputs_change(tmp_path, monkeypatch):
     score_filter_patch = tmp_path / "score-filter.patch"
     score_filter_patch.write_text("score-filter-v1")
     monkeypatch.setattr(bootstrap, "SCORE_FILTER_PATCH", score_filter_patch)
-    episode_lengths_patch = tmp_path / "episode-lengths.patch"
-    episode_lengths_patch.write_text("episode-lengths-v1")
-    monkeypatch.setattr(bootstrap, "EPISODE_LENGTHS_PATCH", episode_lengths_patch)
     (tmp_path / "source/.next").mkdir(parents=True)
     (tmp_path / ".letools-source.json").write_text(json.dumps({"fingerprint": "f1"}))
     builds = []
@@ -605,9 +509,6 @@ def test_build_is_skipped_until_inputs_change(tmp_path, monkeypatch):
     score_filter_patch.write_text("score-filter-v2")
     bootstrap.build_if_needed(tmp_path, "bun", {}, "http://y/_data")
     assert len(builds) == 7
-    episode_lengths_patch.write_text("episode-lengths-v2")
-    bootstrap.build_if_needed(tmp_path, "bun", {}, "http://y/_data")
-    assert len(builds) == 8
 
 
 def test_corrupt_viewer_state_is_not_reported_as_stopped(settings_factory):

@@ -7,9 +7,11 @@ import subprocess
 import threading
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from pathlib import Path
 
-from pipeline.shared.collections import collection_metadata
+from pipeline.shared.collections import stored_collection_metadata
 from pipeline.shared.core import (
     DomainError,
     atomic_json,
@@ -17,6 +19,7 @@ from pipeline.shared.core import (
     executable_path,
     now,
 )
+from pipeline.shared.identity import Principal
 
 from .conversion_options import normalize_options, provider_capabilities
 from .datasets import TARGET_FORMATS
@@ -38,18 +41,77 @@ from .version_conversions import VersionConversionRunner
 
 
 class JobRunner:
-    def __init__(self, settings, ingest):
+    def __init__(self, settings, ingest, user_sessions=None):
         self.settings, self.ingest, self.store = settings, ingest, ingest.store
+        self.user_sessions = user_sessions
         self.catalog = RuntimeCatalog(settings)
         self.lock = threading.RLock()
         self.shutdown_requested = threading.Event()
+        self._allocation_context = threading.local()
+        self._execution_context = threading.local()
+        self._executor = None
+        self._active = {}
+        self._source_reservations = {}
         self.merges = MergeRunner(settings, self)
         self.version_conversions = VersionConversionRunner(settings, self)
         self.subtask_exports = SubtaskExportRunner(settings, self)
         self.trims = TrimRunner(settings, self)
 
+    @property
+    def allocation_id(self):
+        # Each worker owns its allocation, including checks using this runner.
+        return getattr(self._allocation_context, "allocation_id", None)
+
+    @allocation_id.setter
+    def allocation_id(self, value):
+        self._allocation_context.allocation_id = value
+
+    @property
+    def execution_session(self):
+        return getattr(self._execution_context, "session", None)
+
+    @contextmanager
+    def bind_record_session(self, row):
+        execution_id = row.get("slurm_execution_id")
+        session = None
+        if execution_id:
+            if self.user_sessions is None:
+                raise DomainError("任务需要 H800 用户会话，但服务未配置用户登录", 503)
+            session = self.user_sessions.session_for_execution(execution_id)
+            if session is None:
+                raise DomainError(
+                    "任务发起者的 H800 登录会话已过期；请重新登录并重新提交任务",
+                    401,
+                )
+        previous = self.execution_session
+        self._execution_context.session = session
+        try:
+            yield session
+        finally:
+            self._execution_context.session = previous
+
+    @staticmethod
+    def submission_metadata(principal: Principal | None) -> dict:
+        if principal is None:
+            return {
+                "owner_user_id": None,
+                "owner_uid": None,
+                "submitted_as": "service-account",
+                "slurm_user": None,
+                "slurm_execution_id": None,
+                "submission_auth": "internal",
+            }
+        return principal.job_metadata()
+
     def recover(self):
         for job in self.store.all("job"):
+            if job["state"] == "QUEUED" and job.get("slurm_execution_id"):
+                job.update(
+                    state="INTERRUPTED",
+                    error="服务重启后 H800 用户会话失效；请重新登录并重新提交任务",
+                    finished_at=now(),
+                )
+                self.store.put("job", job["id"], job)
             if job["state"] == "RUNNING":
                 job.update(
                     state="INTERRUPTED",
@@ -68,6 +130,7 @@ class JobRunner:
         invalid_episode_policy="fail",
         trim_idle_frames=False,
         trim_static_intervals=False,
+        principal: Principal | None = None,
     ):
         return self._enqueue(
             [uid],
@@ -78,6 +141,7 @@ class JobRunner:
             invalid_episode_policy=invalid_episode_policy,
             trim_idle_frames=trim_idle_frames,
             trim_static_intervals=trim_static_intervals,
+            principal=principal,
         )
 
     def enqueue_collection(
@@ -91,6 +155,7 @@ class JobRunner:
         invalid_episode_policy="fail",
         trim_idle_frames=False,
         trim_static_intervals=False,
+        principal: Principal | None = None,
     ):
         if upload_ids is None:
             upload_ids = []
@@ -98,8 +163,8 @@ class JobRunner:
                 if row["state"] != "COMMITTED":
                     continue
                 try:
-                    metadata = collection_metadata(
-                        self.ingest.manifest(row), row["target"], row["prefix"]
+                    metadata = stored_collection_metadata(
+                        self.ingest.manifest(row), row
                     )
                 except (DomainError, OSError, ValueError, KeyError):
                     continue
@@ -115,6 +180,7 @@ class JobRunner:
             invalid_episode_policy=invalid_episode_policy,
             trim_idle_frames=trim_idle_frames,
             trim_static_intervals=trim_static_intervals,
+            principal=principal,
         )
 
     def _enqueue(
@@ -129,6 +195,7 @@ class JobRunner:
         invalid_episode_policy="fail",
         trim_idle_frames=False,
         trim_static_intervals=False,
+        principal: Principal | None = None,
     ):
         policy = validate_episode_policy(invalid_episode_policy)
         if (
@@ -170,9 +237,7 @@ class JobRunner:
                 runtime = self.catalog.for_stored_record(upload, manifest)
                 runtime_ids.append(runtime.id)
                 manifests.append(manifest)
-                metadata.append(
-                    collection_metadata(manifest, upload["target"], upload["prefix"])
-                )
+                metadata.append(stored_collection_metadata(manifest, upload))
             if len(set(runtime_ids)) != 1:
                 raise DomainError(
                     "批量转换不允许混合不同机器人 Runtime，请按机器人类型分别提交", 400
@@ -219,6 +284,11 @@ class JobRunner:
                         else {}
                     ),
                     "pipeline": "runtime-provider-v2",
+                    "submitted_by": (
+                        "service-account"
+                        if principal is None or principal.is_admin
+                        else principal.username
+                    ),
                     "encoding": "libx264-yuv420p",
                     "letools": "1c417cc9c205f85cd01a5e5860646f1594738354",
                 }
@@ -244,6 +314,11 @@ class JobRunner:
                 },
                 "collection_id": cid,
                 "dataset_name": metadata[0]["dataset_name"],
+                **{
+                    key: metadata[0][key]
+                    for key in ("collection_date", "batch_id")
+                    if key in metadata[0]
+                },
                 "source_count": len(uploads),
                 "invalid_episode_policy": policy,
                 "state": "QUEUED",
@@ -274,6 +349,7 @@ class JobRunner:
                 ),
                 "capture_mode": manifests[0]["capture_mode"],
                 "error": None,
+                **self.submission_metadata(principal),
             }
             job["robot_type"] = runtime.robot_type
             for field in ("data_layout",):
@@ -310,7 +386,17 @@ class JobRunner:
         job.update(**updates, updated_at=now())
         self.store.put("job", job["id"], job)
 
-    def command(self, args, work, name, allocation=None, *, timeout=None, cancel_event=None):
+    def command(
+        self,
+        args,
+        work,
+        name,
+        allocation=None,
+        *,
+        timeout=None,
+        cancel_event=None,
+        remote_env=None,
+    ):
         stdout, stderr = work / f"{name}.json", work / f"{name}.stderr.log"
         # An allocation reused across one job's steps avoids paying the Slurm
         # queue latency three times for convert / validate / doctor.
@@ -319,30 +405,108 @@ class JobRunner:
             share_data_path(stdout)
             share_data_path(stderr)
             env = self.settings.tool_environment()
-            process = subprocess.Popen(
-                argv, stdout=out, stderr=err, start_new_session=True, cwd=work, env=env
+            process = self._popen(
+                argv,
+                stdout=out,
+                stderr=err,
+                start_new_session=True,
+                cwd=work,
+                env=env,
+                remote_env=remote_env,
             )
-            try:
-                deadline = time.monotonic() + (
-                    self.settings.command_timeout if timeout is None else timeout
-                )
-                while process.poll() is None:
-                    if cancel_event is not None and cancel_event.is_set():
-                        raise InterruptedError("命令已取消")
-                    if self.shutdown_requested.wait(0.25):
-                        raise InterruptedError("Worker 收到停止请求")
-                    if time.monotonic() >= deadline:
-                        raise TimeoutError("命令执行超时")
-                code = process.returncode
-            except BaseException:
-                os.killpg(process.pid, signal.SIGTERM)
-                try:
-                    process.wait(timeout=10)
-                except subprocess.TimeoutExpired:
-                    os.killpg(process.pid, signal.SIGKILL)
-                    process.wait()
-                raise
+            code = self._wait_process(
+                process,
+                self.settings.command_timeout if timeout is None else timeout,
+                cancel_event=cancel_event,
+            )
+        if name in {"convert", "merge", "trim", "subtask-export"}:
+            self._share_user_work(work)
         return code, stdout, stderr
+
+    def _popen(self, argv, *, remote_env=None, **kwargs):
+        session = self.execution_session
+        if session is None:
+            return subprocess.Popen(argv, **kwargs)
+        return self.user_sessions.popen(
+            session,
+            argv,
+            remote_env=remote_env,
+            **kwargs,
+        )
+
+    def _run(self, argv, *, remote_env=None, **kwargs):
+        session = self.execution_session
+        if session is None:
+            return subprocess.run(argv, **kwargs)
+        return self.user_sessions.run(
+            session,
+            argv,
+            remote_env=remote_env,
+            **kwargs,
+        )
+
+    def _share_user_work(self, work: Path) -> None:
+        """Publish files created by the authenticated Slurm user.
+
+        ``umask 000`` covers ordinary file creation, but tools may retain source
+        modes or use private temporary files. Only files owned by that user are
+        changed; service-owned state and logs keep their configured modes.
+        """
+
+        session = self.execution_session
+        if session is None:
+            return
+        result = self.user_sessions.run(
+            session,
+            [
+                "/usr/bin/find",
+                str(work),
+                "!",
+                "-type",
+                "l",
+                "-user",
+                str(session.uid),
+                "-exec",
+                "/usr/bin/chmod",
+                "a+rwX",
+                "{}",
+                "+",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=300,
+        )
+        if result.returncode:
+            raise DomainError(
+                "无法发布 Slurm 用户的输出权限："
+                + (result.stderr or "chmod failed")[-1200:]
+            )
+
+    def _wait_process(self, process, timeout, *, cancel_event=None):
+        try:
+            deadline = time.monotonic() + timeout
+            while process.poll() is None:
+                if cancel_event is not None and cancel_event.is_set():
+                    raise InterruptedError("命令已取消")
+                if self.shutdown_requested.wait(0.25):
+                    raise InterruptedError("Worker 收到停止请求")
+                if time.monotonic() >= deadline:
+                    raise TimeoutError("命令执行超时")
+            return process.returncode
+        except BaseException:
+            try:
+                os.killpg(process.pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+            try:
+                process.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                process.wait()
+            raise
 
     def _deep_validate(self, executable: str, work: Path, allocation: str | None):
         """Validate the converted dataset, retrying only a publish race.
@@ -381,12 +545,21 @@ class JobRunner:
         config = self.settings.slurm or {}
         if not config.get("enabled"):
             return None
-        if os.environ.get("SLURM_JOB_ID"):
+        if self.shutdown_requested.is_set():
+            raise InterruptedError("Worker 收到停止请求")
+        if self.execution_session is None and os.environ.get("SLURM_JOB_ID"):
             return os.environ["SLURM_JOB_ID"]
+        if self.allocation_id:
+            return self.allocation_id
         salloc = executable_path("salloc")
         if salloc is None:
             raise DomainError("配置了 Slurm 但找不到 salloc", 503)
-        job_name = str(config.get("job_name", "bodypipeline-convert"))
+        # A shared name can resolve to another concurrent job's allocation.
+        job_name = (
+            str(config.get("job_name", "bodypipeline-convert"))[:80]
+            + "-"
+            + uuid.uuid4().hex
+        )
         argv = [
             salloc,
             "--no-shell",
@@ -394,6 +567,8 @@ class JobRunner:
             str(config.get("partition", "dev")),
             "--job-name",
             job_name,
+            "--chdir",
+            str(work.resolve()),
             "--cpus-per-task",
             str(config.get("cpus_per_task", 16)),
             "--mem",
@@ -405,43 +580,65 @@ class JobRunner:
             argv += ["--nodelist", str(config["nodelist"])]
         if config.get("extra_args"):
             argv += [str(value) for value in config["extra_args"]]
-        result = subprocess.run(
-            argv,
-            capture_output=True,
-            text=True,
-            timeout=900,
-            cwd=work,
-            env=self.settings.tool_environment(),
-        )
-        if result.returncode != 0:
-            raise DomainError(
-                "Slurm 分配失败：" + (result.stderr or result.stdout)[-800:]
-            )
-        job_id = self._allocation_id(job_name, work)
-        if job_id is None:
-            raise DomainError("Slurm 未返回分配编号")
-        self.allocation_id = job_id
-        return job_id
+        stdout = work / "slurm-allocation.stdout.log"
+        stderr = work / "slurm-allocation.stderr.log"
+        try:
+            with stdout.open("wb") as out, stderr.open("wb") as err:
+                process = self._popen(
+                    argv,
+                    stdout=out,
+                    stderr=err,
+                    start_new_session=True,
+                    cwd=work,
+                    env=self.settings.tool_environment(),
+                )
+                code = self._wait_process(process, 900)
+            if code:
+                raise DomainError(
+                    "Slurm 分配失败：" + stderr.read_text(errors="replace")[-800:]
+                )
+            job_id = self._allocation_id(job_name, work)
+            if job_id is None:
+                raise DomainError("Slurm 未返回分配编号")
+            self.allocation_id = job_id
+            return job_id
+        except BaseException:
+            # Also cancels a pending allocation when shutdown interrupts salloc.
+            self._cancel_allocation("--name", job_name)
+            raise
 
     def _allocation_id(self, job_name: str, work: Path) -> str | None:
-        """The newest pending/running allocation with this job name and directory."""
+        """Resolve only this request's unique job name and working directory."""
 
         squeue = executable_path("squeue")
         if squeue is None:
             return None
         deadline = time.monotonic() + 300
         while time.monotonic() < deadline:
-            result = subprocess.run(
-                [squeue, "--me", "--name", job_name, "--noheader", "--format=%i %T"],
+            if self.shutdown_requested.is_set():
+                raise InterruptedError("Worker 收到停止请求")
+            result = self._run(
+                [squeue, "--me", "--name", job_name, "--noheader", "--format=%i|%T|%Z"],
                 capture_output=True,
                 text=True,
                 timeout=30,
+                cwd=work,
             )
-            rows = [line.split() for line in result.stdout.splitlines() if line.strip()]
-            for row in sorted(rows, key=lambda r: -int(r[0])):
-                if len(row) >= 2 and row[1] in {"PENDING", "RUNNING", "CONFIGURING"}:
-                    return row[0]
-            time.sleep(2)
+            matches = []
+            for line in result.stdout.splitlines():
+                row = [part.strip() for part in line.split("|", 2)]
+                if (
+                    len(row) == 3
+                    and row[0].isdecimal()
+                    and row[1] in {"PENDING", "RUNNING", "CONFIGURING"}
+                    and row[2] == str(work.resolve())
+                ):
+                    matches.append(row[0])
+            if len(matches) > 1:
+                raise DomainError("Slurm 分配编号不唯一，拒绝复用")
+            if matches:
+                return matches[0]
+            self.shutdown_requested.wait(2)
         return None
 
     def _close_allocation(self):
@@ -449,28 +646,51 @@ class JobRunner:
         if not job_id:
             return
         self.allocation_id = None
+        self._cancel_allocation(job_id)
+
+    def _cancel_allocation(self, *args):
         scancel = executable_path("scancel")
         if scancel is None:
             return
         try:
-            subprocess.run([scancel, job_id], capture_output=True, timeout=60)
+            self._run(
+                [scancel, *args],
+                capture_output=True,
+                timeout=10,
+                cwd=self.settings.root,
+            )
         except subprocess.SubprocessError:
             pass
 
-    def _conversion_parallelism(self) -> dict:
-        """Worker counts for this conversion, bounded by the CPUs available.
+    def _cpu_budget(self):
+        """CPU budget for one job's steps and video workers.
 
-        ``os.sched_getaffinity`` reports the allocation's CPUs inside a Slurm
-        step, so the same numbers hold when the pipeline is run without Slurm.
+        The Server's affinity is not the remote Slurm step's CPU budget.
+        Local workers share the host budget across the configured job slots.
         """
 
         try:
             cpus = len(os.sched_getaffinity(0))
-        except AttributeError:
+        except (AttributeError, OSError):
             cpus = os.cpu_count() or 1
         config = self.settings.slurm or {}
+        if config.get("enabled"):
+            requested = int(config.get("cpus_per_task", 16))
+            if self.execution_session is None and os.environ.get("SLURM_JOB_ID"):
+                inherited = int(os.environ.get("SLURM_CPUS_PER_TASK") or cpus)
+                requested = min(
+                    requested, max(1, inherited // self.settings.max_concurrent_jobs)
+                )
+            cpus = max(1, requested)
+        else:
+            cpus = max(1, cpus // self.settings.max_concurrent_jobs)
+        return cpus
+
+    def _conversion_parallelism(self) -> dict:
+        cpus = self._cpu_budget()
+        config = self.settings.slurm or {}
         configured = int(config.get("conversion_workers") or 0)
-        workers = configured or max(1, min(cpus, 8))
+        workers = max(1, min(cpus, configured or 8))
         return {
             "convert_workers": workers,
             "video_workers": workers,
@@ -496,9 +716,19 @@ class JobRunner:
         srun = executable_path("srun")
         if srun is None:
             raise DomainError("配置了 Slurm 但找不到 srun", 503)
-        reusable = allocation or os.environ.get("SLURM_JOB_ID")
+        reusable = allocation or (
+            os.environ.get("SLURM_JOB_ID") if self.execution_session is None else None
+        )
         if reusable:
-            return [srun, "--jobid", str(reusable), *args]
+            return [
+                srun,
+                "--jobid",
+                str(reusable),
+                "--exact",
+                "--cpus-per-task",
+                str(self._cpu_budget()),
+                *args,
+            ]
         argv = [
             srun,
             "--partition",
@@ -521,7 +751,7 @@ class JobRunner:
             argv += [str(value) for value in config["extra_args"]]
         return argv + list(args)
 
-    def tick(self):
+    def _auto_enqueue(self):
         if self.settings.auto_process:
             for upload in self.store.all("upload"):
                 if (
@@ -534,11 +764,169 @@ class JobRunner:
                     )
                 ):
                     self.enqueue(upload["id"])
+
+    def _release_slot(self, identifier):
+        self._active.pop(identifier, None)
+        self._source_reservations.pop(identifier, None)
+
+    def _reap(self):
+        for identifier, future in list(self._active.items()):
+            if future is not None and future.done():
+                # Surface unexpected worker/storage errors in the polling log.
+                self._release_slot(identifier)
+                future.result()
+
+    def _job_resources(self, job):
+        # Derived jobs take exclusive dataset locks. Queue overlapping sources
+        # instead of making concurrent merges/exports fail with a lock conflict.
+        sources = set(job.get("source_job_ids") or [])
+        if job.get("source_job_id"):
+            sources.add(job["source_job_id"])
+        resources = {"job:" + identifier for identifier in sources | {job["id"]}}
+        for identifier in sources:
+            try:
+                source = self.store.get("job", identifier)
+            except DomainError as exc:
+                if exc.code != 404:
+                    raise
+                continue
+            if source.get("dataset_path"):
+                resources.add("path:" + str(Path(source["dataset_path"]).resolve()))
+        return resources
+
+    def _claim(self):
+        if self.shutdown_requested.is_set():
+            return None
+        reserved = set().union(*self._source_reservations.values())
         queued = [j for j in self.store.all("job") if j["state"] == "QUEUED"]
-        if queued:
-            self.run(queued[-1])
-            return True
-        return False
+        for job in reversed(queued):
+            resources = self._job_resources(job)
+            if reserved & resources:
+                continue
+            self.save(job, state="RUNNING", stage="准备执行作业", started_at=now())
+            self._active[job["id"]] = None
+            self._source_reservations[job["id"]] = resources
+            return job
+        return None
+
+    def dataset_tick(self, worker, kind, *, save=None, run=None):
+        """Run a read-only task without overlapping a job using its dataset."""
+        with self.lock:
+            if self.shutdown_requested.is_set():
+                return False
+            reserved = set().union(*self._source_reservations.values())
+            queued = [row for row in self.store.all(kind) if row["state"] == "QUEUED"]
+            for row in reversed(queued):
+                identifier = f"{kind}:{row['id']}"
+                resources = self._job_resources(
+                    {"id": identifier, "source_job_id": row["job_id"]}
+                )
+                if reserved & resources:
+                    continue
+                (save or worker.save)(row, state="RUNNING", started_at=now())
+                self._source_reservations[identifier] = resources
+                break
+            else:
+                return False
+        try:
+            with self.bind_record_session(row):
+                (run or worker.run)(row)
+        except Exception as exc:
+            (save or worker.save)(
+                row,
+                state="FAILED",
+                stage="任务失败",
+                error=str(exc),
+                finished_at=now(),
+            )
+        finally:
+            with self.lock:
+                self._source_reservations.pop(identifier, None)
+        return True
+
+    def _execute_job(self, job):
+        try:
+            with self.bind_record_session(job):
+                try:
+                    if self.shutdown_requested.is_set():
+                        raise InterruptedError("Worker 收到停止请求")
+                    self.run(job)
+                finally:
+                    if self.allocation_id:
+                        self._close_allocation()
+        except InterruptedError as exc:
+            self.save(
+                job,
+                state="INTERRUPTED",
+                stage="Worker 已停止",
+                error=str(exc),
+                finished_at=now(),
+            )
+        except Exception as exc:
+            self.save(
+                job, state="FAILED", stage="任务失败", error=str(exc), finished_at=now()
+            )
+
+    def dispatch(self):
+        """Fill free execution slots without blocking the other Server queues."""
+        with self.lock:
+            self._reap()
+            if self.shutdown_requested.is_set():
+                return False
+            slots = self.settings.max_concurrent_jobs - len(self._active)
+            if slots < 1:
+                return False
+            self._auto_enqueue()
+            if self._executor is None:
+                self._executor = ThreadPoolExecutor(
+                    max_workers=self.settings.max_concurrent_jobs,
+                    thread_name_prefix="conversion",
+                )
+            launched = False
+            for _ in range(slots):
+                job = self._claim()
+                if job is None:
+                    break
+                try:
+                    self._active[job["id"]] = self._executor.submit(
+                        self._execute_job, job
+                    )
+                except Exception:
+                    self._release_slot(job["id"])
+                    self.save(job, state="QUEUED", stage="等待 Worker", started_at=None)
+                    raise
+                launched = True
+            return launched
+
+    def tick(self):
+        """Run one job synchronously for explicit drains and offline tooling."""
+        with self.lock:
+            self._reap()
+            if (
+                self.shutdown_requested.is_set()
+                or len(self._active) >= self.settings.max_concurrent_jobs
+            ):
+                return False
+            self._auto_enqueue()
+            job = self._claim()
+        if job is None:
+            return False
+        try:
+            self._execute_job(job)
+        finally:
+            with self.lock:
+                self._release_slot(job["id"])
+        return True
+
+    def shutdown(self):
+        """Stop admission and wait for every worker to release its resources."""
+        with self.lock:
+            self.shutdown_requested.set()
+            executor = self._executor
+        if executor is not None:
+            executor.shutdown(wait=True)
+        with self.lock:
+            self._reap()
 
     def run(self, job):
         if job.get("operation") == "merge":
@@ -633,12 +1021,16 @@ class JobRunner:
                     self.catalog.validate_capture(
                         runtime, manifest, require_compatible_hash=False
                     )
-                    metadata = collection_metadata(
-                        manifest, upload["target"], upload["prefix"]
+                    metadata = stored_collection_metadata(manifest, upload)
+                    migrated_from = upload.get("collection_migration", {}).get(
+                        "original_collection_id"
                     )
-                    if (
-                        job.get("collection_id")
-                        and metadata["collection_id"] != job["collection_id"]
+                    if job.get("collection_id") and metadata[
+                        "collection_id"
+                    ] != job["collection_id"] and not (
+                        migrated_from == job["collection_id"]
+                        and metadata["collection_id"]
+                        in job.get("source_collection_ids", [])
                     ):
                         raise DomainError("源采集不属于任务数据集")
                     if (
@@ -871,6 +1263,9 @@ class JobRunner:
                 raise DomainError(
                     f"转换失败（{code}）：{err.read_text(errors='replace')[-2000:]}"
                 )
+            # The converter runs as the submitting H800 user. Publish its output
+            # before the service process applies trusted provider metadata.
+            share_data_tree(work / "dataset")
             provider.patch_dataset_info(work / "dataset", profile, synthetic=synthetic)
             # Run after the provider's atomic metadata rewrite, and before the
             # dataset becomes available to previews or downstream users. This

@@ -16,6 +16,7 @@ from pathlib import Path
 import httpx
 from fastapi import FastAPI, Request
 from fastapi.responses import (
+    FileResponse,
     HTMLResponse,
     JSONResponse,
     RedirectResponse,
@@ -25,7 +26,7 @@ from pydantic import BaseModel, ConfigDict, Field, StrictBool, StrictInt
 
 from pipeline.shared.core import DomainError, Store, executable_path
 from pipeline.shared.security import install_security
-from pipeline.shared.web import themed_html
+from pipeline.shared.web import ASSETS, themed_html
 
 from .datasets import dataset_for_job
 from .episode_scores import EpisodeScoreCache
@@ -464,6 +465,11 @@ def create_gateway(settings):
     async def domain_error(_request, exc):
         return JSONResponse({"detail": exc.message}, status_code=exc.code)
 
+    @app.get("/bodypipeline-icon.png")
+    @app.get("/bodypipeline-mark.png")
+    def bodypipeline_asset(request: Request):
+        return FileResponse(ASSETS / request.url.path.removeprefix("/"))
+
     def service_ready():
         state = _gateway_state(store)
         return state is not None and state.get("state") == "READY"
@@ -533,24 +539,6 @@ def create_gateway(settings):
     async def save_task_templates(body: TemplateRequest):
         return await annotation_proxy("/api/task-templates", body)
 
-    @app.get("/api/subtask-review/{dataset_id}/episodes/{episode}")
-    async def review_episode(dataset_id: str, episode: int):
-        return await review_proxy(dataset_id, f"episodes/{episode}")
-
-    @app.post("/api/subtask-review/{dataset_id}/episodes/{episode}")
-    async def review_save(dataset_id: str, episode: int, body: DraftRequest):
-        return await review_proxy(dataset_id, f"episodes/{episode}", body)
-
-    @app.post("/api/subtask-review/{dataset_id}/exports")
-    async def review_export(dataset_id: str, body: RevisionExportRequest):
-        return await review_proxy(dataset_id, "exports", body)
-
-    @app.get("/api/subtask-review/{dataset_id}/exports/{export_id}")
-    async def review_export_status(dataset_id: str, export_id: str):
-        if not export_id or any(c not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-" for c in export_id):
-            raise DomainError("修订导出任务编号无效", 404)
-        return await review_proxy(dataset_id, f"exports/{export_id}")
-
     @app.get("/api/instructions/{dataset_id}")
     async def instruction_dataset(dataset_id: str):
         return await instruction_proxy(dataset_id, "")
@@ -600,9 +588,25 @@ def create_gateway(settings):
             for character in apply_id
         ):
             raise DomainError("语言指令任务编号无效", 404)
-        return await instruction_proxy(
-            dataset_id, f"apply/{apply_id}"
-        )
+        return await instruction_proxy(dataset_id, f"apply/{apply_id}")
+
+    @app.get("/api/subtask-review/{dataset_id}/episodes/{episode}")
+    async def review_episode(dataset_id: str, episode: int):
+        return await review_proxy(dataset_id, f"episodes/{episode}")
+
+    @app.post("/api/subtask-review/{dataset_id}/episodes/{episode}")
+    async def review_save(dataset_id: str, episode: int, body: DraftRequest):
+        return await review_proxy(dataset_id, f"episodes/{episode}", body)
+
+    @app.post("/api/subtask-review/{dataset_id}/exports")
+    async def review_export(dataset_id: str, body: RevisionExportRequest):
+        return await review_proxy(dataset_id, "exports", body)
+
+    @app.get("/api/subtask-review/{dataset_id}/exports/{export_id}")
+    async def review_export_status(dataset_id: str, export_id: str):
+        if not export_id or any(c not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-" for c in export_id):
+            raise DomainError("修订导出任务编号无效", 404)
+        return await review_proxy(dataset_id, f"exports/{export_id}")
 
     @app.get("/api/episode-scores/{dataset_id}")
     async def score_status(dataset_id: str):

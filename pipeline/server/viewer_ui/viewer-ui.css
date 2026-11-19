@@ -1,4 +1,4 @@
-/* BodyPipeline signal explorer and responsive camera stage. */
+/* imply signal explorer and responsive camera stage. */
 .episode-score-panel {
   margin-top: 16px;
   padding: 12px;
@@ -106,7 +106,6 @@ html[data-theme="dark"] .annotations-skin {
   --hf-green: #82dabb;
   --hf-purple: #c2a4ff;
 }
-
 /* Visual language-instruction studio. */
 .instruction-editor {
   display: flex;
@@ -490,15 +489,9 @@ html[data-theme="light"] .theme-label-light {
   min-width: 0;
 }
 .viewer-identity-icon {
-  display: grid;
-  place-items: center;
-  width: 38px;
+  width: 112px;
   height: 38px;
-  border-radius: 10px;
-  background: var(--accent-soft);
-  border: 1px solid var(--accent-ring);
-  color: var(--accent);
-  font-weight: 700;
+  object-fit: contain;
   flex-shrink: 0;
 }
 .viewer-instruction {

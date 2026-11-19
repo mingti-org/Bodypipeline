@@ -7,12 +7,17 @@ from contextlib import asynccontextmanager
 from typing import Literal
 from urllib.parse import quote
 
-from fastapi import Body, FastAPI, Request, Response
+from fastapi import Body, FastAPI, Query, Request, Response
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, ConfigDict, Field, StrictBool, StrictInt
 
-from pipeline.shared.collections import collection_metadata, group_uploads
+from pipeline.shared.collections import (
+    group_uploads,
+    stored_collection_metadata,
+    visible_collection_uploads,
+)
 from pipeline.shared.core import DomainError, ProcessLock, executable_path
+from pipeline.shared.identity import Principal, require_owner
 from pipeline.shared.security import install_security
 from pipeline.shared.web import ListCompressionMiddleware, mount_ui
 
@@ -20,8 +25,9 @@ from .analyses import AnalysisRunner
 from .annotations import AnnotationRunner
 from .checks import QualityRunner
 from .conversion_options import ConversionOptions
+from .dataset_descriptions import DatasetDescriptionRequest, DatasetDescriptions
 from .dataset_management import DELETION_STATES, DatasetManager
-from .datasets import TARGET_FORMATS, dataset_for_job
+from .datasets import TARGET_FORMATS, batch_name_for_job, dataset_for_job
 from .deliveries import DeliveryScanner
 from .episode_validation import InvalidEpisodePolicy
 from .imports import ImportService
@@ -34,11 +40,13 @@ from .instruction_review import (
 )
 from .instruction_worker import InstructionApplyRunner
 from .jobs import JobRunner
+from .listings import WorkbenchLists
 from .providers import RuntimeCatalog
 from .quality import robot_profile_blockers
 from .storage import storage_path
 from .subtask_review import DraftRequest, RevisionExportRequest, SubtaskReview
 from .task_annotations import TemplateLibrary, TemplateRequest
+from .user_sessions import SlurmIdentityBroker
 from .viewer import ViewerManager
 
 # Fields only the per-job detail view needs. They are the bulk of the listing
@@ -209,7 +217,8 @@ def create_app(settings, background=True):
     ingest = IngestService(settings)
     runtimes = RuntimeCatalog(settings)
     imports = ImportService(settings, ingest, runtimes)
-    runner = JobRunner(settings, ingest)
+    user_sessions = SlurmIdentityBroker(settings)
+    runner = JobRunner(settings, ingest, user_sessions=user_sessions)
     subtask_review = SubtaskReview(settings, ingest.store)
     instruction_review = InstructionReview(settings, ingest.store)
     instruction_apply = InstructionApplyRunner(
@@ -223,9 +232,12 @@ def create_app(settings, background=True):
         close_allocation=runner._close_allocation,
     )
     analyses = AnalysisRunner(settings, ingest.store, runner.command)
-    annotations = AnnotationRunner(settings, ingest.store, runtimes)
+    annotations = AnnotationRunner(
+        settings, ingest.store, runtimes, runner=runner
+    )
     viewer = ViewerManager(settings, ingest.store)
     datasets = DatasetManager(settings, runner, viewer)
+    descriptions = DatasetDescriptions(settings, runner)
     deliveries = DeliveryScanner(settings, imports, datasets, runner)
     trims = runner.trims
     # Enqueueing consumers and marking deletions share one admission lock.
@@ -233,17 +245,38 @@ def create_app(settings, background=True):
     lock = ProcessLock(settings.root / "server.lock")
     stopping = asyncio.Event()
 
+    def principal(request: Request) -> Principal:
+        value = getattr(request.state, "principal", None)
+        if value is None:
+            raise DomainError("请先登录或提供有效凭据", 401)
+        return value
+
+    def owned_job(identifier: str, request: Request, *, action: str = "操作") -> dict:
+        row = ingest.store.get("job", identifier)
+        require_owner(row, principal(request), action=action)
+        return row
+
+    def check_tick():
+        return runner.dataset_tick(checks, "check")
+
+    def analysis_tick():
+        return runner.dataset_tick(analyses, "analysis")
+
+    def trim_tick():
+        return runner.dataset_tick(
+            trims, "trim_preview", save=trims._save_preview, run=trims._run_preview
+        )
+
     async def loop():
         while not stopping.is_set():
             # One failing worker must not stop the shared loop: a dead loop means
             # every later job, check and analysis silently stops being picked up.
             for worker in (
                 datasets.tick,
-                runner.tick,
+                check_tick,
+                analysis_tick,
+                trim_tick,
                 instruction_apply.tick,
-                checks.tick,
-                analyses.tick,
-                trims.tick,
             ):
                 if stopping.is_set():
                     break
@@ -253,6 +286,17 @@ def create_app(settings, background=True):
                     log.exception(
                         "worker tick failed: %s", getattr(worker, "__self__", worker)
                     )
+            try:
+                await asyncio.wait_for(stopping.wait(), settings.poll_seconds)
+            except asyncio.TimeoutError:
+                pass
+
+    async def conversion_loop():
+        while not stopping.is_set():
+            try:
+                await asyncio.to_thread(runner.dispatch)
+            except Exception:
+                log.exception("conversion dispatch failed")
             try:
                 await asyncio.wait_for(stopping.wait(), settings.poll_seconds)
             except asyncio.TimeoutError:
@@ -301,13 +345,16 @@ def create_app(settings, background=True):
         checks.recover()
         analyses.recover()
         annotations.recover()
-        instruction_apply.recover()
         viewer.recover()
         datasets.recover()
         trims.recover()
+        instruction_apply.recover()
+        if background:
+            await asyncio.to_thread(lists.index.warm)
         tasks = (
             [
                 asyncio.create_task(loop()),
+                asyncio.create_task(conversion_loop()),
                 asyncio.create_task(annotation_loop()),
                 asyncio.create_task(viewer_loop()),
                 asyncio.create_task(delivery_loop()),
@@ -321,14 +368,26 @@ def create_app(settings, background=True):
             stopping.set()
             deliveries.stopping.set()
             runner.shutdown_requested.set()
+            analyses.shutdown_requested.set()
             annotations.shutdown_requested.set()
-            if tasks:
-                await asyncio.gather(*tasks)
-            viewer.stop()
-            lock.release()
+            try:
+                if tasks:
+                    await asyncio.gather(*tasks)
+            finally:
+                try:
+                    await asyncio.to_thread(runner.shutdown)
+                finally:
+                    try:
+                        viewer.stop()
+                    finally:
+                        try:
+                            user_sessions.close_all()
+                        finally:
+                            lock.release()
 
     app = FastAPI(title="Embodied Pipeline Server", lifespan=lifespan)
     app.state.ingest, app.state.runner, app.state.viewer = ingest, runner, viewer
+    app.state.user_sessions = user_sessions
     app.state.imports = imports
     app.state.deliveries = deliveries
     app.state.checks = checks
@@ -339,7 +398,12 @@ def create_app(settings, background=True):
     app.state.runtimes = runtimes
     app.state.datasets = datasets
     app.state.trims = trims
-    install_security(app, settings, device_prefix="/device/")
+    install_security(
+        app,
+        settings,
+        device_prefix="/device/",
+        user_sessions=user_sessions,
+    )
     app.add_middleware(
         ListCompressionMiddleware,
         paths={
@@ -351,6 +415,11 @@ def create_app(settings, background=True):
             "/api/version-conversion-candidates",
             "/api/trim-candidates",
             "/api/annotations",
+            *(f"/api/listings/{name}" for name in (
+                "collections", "jobs", "merge-jobs", "results", "datasets", "merge-candidates",
+                "version-conversion-candidates", "trim-candidates", "annotations",
+                "annotation-candidates", "collection-detail", "status", "robots",
+            )),
         },
     )
     mount_ui(app, report=True)
@@ -360,11 +429,13 @@ def create_app(settings, background=True):
         return {"service": "server", "alive": True}
 
     @app.get("/api/config")
-    def config():
+    def config(request: Request):
+        principal = getattr(request.state, "principal", None)
         return {
             "role": "server",
             "processing_mode": settings.processing_mode,
             "auto_process": settings.auto_process,
+            "max_concurrent_jobs": settings.max_concurrent_jobs,
             "robot_id": settings.robot_id,
             "profile": settings.profile(),
             "default_runtime_id": settings.default_profile or runtimes.default().id,
@@ -376,6 +447,8 @@ def create_app(settings, background=True):
             "letools_available": bool(executable_path(settings.letools_bin)),
             "viewer_url": settings.viewer_origin.rstrip("/") + "/",
             "import_roots": [str(root) for root in imports.allowed_roots()],
+            "current_user": principal.public() if principal else None,
+            "user_login": user_sessions.enabled,
         }
 
     @app.post("/api/imports", status_code=201)
@@ -401,7 +474,9 @@ def create_app(settings, background=True):
         return datasets.listing()
 
     @app.post("/api/dataset-deletions", status_code=202)
-    def delete_dataset(body: DatasetDeletionRequest):
+    def delete_dataset(body: DatasetDeletionRequest, request: Request):
+        if body.kind == "result":
+            owned_job(body.id, request, action="删除")
         return datasets.enqueue(body.kind, body.id, body.confirmation)
 
     @app.post("/api/dataset-deletions/{identifier}/retry", status_code=202)
@@ -421,6 +496,7 @@ def create_app(settings, background=True):
     def targets(request: Request):
         allowed = request.state.device.get("targets", list(settings.targets))
         return {
+            "collection_batch_version": 1,
             "targets": [
                 {"id": k, "label": v}
                 for k, v in settings.targets.items()
@@ -490,17 +566,18 @@ def create_app(settings, background=True):
 
     @app.get("/api/uploads")
     def uploads():
+        return upload_rows(ingest.store.all("upload"))
+
+    def upload_rows(records):
         rows = []
-        for row in ingest.store.all("upload"):
+        for row in records:
             if row["state"] in DELETION_STATES:
                 continue
             result = {**row, "conversion_blockers": []}
             blockers = result["conversion_blockers"]
             try:
                 manifest = ingest.manifest(row)
-                result.update(
-                    collection_metadata(manifest, row["target"], row["prefix"])
-                )
+                result.update(stored_collection_metadata(manifest, row))
                 source_type = manifest["profile"].get("robot_type")
                 result["robot_type"] = row.get("robot_type") or source_type
                 try:
@@ -561,7 +638,7 @@ def create_app(settings, background=True):
 
     @app.get("/api/collections")
     def collections(summary: bool = False):
-        groups = group_uploads(uploads())
+        groups = group_uploads(visible_collection_uploads(uploads()))
         if summary:
             for group in groups:
                 group["uploads"] = [
@@ -571,14 +648,23 @@ def create_app(settings, background=True):
         return groups
 
     @app.post("/api/collections/{cid}/process", status_code=202)
-    def process_collection(cid: str, body: BatchConversionRequest):
-        return job_response(runner.enqueue_collection(cid, **body.model_dump()))
+    def process_collection(cid: str, body: BatchConversionRequest, request: Request):
+        return job_response(
+            runner.enqueue_collection(
+                cid,
+                **body.model_dump(),
+                principal=principal(request),
+            )
+        )
 
-    def job_response(row, summary=False):
+    def job_response(row, summary=False, metadata=None):
         result = {**row, "target_format": row.get("target_format", "v3.0")}
         result["robot_type"] = row.get("robot_type") or row.get("profile", {}).get(
             "robot_type"
         )
+        batch_name = batch_name_for_job(row)
+        if batch_name:
+            result["batch_name"] = batch_name
         if summary:
             # List views only render progress and names; the full reports are
             # fetched per job. Serving them here cost more than 10 MB per poll.
@@ -596,9 +682,9 @@ def create_app(settings, background=True):
                     blockers = robot_profile_blockers(row.get("profile", {}))
             result["blockers"] = blockers
         try:
-            result["dataset_path"] = str(dataset_for_job(settings, row))
+            result["dataset_path"] = str(dataset_for_job(settings, row) if metadata is None else metadata(row)[0])
             result["dataset_available"] = True
-        except DomainError as exc:
+        except (DomainError, OSError, ValueError) as exc:
             result["dataset_available"] = False
             result["dataset_unavailable_reason"] = str(exc)
         return result
@@ -620,19 +706,26 @@ def create_app(settings, background=True):
         return runner.version_conversions.candidates()
 
     @app.post("/api/version-conversions", status_code=202)
-    def convert_version(body: VersionConversionRequest):
+    def convert_version(body: VersionConversionRequest, request: Request):
         return job_response(
             runner.version_conversions.enqueue(
                 body.source_job_id,
                 body.target_format,
                 name=body.name,
                 run_doctor=body.run_doctor,
+                principal=principal(request),
             )
         )
 
     @app.post("/api/merges", status_code=202)
-    def merge(body: MergeRequest):
-        return job_response(runner.merges.enqueue(body.source_job_ids, body.name))
+    def merge(body: MergeRequest, request: Request):
+        return job_response(
+            runner.merges.enqueue(
+                body.source_job_ids,
+                body.name,
+                principal=principal(request),
+            )
+        )
 
     @app.get("/api/trim-candidates")
     def trim_candidates():
@@ -648,22 +741,31 @@ def create_app(settings, background=True):
         return trims.listing(jid)
 
     @app.post("/api/jobs/{jid}/trim-previews", status_code=202)
-    def trim_preview_start(jid: str, body: TrimPreviewRequest | None = None):
+    def trim_preview_start(
+        jid: str, request: Request, body: TrimPreviewRequest | None = None
+    ):
+        owned_job(jid, request, action="检测")
         options = (body or TrimPreviewRequest()).options
-        return trims.enqueue_preview(jid, options.model_dump())
+        return trims.enqueue_preview(
+            jid,
+            options.model_dump(),
+            principal=principal(request),
+        )
 
     @app.get("/api/trim-previews/{pid}")
     def trim_preview(pid: str, offset: int = 0, limit: int = 200):
         return trims.preview(pid, offset, limit)
 
     @app.post("/api/jobs/{jid}/trims", status_code=202)
-    def trim_start(jid: str, body: TrimRequest):
+    def trim_start(jid: str, body: TrimRequest, request: Request):
+        owned_job(jid, request, action="裁剪")
         return job_response(
             trims.enqueue(
                 jid,
                 body.preview_id,
                 name=body.name,
                 run_doctor=body.run_doctor,
+                principal=principal(request),
             )
         )
 
@@ -681,25 +783,51 @@ def create_app(settings, background=True):
         )
 
     @app.post("/api/uploads/{uid}/process", status_code=202)
-    def process(uid: str, body: ConversionRequest | None = Body(default=None)):
+    def process(
+        uid: str,
+        request: Request,
+        body: ConversionRequest | None = Body(default=None),
+    ):
         options = body or ConversionRequest()
-        return job_response(runner.enqueue(uid, **options.model_dump()))
+        return job_response(
+            runner.enqueue(
+                uid,
+                **options.model_dump(),
+                principal=principal(request),
+            )
+        )
 
     @app.get("/api/jobs/{jid}")
     def job(jid: str):
         return job_response(ingest.store.get("job", jid))
 
+    @app.get("/api/jobs/{jid}/description")
+    def dataset_description(jid: str):
+        return descriptions.get(jid)
+
+    @app.put("/api/jobs/{jid}/description")
+    def save_dataset_description(
+        jid: str, body: DatasetDescriptionRequest, request: Request
+    ):
+        owned_job(jid, request, action="修改说明")
+        return descriptions.save(jid, body)
+
     @app.post("/api/jobs/{jid}/checks", status_code=202)
-    def run_check(jid: str):
+    def run_check(jid: str, request: Request):
+        owned_job(jid, request, action="质检")
         # Doctor and the content analysis answer different questions about the
         # same dataset, so starting one starts both. Argus does not need letools,
         # so it is enqueued first: a broken Doctor install must not hide it.
         if settings.argus_src:
             try:
-                analyses.enqueue(jid, mode="local")
+                analyses.enqueue(
+                    jid,
+                    mode="local",
+                    principal=principal(request),
+                )
             except DomainError:
                 pass
-        return checks.enqueue(jid)
+        return checks.enqueue(jid, principal=principal(request))
 
     @app.get("/api/jobs/{jid}/checks")
     def job_checks(jid: str):
@@ -707,9 +835,19 @@ def create_app(settings, background=True):
         return [r for r in ingest.store.all("check") if r["job_id"] == jid]
 
     @app.post("/api/jobs/{jid}/analyses", status_code=202)
-    def run_analysis(jid: str, body: AnalysisRequest | None = Body(default=None)):
+    def run_analysis(
+        jid: str,
+        request: Request,
+        body: AnalysisRequest | None = Body(default=None),
+    ):
+        owned_job(jid, request, action="分析")
         options = body or AnalysisRequest()
-        return analyses.enqueue(jid, mode=options.mode, episodes=options.episodes)
+        return analyses.enqueue(
+            jid,
+            mode=options.mode,
+            episodes=options.episodes,
+            principal=principal(request),
+        )
 
     @app.get("/api/jobs/{jid}/analyses")
     def job_analyses(jid: str):
@@ -721,7 +859,12 @@ def create_app(settings, background=True):
         return ingest.store.get("analysis", aid)
 
     @app.post("/api/analyses/{aid}/cancel")
-    def cancel_analysis(aid: str):
+    def cancel_analysis(aid: str, request: Request):
+        require_owner(
+            ingest.store.get("analysis", aid),
+            principal(request),
+            action="取消",
+        )
         return analyses.cancel(aid)
 
     @app.get("/api/analyses/{aid}/budget")
@@ -736,27 +879,6 @@ def create_app(settings, background=True):
     @app.post("/api/task-templates")
     def save_task_templates(body: TemplateRequest):
         return TemplateLibrary(ingest.store).save(body)
-
-    @app.get("/api/subtask-review/{dataset_id}/episodes/{episode}")
-    def review_episode(dataset_id: str, episode: int):
-        return subtask_review.episode(dataset_id, episode)
-
-    @app.post("/api/subtask-review/{dataset_id}/episodes/{episode}")
-    def review_save(dataset_id: str, episode: int, body: DraftRequest):
-        return subtask_review.save(dataset_id, episode, body)
-
-    @app.post("/api/subtask-review/{dataset_id}/exports", status_code=202)
-    def review_export(dataset_id: str, body: RevisionExportRequest):
-        job = runner.subtask_exports.enqueue_review(dataset_id, body)
-        return {k: job.get(k) for k in ("id", "state", "stage", "dataset_name", "error")}
-
-    @app.get("/api/subtask-review/{dataset_id}/exports/{export_id}")
-    def review_export_status(dataset_id: str, export_id: str):
-        subtask_review.resolve(dataset_id)
-        job = ingest.store.get("job", export_id)
-        if job.get("source_kind") != "lerobot_subtask_revision" or job.get("source_job_id") != dataset_id:
-            raise DomainError("修订导出任务不存在", 404)
-        return {k: job.get(k) for k in ("id", "state", "stage", "dataset_name", "error")}
 
     @app.get("/api/instructions/{dataset_id}")
     def instruction_dataset(dataset_id: str):
@@ -799,6 +921,36 @@ def create_app(settings, background=True):
     def instruction_apply_status(dataset_id: str, apply_id: str):
         return instruction_apply.status(dataset_id, apply_id)
 
+    @app.get("/api/subtask-review/{dataset_id}/episodes/{episode}")
+    def review_episode(dataset_id: str, episode: int):
+        return subtask_review.episode(dataset_id, episode)
+
+    @app.post("/api/subtask-review/{dataset_id}/episodes/{episode}")
+    def review_save(dataset_id: str, episode: int, body: DraftRequest):
+        return subtask_review.save(dataset_id, episode, body)
+
+    @app.post("/api/subtask-review/{dataset_id}/exports", status_code=202)
+    def review_export(
+        dataset_id: str, body: RevisionExportRequest, request: Request
+    ):
+        owned_job(dataset_id, request, action="导出")
+        job = runner.subtask_exports.enqueue_review(
+            dataset_id,
+            body,
+            principal=principal(request),
+        )
+        return {
+            k: job.get(k) for k in ("id", "state", "stage", "dataset_name", "error")
+        }
+
+    @app.get("/api/subtask-review/{dataset_id}/exports/{export_id}")
+    def review_export_status(dataset_id: str, export_id: str):
+        subtask_review.resolve(dataset_id)
+        job = ingest.store.get("job", export_id)
+        if job.get("source_kind") != "lerobot_subtask_revision" or job.get("source_job_id") != dataset_id:
+            raise DomainError("修订导出任务不存在", 404)
+        return {k: job.get(k) for k in ("id", "state", "stage", "dataset_name", "error")}
+
     @app.get("/api/annotations/options")
     def annotation_options():
         return annotations.options()
@@ -821,7 +973,8 @@ def create_app(settings, background=True):
         return rows
 
     @app.post("/api/annotations", status_code=202)
-    def annotation_start(body: AnnotationRequest):
+    def annotation_start(body: AnnotationRequest, request: Request):
+        owned_job(body.job_id, request, action="标注")
         return annotations.enqueue(
             body.job_id,
             note=body.note,
@@ -837,6 +990,7 @@ def create_app(settings, background=True):
             api_key=body.api_key,
             template_id=body.template_id,
             template_revision=body.template_revision,
+            principal=principal(request),
         )
 
     @app.get("/api/annotations/{aid}")
@@ -851,15 +1005,30 @@ def create_app(settings, background=True):
         )
 
     @app.post("/api/annotations/{aid}/cancel")
-    def annotation_cancel(aid: str):
+    def annotation_cancel(aid: str, request: Request):
+        require_owner(
+            ingest.store.get("annotation", aid),
+            principal(request),
+            action="取消",
+        )
         return annotations.cancel(aid)
 
     @app.post("/api/annotations/{aid}/resume")
-    def annotation_resume(aid: str, body: AnnotationResumeRequest | None = None):
+    def annotation_resume(
+        aid: str,
+        request: Request,
+        body: AnnotationResumeRequest | None = None,
+    ):
+        require_owner(
+            ingest.store.get("annotation", aid),
+            principal(request),
+            action="续跑",
+        )
         return annotations.resume(
             aid,
             base_url=body.base_url if body else None,
             api_key=body.api_key if body else None,
+            principal=principal(request),
         )
 
     @app.get("/api/annotations/{aid}/episodes")
@@ -923,8 +1092,21 @@ def create_app(settings, background=True):
         return runner.subtask_exports.preview(aid)
 
     @app.post("/api/annotations/{aid}/subtask-exports", status_code=202)
-    def subtask_export_start(aid: str, body: SubtaskExportRequest | None = None):
-        return runner.subtask_exports.enqueue(aid, body.name if body else None)
+    def subtask_export_start(
+        aid: str,
+        request: Request,
+        body: SubtaskExportRequest | None = None,
+    ):
+        require_owner(
+            ingest.store.get("annotation", aid),
+            principal(request),
+            action="导出",
+        )
+        return runner.subtask_exports.enqueue(
+            aid,
+            body.name if body else None,
+            principal=principal(request),
+        )
 
     @app.get("/api/checks/{cid}/logs/{name}")
     def check_logs(cid: str, name: str):
@@ -981,5 +1163,43 @@ def create_app(settings, background=True):
     def manifest(uid: str):
         row = ingest.store.get("upload", uid)
         return ingest.manifest(row)
+
+    def slim_upload_rows(records):
+        return [
+            {key: value for key, value in row.items() if key in COLLECTION_UPLOAD_FIELDS}
+            for row in upload_rows(records)
+        ]
+
+    lists = WorkbenchLists(
+        settings, ingest, runner, datasets, annotations, slim_upload_rows, job_response
+    )
+    app.state.lists = lists
+
+    @app.get("/api/listings/robots")
+    def list_robots():
+        return {"robot_types": lists.robots()}
+
+    @app.get("/api/listings/status")
+    def list_status(robot_type: str = Query(min_length=1, max_length=128)):
+        return lists.status(robot_type)
+
+    @app.get("/api/listings/deletion-preview")
+    def deletion_preview(kind: Literal["raw", "result"], id: str):
+        return lists.deletion_preview(kind, id)
+
+    @app.get("/api/listings/collection-detail")
+    def collection_detail(robot_type: str = Query(min_length=1, max_length=128), id: str = Query(min_length=1, max_length=128)):
+        return lists.collection_detail(robot_type, id)
+
+    @app.get("/api/listings/{resource}")
+    def list_page(
+        resource: str,
+        robot_type: str = Query(min_length=1, max_length=128),
+        offset: int = Query(default=0, ge=0),
+        limit: int = Query(default=50, ge=1, le=200),
+        q: str = Query(default="", max_length=2000),
+        kind: Literal["raw", "result"] | None = None,
+    ):
+        return lists.page(resource, robot_type, offset=offset, limit=limit, q=q, kind=kind)
 
     return app

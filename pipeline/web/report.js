@@ -92,6 +92,7 @@ let query = "";
 let pollTimer = null;
 let logText = "";
 let analyses = [];
+let authOptions = { user_login: false, login_nodes: [] };
 
 function badge(severity) {
   const cls = severity === "FAIL" ? "error" : severity === "WARN" ? "warn" : "";
@@ -121,7 +122,8 @@ function showLogin() {
   $("login-view").hidden = false;
   $("report-view").hidden = true;
   $("logout").hidden = true;
-  $("token")?.focus();
+  if (authOptions.user_login) $("login-password")?.focus();
+  else $("token")?.focus();
 }
 let trustedNetwork = null;
 async function resolveTrust() {
@@ -165,6 +167,33 @@ async function api(path, method = "GET", body) {
     );
   }
   return data;
+}
+
+async function configureLogin() {
+  try {
+    authOptions = await api("/api/auth-options");
+  } catch {
+    authOptions = { user_login: false, login_nodes: [] };
+  }
+  const userLogin = Boolean(authOptions.user_login);
+  $("h800-login-fields").hidden = !userLogin;
+  $("token-login-fields").hidden = userLogin;
+  for (const id of ("username login-password login-node").split(" ")) {
+    $(id).required = userLogin;
+  }
+  $("token").required = !userLogin;
+  const nodes = Array.isArray(authOptions.login_nodes)
+    ? authOptions.login_nodes
+    : [];
+  $("login-node-options").innerHTML = nodes
+    .map((node) => `<option value="${esc(node)}"></option>`)
+    .join("");
+  if (userLogin && !$("login-node").value) {
+    $("login-node").value = nodes[0] || "";
+  }
+  $("login-hint").textContent = userLogin
+    ? "使用 H800 Linux 账号登录。会话失效后请重新登录。"
+    : "报告页与工作台使用同一个服务访问密钥，通过 HttpOnly Cookie 鉴权。";
 }
 
 function parseJobId() {
@@ -308,7 +337,7 @@ function renderHero(report, gate) {
         : "存在必须处理的失败项";
   const desc =
     severity === "PASS"
-      ? "当前数据集通过了 BodyPipeline 固定的 11 项非运动学检查。报告不修改、不裁剪任何数据。"
+      ? "当前数据集通过了 imply 固定的 11 项非运动学检查。报告不修改、不裁剪任何数据。"
       : severity === "WARN"
         ? "数据已保留，仍可预览。建议按下方检查项逐条人工复查，确认是否影响训练语义。"
         : "数据已保留并标记为质检异常。请先定位失败项原因；Doctor 不会自动修复或删除数据。";
@@ -725,7 +754,7 @@ function renderReport(job, checks) {
     ${renderRaw(job, active)}
     <p class="report-footer-note">
       <strong>边界说明：</strong>Doctor 只生成质量报告，不执行关节/夹爪软限位门禁、URDF 运动学准入，也不会自动修复、裁剪或删除数据。
-      BodyPipeline 固定运行 11 项非运动学检查；报告中的明细消息保留 Doctor 原始英文，便于与上游工具对照排查。
+      imply 固定运行 11 项非运动学检查；报告中的明细消息保留 Doctor 原始英文，便于与上游工具对照排查。
       WARN / FAIL 的结果仍保留数据集，可继续预览和人工复查。
       <br />
       内容分析是独立的第三方检查，结论不参与任务状态；「不适用」表示该检查在当前机器人布局上没有定义（例如关节角录制没有末端位姿），
@@ -980,8 +1009,16 @@ $("login-form").onsubmit = async (event) => {
   event.preventDefault();
   $("login-error").textContent = "";
   try {
-    await api("/api/login", "POST", { token: $("token").value });
+    const body = authOptions.user_login
+      ? {
+          username: $("username").value.trim(),
+          password: $("login-password").value,
+          login_node: $("login-node").value.trim(),
+        }
+      : { token: $("token").value };
+    await api("/api/login", "POST", body);
     $("token").value = "";
+    $("login-password").value = "";
     await load();
   } catch (error) {
     $("login-error").textContent = error.message || String(error);
@@ -989,4 +1026,7 @@ $("login-form").onsubmit = async (event) => {
 };
 
 jobId = parseJobId();
-load();
+void (async () => {
+  await configureLogin();
+  await load();
+})();

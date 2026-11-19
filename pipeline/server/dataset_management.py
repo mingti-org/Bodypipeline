@@ -381,6 +381,8 @@ class DatasetManager:
                 "episode_count": row.get("episode_count") or row.get("source_count"),
                 "total_bytes": row.get("total_bytes"),
                 "target_format": row.get("target_format"),
+                "owner_user_id": row.get("owner_user_id"),
+                "submitted_as": row.get("submitted_as"),
                 "state": "DELETE_FAILED"
                 if "DELETE_FAILED" in states
                 else "DELETING"

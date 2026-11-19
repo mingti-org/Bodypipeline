@@ -98,8 +98,8 @@ PIPELINE_BRIDGE_TOKEN
 
 | 变量 | 要求 |
 | --- | --- |
-| `PIPELINE_TOKEN` | 至少 24 字符，用于 Server / Viewer 网页登录；Client 本地页面不要求网页密钥 |
-| `PIPELINE_DEVICE_TOKEN` | 至少 24 字符，与用户密钥不同，用于 Client 向 Server 上传 |
+| `PIPELINE_TOKEN` | 至少 24 字符，用于 Client / Server / Viewer 网页登录 |
+| `PIPELINE_DEVICE_TOKEN` | 至少 24 字符，与用户密钥不同，用于上传 |
 | `PIPELINE_BRIDGE_TOKEN` | 至少 24 字符，仅用于 Client ↔ Bridge |
 
 多设备 Server 使用 `devices` 注册表时，每台机器人应通过独立 `token_env` 注入密钥。不要把密钥写入 JSON、Git、脚本参数或前端 localStorage。
@@ -228,7 +228,7 @@ uv run --locked python scripts/demo.py
 | Server | `http://127.0.0.1:8081` |
 | Viewer | `http://127.0.0.1:8082/` |
 
-首次运行生成 `.runtime/local-credentials.json`，权限为 `0600`。使用 `PIPELINE_TOKEN` 登录 Server 与 Viewer；Client 页面直接使用可信设备内网，上传仍由 `PIPELINE_DEVICE_TOKEN` 授权。
+首次运行生成 `.runtime/local-credentials.json`，权限为 `0600`。使用 `PIPELINE_TOKEN` 登录 Client / Server 与 Viewer。
 
 基础演示使用 `processing_mode=demo`，不会生成真实 LeRobot 数据。安装工具链后可运行：
 
@@ -408,7 +408,7 @@ Chat Completions 兼容网关，此时服务会自动设置
 
 ```json
 {
-  "argus_base_url": "https://gateway.example.com/v1",
+  "argus_base_url": "https://aiproxy.mintibot.com:8888/v1",
   "argus_models": ["gpt-6.1-sol"]
 }
 ```
@@ -580,8 +580,8 @@ Server 内存中，任务结束、取消或 Server 重启后清除；不会写�
 验收命令（在生产机执行，`$AID` 为标注 id）：
 
 ```bash
-curl -s -b cookie.txt "http://127.0.0.1:8081/api/annotations/$AID/subtask-export-preview" | jq '.summary'
-curl -s -b cookie.txt -X POST "http://127.0.0.1:8081/api/annotations/$AID/subtask-exports" \
+curl -s -b cookie.txt "http://100.64.0.71:8081/api/annotations/$AID/subtask-export-preview" | jq '.summary'
+curl -s -b cookie.txt -X POST "http://100.64.0.71:8081/api/annotations/$AID/subtask-exports" \
   -H 'content-type: application/json' -d '{"name": null}' | jq '{id,dataset_name,state}'
 # 任务完成后
 letools validate "/path/to/example-subtasks" --deep
@@ -770,7 +770,7 @@ ssh -N -L 18082:127.0.0.1:8082 <server-host>
 | Server 质检 | `/api/jobs/{id}/checks`、`/api/checks/*` |
 | Server Viewer | `POST/DELETE /api/jobs/{id}/viewer`、`GET /api/viewer` |
 
-Server 与 Viewer 管理 API 使用 `PIPELINE_TOKEN` 登录后的 Cookie；Client 本地管理 API 不要求网页密钥；设备上传 API 使用独立设备密钥；Bridge API 使用 `PIPELINE_BRIDGE_TOKEN` 且只允许 loopback。
+所有管理 API 使用 `PIPELINE_TOKEN` 登录后的 Cookie；设备 API 使用独立设备密钥；Bridge API 使用 `PIPELINE_BRIDGE_TOKEN` 且只允许 loopback。
 
 ## 10. 备份、迁移与清理
 

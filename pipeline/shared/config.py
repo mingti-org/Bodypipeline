@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -119,6 +120,7 @@ class Settings:
     processing_mode: str = "real"
     auto_process: bool = False
     poll_seconds: float = 2.0
+    max_concurrent_jobs: int = 4
     cookie_secure: bool = False
     # Deployment setting: when the Server is only reachable on a trusted
     # network such as Tailscale, the browser login can be disabled entirely.
@@ -156,6 +158,7 @@ class Settings:
     argus_annotation_inspection: str = "auto"
     argus_annotation_field_dictionary: bool = False
     argus_annotation_note: str = ""
+    user_sessions: dict = field(default_factory=dict)
     slurm: dict = field(default_factory=dict)
     # Trusted deployment setting, not a user-supplied conversion option.
     conversion_image_storage: str = "materialized"
@@ -163,10 +166,13 @@ class Settings:
     devices: list[dict] = field(default_factory=list)
     accepted_capture_profile_hashes: list[str] = field(default_factory=list)
     replay: dict = field(default_factory=dict)
-    capture: dict = field(default_factory=dict)
-    background_transfer: dict = field(default_factory=dict)
 
     def __post_init__(self):
+        if (
+            type(self.max_concurrent_jobs) is not int
+            or not 1 <= self.max_concurrent_jobs <= 16
+        ):
+            raise ValueError("max_concurrent_jobs 必须是 1–16 之间的整数")
         from .delivery_config import validate_delivery_config
 
         validate_delivery_config(self)
@@ -186,6 +192,7 @@ class Settings:
         from .execution_budget import ExecutionBudget
 
         ExecutionBudget.resolve(self.slurm)
+        self._validate_user_sessions_configuration()
 
     @classmethod
     def load(cls, role: str, path: str | None = None):
@@ -220,11 +227,7 @@ class Settings:
             )
         if settings.token and settings.token == settings.device_token:
             raise ValueError("用户密钥与设备密钥必须不同")
-        if settings.mode not in {
-            "mock",
-            "ros2",
-            "external",
-        } or settings.processing_mode not in {
+        if settings.mode not in {"mock", "ros2"} or settings.processing_mode not in {
             "demo",
             "real",
         }:
@@ -245,6 +248,7 @@ class Settings:
         ):
             raise ValueError("argus_models 必须是模型标识符列表")
         settings.argus_prices = validate_argus_prices(settings.argus_prices)
+        settings._validate_user_sessions_configuration()
         if settings.argus_annotation_timeout < 60:
             raise ValueError("argus_annotation_timeout 不能小于 60 秒")
         if not 1 <= settings.argus_annotation_concurrency <= 64:
@@ -285,6 +289,73 @@ class Settings:
                 credentials.add(key)
         settings._validate_runtime_configuration()
         return settings
+
+    def _validate_user_sessions_configuration(self):
+        if not isinstance(self.user_sessions, dict):
+            raise ValueError("user_sessions 必须是对象")
+        if not self.user_sessions:
+            return
+        allowed = {
+            "enabled",
+            "login_nodes",
+            "control_dir",
+            "ssh_bin",
+            "sshpass_bin",
+            "connect_host",
+            "connect_hosts",
+            "port",
+            "session_ttl_seconds",
+            "connect_timeout_seconds",
+            "strict_host_key_checking",
+        }
+        unknown = set(self.user_sessions) - allowed
+        if unknown:
+            raise ValueError(
+                f"user_sessions 包含未知字段：{', '.join(sorted(unknown))}"
+            )
+        if not isinstance(self.user_sessions.get("enabled", False), bool):
+            raise ValueError("user_sessions.enabled 必须为布尔值")
+        nodes = self.user_sessions.get("login_nodes", ["H800-node11"])
+        if (
+            not isinstance(nodes, list)
+            or not 1 <= len(nodes) <= 20
+            or len(nodes) != len(set(nodes))
+            or any(
+                not isinstance(node, str)
+                or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9.-]{0,252}", node)
+                for node in nodes
+            )
+        ):
+            raise ValueError("user_sessions.login_nodes 必须是有效的唯一节点列表")
+        for key in ("control_dir", "ssh_bin", "sshpass_bin", "connect_host"):
+            if key in self.user_sessions and not isinstance(
+                self.user_sessions[key], str
+            ):
+                raise ValueError(f"user_sessions.{key} 必须是字符串")
+        connect_hosts = self.user_sessions.get("connect_hosts", {})
+        if not isinstance(connect_hosts, dict):
+            raise ValueError("user_sessions.connect_hosts 必须是对象")
+        for node, host in connect_hosts.items():
+            if node not in nodes:
+                raise ValueError("user_sessions.connect_hosts 包含未允许的登录节点")
+            if (
+                not isinstance(host, str)
+                or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9.-]{0,252}", host)
+            ):
+                raise ValueError("user_sessions.connect_hosts 主机地址无效")
+        for key, default, low, high in (
+            ("port", 22, 1, 65535),
+            ("session_ttl_seconds", 24 * 3600, 60, 7 * 24 * 3600),
+            ("connect_timeout_seconds", 20, 1, 120),
+        ):
+            value = self.user_sessions.get(key, default)
+            if type(value) is not int or not low <= value <= high:
+                raise ValueError(f"user_sessions.{key} 必须在 {low} 到 {high} 之间")
+        strict = self.user_sessions.get("strict_host_key_checking", "yes")
+        if strict not in {"yes", "accept-new", "no"}:
+            raise ValueError(
+                "user_sessions.strict_host_key_checking 必须为 yes、accept-new 或 no"
+            )
 
     def _validate_runtime_configuration(self):
         if not isinstance(self.profiles, dict):

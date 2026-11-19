@@ -36,7 +36,14 @@ html[data-theme="dark"] .primary { background: #3567d9; color: #fff; }
 html[data-theme="dark"] .primary:hover:not(:disabled) { background: #4279ee; }
 html[data-theme="dark"] :is(.import-capabilities, pre, th, .check-head, .analysis-runs, .analysis-na code) { background: var(--night-soft); border-color: var(--line); }
 html[data-theme="dark"] td { border-color: #233046; }
-html[data-theme="dark"] :is(.login-shell, .report-page) { background: #0b1019; }
+html[data-theme="dark"] .report-page { background: #0b1019; }
+html[data-theme="dark"] .login-shell { background: #0b1019 url('/assets/bodypipeline-login-bg.svg') center right / cover no-repeat; }
+html[data-theme="dark"] .login-shell::before { background: linear-gradient(90deg, #0b1019fa 0%, #0b1019e6 35%, #0b101980 63%, #0b101930 100%); }
+html[data-theme="dark"] .login-card h1 { color: #e3eaf4; }
+html[data-theme="dark"] .login-card input:not([type="hidden"]) { color: #f7f7f8; background: #111214; border-color: #3e4147; box-shadow: none; }
+html[data-theme="dark"] .login-card input::placeholder { color: #70747c; }
+html[data-theme="dark"] .login-node-option { color: #eceef2; background: #101113; border-color: #3e4147; box-shadow: none; }
+html[data-theme="dark"] .login-node-option:hover { border-color: #596170; background: #15171a; }
 html[data-theme="dark"] :is(.warning, .badge.warn, .sev-chip.warn) { background: #3a2c18; color: #f1c576; border-color: #68502b; }
 html[data-theme="dark"] :is(.danger, .badge.error, .sev-chip.fail, #notice.error) { background: #3a202b; color: #ffabb9; border-color: #703648; }
 html[data-theme="dark"] :is(.badge:not(.error):not(.warn):not(.busy), .sev-chip.pass) { background: #17362f; color: #82dabb; }
@@ -49,7 +56,7 @@ html[data-theme="dark"] .check-card.sev-fail { border-color: #703648; }
 html[data-theme="dark"] td .task-name { color: #9cbdff; }
 html[data-theme="dark"] :is(.progress, .sev-chip) { background: #233046; }
 html[data-theme="dark"] .sev-chip { color: #b0bfd2; }
-html[data-theme="dark"] .login-card { box-shadow: 0 24px 80px #0005; }
+html[data-theme="dark"] .login-card { background: transparent; border: 0; box-shadow: none; }
 /* Automatic annotation episode viewer */
 html[data-theme="dark"] .annotation-viewer { background: var(--night-surface); border-color: var(--line); }
 html[data-theme="dark"] .annotation-subtask { background: var(--night-surface); border-color: var(--line); }

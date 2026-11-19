@@ -3,7 +3,8 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width,initial-scale=1" />
-    <title>数据质检报告 · BodyPipeline</title>
+    <title>数据质检报告 · imply</title>
+    <link rel="icon" type="image/png" href="/assets/bodypipeline-icon.png" />
     <script src="/assets/theme.js"></script>
     <link rel="stylesheet" href="/assets/style.css" />
     <link rel="stylesheet" href="/assets/report.css" />
@@ -14,8 +15,8 @@
   <body class="report-page">
     <header class="topbar">
       <div class="topbar-left">
-        <a class="brand" href="/" aria-label="BodyPipeline 首页"
-          ><span class="brand-icon">B</span> BodyPipeline</a
+        <a class="brand" href="/" aria-label="imply 首页"
+          ><img class="brand-icon" src="/assets/bodypipeline-mark.png" alt="" /> imply</a
         >
         <span class="product-label">数据质检报告</span>
       </div>
@@ -29,16 +30,27 @@
     <main class="report-main">
       <section id="login-view" class="panel report-login" hidden>
         <h1>查看质检报告</h1>
-        <p class="muted small">报告页与工作台使用同一个服务访问密钥，通过 HttpOnly Cookie 鉴权。</p>
+        <p class="muted small" id="login-hint">报告页与工作台使用同一个登录会话，通过 HttpOnly Cookie 鉴权。</p>
         <form id="login-form">
-          <label for="token">服务访问密钥</label>
-          <input
-            id="token"
-            type="password"
-            required
-            autocomplete="off"
-            placeholder="输入管理员配置的访问密钥"
-          />
+          <div id="h800-login-fields" hidden>
+            <label for="username">H800 用户名</label>
+            <input id="username" type="text" autocomplete="username" autocapitalize="none" spellcheck="false" placeholder="例如 guoyunhan" />
+            <label for="login-password">H800 密码</label>
+            <input id="login-password" type="password" autocomplete="current-password" placeholder="密码只用于建立 SSH 会话" />
+            <label for="login-node">登录节点</label>
+            <input id="login-node" type="text" list="login-node-options" autocomplete="off" spellcheck="false" placeholder="H800-node11" />
+            <datalist id="login-node-options"></datalist>
+          </div>
+          <div id="token-login-fields">
+            <label for="token">服务访问密钥</label>
+            <input
+              id="token"
+              type="password"
+              required
+              autocomplete="off"
+              placeholder="输入管理员配置的访问密钥"
+            />
+          </div>
           <button class="primary" type="submit">登录并查看报告</button>
         </form>
         <p id="login-error" role="alert"></p>

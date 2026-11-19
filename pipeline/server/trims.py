@@ -24,6 +24,7 @@ from pathlib import Path
 
 from pipeline.shared.collections import dataset_name
 from pipeline.shared.core import DomainError, atomic_json, digest, executable_path, now
+from pipeline.shared.identity import Principal
 
 from . import static_intervals
 from .datasets import DATA_READY_STATES, TARGET_FORMATS, dataset_for_job
@@ -209,9 +210,12 @@ class TrimRunner:
         if row.get("entries"):
             raise DomainError("来源存在回收站 Episode，请先还原或永久清理再裁剪")
 
-    def _describe(self, job) -> dict:
-        source = dataset_for_job(self.settings, job)
-        info = _read_json(source / "meta/info.json")
+    def _describe(self, job, metadata=None) -> dict:
+        if metadata is None:
+            source = dataset_for_job(self.settings, job)
+            info = _read_json(source / "meta/info.json")
+        else:
+            source, info = metadata(job)
         version = info.get("codebase_version")
         if version not in TARGET_FORMATS:
             raise ValueError("仅支持 LeRobot v2.1 / v3.0")
@@ -236,14 +240,14 @@ class TrimRunner:
         }
 
     # ------------------------------------------------------------- candidates
-    def candidates(self) -> list[dict]:
+    def candidates(self, jobs=None, metadata=None) -> list[dict]:
         rows = []
         try:
             self._tool()
             available_reason = ""
         except DomainError as exc:
             available_reason = exc.message
-        for job in self.store.all("job"):
+        for job in self.store.all("job") if jobs is None else jobs:
             if job["state"] not in DATA_READY_STATES and not job.get("dataset_ready"):
                 continue
             # An in-place trim shares the source path and is tracked on the
@@ -263,7 +267,7 @@ class TrimRunner:
                 "created_at": job.get("created_at"),
             }
             try:
-                described = self._describe(job)
+                described = self._describe(job, metadata=metadata)
                 if available_reason:
                     raise DomainError(available_reason, 503)
                 row.update(
@@ -325,7 +329,13 @@ class TrimRunner:
             "limit": limit,
         }
 
-    def enqueue_preview(self, job_id: str, overrides: dict | None = None) -> dict:
+    def enqueue_preview(
+        self,
+        job_id: str,
+        overrides: dict | None = None,
+        *,
+        principal: Principal | None = None,
+    ) -> dict:
         _, python = self._tool()
         overrides = {key: value for key, value in (overrides or {}).items() if value is not None}
         with self.lock:
@@ -343,6 +353,11 @@ class TrimRunner:
                     "source_snapshot": snapshot,
                     "policy": policy,
                     "algorithm": ALGORITHM,
+                    "submitted_by": (
+                        "service-account"
+                        if principal is None or principal.is_admin
+                        else principal.username
+                    ),
                 }
             )
             for row in self.store.all("trim_preview"):
@@ -369,6 +384,7 @@ class TrimRunner:
                 "source_snapshot": snapshot,
                 "policy": policy,
                 "python": python,
+                **self.runner.submission_metadata(principal),
             }
             self.store.put("trim_preview", row["id"], row)
             return row
@@ -403,12 +419,13 @@ class TrimRunner:
             if source_snapshot(source) != row["source_snapshot"]:
                 raise DomainError("来源数据集在提交后发生变化，请重新提交预览")
             source_job = self.store.get("job", row["job_id"])
-            work = (
-                storage_path(self.settings, source_job, "work", source_job["id"])
-                / "trim-previews"
-                / row["id"]
+            work = data_directory(
+                self.settings,
+                source_job,
+                "work",
+                f"{source_job['id']}/trim-previews/{row['id']}",
+                exist_ok=False,
             )
-            work.mkdir(parents=True, exist_ok=False)
             self._save_preview(row, work_path=str(work))
             spec_path = work / "trim-detect-spec.json"
             atomic_json(
@@ -419,6 +436,7 @@ class TrimRunner:
                     "policy": row["policy"],
                 },
             )
+            share_data_tree(work)
             code, output, err = self.runner.command(
                 [row["python"], str(Path(__file__).with_name("trim_worker.py")), str(spec_path)],
                 work,
@@ -514,6 +532,7 @@ class TrimRunner:
             detect_spec,
             {"mode": "detect", "source": str(dataset), "policy": policy},
         )
+        share_data_tree(preview_dir)
         self.runner.save(job, stage="检测首尾静止帧")
         code, output, err = self._detect_command(
             job,
@@ -600,6 +619,7 @@ class TrimRunner:
                 "episodes": plan["episodes"],
             },
         )
+        share_data_path(trim_spec)
         self.runner.save(job, stage="裁剪首尾静止帧与全部相机视频")
         code, report, err = self.runner.command(
             [python, str(Path(__file__).with_name("trim_worker.py")), str(trim_spec)],
@@ -675,6 +695,7 @@ class TrimRunner:
             detect_spec,
             {"mode": "detect-static", "source": str(dataset), "policy": policy},
         )
+        share_data_tree(preview_dir)
         self.runner.save(job, stage="检测静止帧")
         code, output, err = self._detect_command(
             job,
@@ -761,6 +782,7 @@ class TrimRunner:
                 "episodes": plan["episodes"],
             },
         )
+        share_data_path(trim_spec)
         self.runner.save(job, stage="删除静止帧与全部相机视频")
         code, report, err = self.runner.command(
             [python, str(Path(__file__).with_name("trim_worker.py")), str(trim_spec)],
@@ -947,6 +969,8 @@ class TrimRunner:
         preview_id: str,
         name: str | None = None,
         run_doctor: bool = True,
+        *,
+        principal: Principal | None = None,
     ) -> dict:
         if type(run_doctor) is not bool:
             raise DomainError("run_doctor 必须为布尔值", 400)
@@ -985,6 +1009,11 @@ class TrimRunner:
                     "name": output_name,
                     "run_doctor": run_doctor,
                     "letools": self.settings.letools_bin,
+                    "submitted_by": (
+                        "service-account"
+                        if principal is None or principal.is_admin
+                        else principal.username
+                    ),
                 }
             )
             for row in self.store.all("job"):
@@ -1021,6 +1050,7 @@ class TrimRunner:
                 "source_count": described["episode_count"],
                 "episode_count": kept,
                 "frame_count": int(summary["frames_kept"]),
+                **self.runner.submission_metadata(principal),
             }
             for field in ("runtime_id", "provider", "profile", "profile_hash"):
                 if source_job.get(field) is not None:
@@ -1211,6 +1241,12 @@ class TrimRunner:
         row["episode_count"] = info.get("total_episodes", row.get("episode_count"))
         row["dataset_ready"] = True
         row["dataset_path"] = str(dataset)
+        # A later queued trim may start after this dataset has been replaced.
+        # Record the exact published revision so it can safely rebase without
+        # accepting changes made outside BodyPipeline.
+        published_snapshot = source_snapshot(dataset)
+        row["published_dataset_snapshot"] = published_snapshot
+        job["published_dataset_snapshot"] = published_snapshot
         row["updated_at"] = now()
         history = row.get("manual_trim_history")
         if not isinstance(history, list):
@@ -1230,6 +1266,37 @@ class TrimRunner:
         row.pop("quality_gate", None)
         self.store.put("job", source_job_id, row)
 
+    @staticmethod
+    def _snapshot_matches(left: dict, right: dict) -> bool:
+        return (
+            left.get("signature") == right.get("signature")
+            and left.get("bytes") == right.get("bytes")
+        )
+
+    def _manual_start_snapshot(self, job, snapshot: dict) -> dict:
+        """Validate a queued trim against the latest trusted dataset revision."""
+
+        stored = job.get("source_snapshot") or {}
+        if self._snapshot_matches(snapshot, stored):
+            return snapshot
+        if job.get("in_place"):
+            try:
+                source_job = self.store.get("job", job["source_job_id"])
+            except DomainError as exc:
+                if exc.code != 404:
+                    raise
+                source_job = {}
+            published = source_job.get("published_dataset_snapshot") or {}
+            if published and self._snapshot_matches(snapshot, published):
+                self.runner.save(
+                    job,
+                    source_snapshot=snapshot,
+                    source_snapshot_rebased=True,
+                    source_snapshot_rebased_at=now(),
+                )
+                return snapshot
+        raise DomainError("来源数据集在提交后发生变化，请重新提交裁剪", 409)
+
     def _run_manual(self, job) -> None:
         """Remove user-selected frame ranges and join the rest in place."""
 
@@ -1242,15 +1309,9 @@ class TrimRunner:
 
                 require_mutable_dataset(self.settings, source, store=self.store)
             with dataset_lock(self.store, self._key(source)):
-                snapshot = source_snapshot(source)
-                stored = job.get("source_snapshot") or {}
-                if (
-                    snapshot["signature"] != stored.get("signature")
-                    or snapshot["bytes"] != stored.get("bytes")
-                ):
-                    raise DomainError(
-                        "来源数据集在提交后发生变化，请重新提交裁剪", 409
-                    )
+                snapshot = self._manual_start_snapshot(
+                    job, source_snapshot(source)
+                )
                 info = _read_json(source / "meta/info.json")
                 frames_before = info.get("total_frames")
                 if (
@@ -1258,6 +1319,16 @@ class TrimRunner:
                     or not isinstance(frames_before, int)
                 ):
                     raise DomainError("来源数据集格式或帧数已变化，请重新提交裁剪", 409)
+                removed = sum(
+                    stop - start for start, stop in job["manual_removed_ranges"]
+                )
+                save(
+                    job,
+                    source_snapshot=snapshot,
+                    source_count=info.get("total_episodes"),
+                    episode_count=info.get("total_episodes"),
+                    frame_count=max(0, frames_before - removed),
+                )
                 work = data_directory(
                     self.settings, job, "work", job["id"], exist_ok=False
                 )
@@ -1311,9 +1382,6 @@ class TrimRunner:
                         "手动裁剪失败：" + err.read_text(errors="replace")[-2000:]
                     )
                 result = json.loads(report.read_text())
-                removed = sum(
-                    stop - start for start, stop in job["manual_removed_ranges"]
-                )
                 if (
                     result.get("validated") is not True
                     or result.get("version") != job["source_format"]

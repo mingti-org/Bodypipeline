@@ -21,29 +21,6 @@ DATASET_READ_LOCK_TIMEOUT_SECONDS = 1.0
 DATASET_LOCK_RETRY_SECONDS = 0.01
 
 
-def record_cleanup(row):
-    """Journal completed renumberings once, including pre-journal deployments."""
-    op = row.get("operation") or {}
-    if op.get("state") != "completed" or "mapping" not in op:
-        return False
-    history = row.setdefault("cleanup_history", [])
-    if any(item["id"] == op["id"] for item in history):
-        return False
-    generation = row.get("cleanup_generation", 0)
-    history.append(
-        {
-            "id": op["id"],
-            "from": generation,
-            "to": generation + 1,
-            "mapping": op["mapping"],
-        }
-    )
-    row["cleanup_generation"] = generation + 1
-    # Maps can be large. Older browsers outside this window must recheck flags.
-    row["cleanup_history"] = history[-32:]
-    return True
-
-
 @contextlib.contextmanager
 def _dataset_file_lock(
     store: Store,
@@ -70,7 +47,6 @@ def _dataset_file_lock(
             yield
         finally:
             fcntl.flock(lock, fcntl.LOCK_UN)
-
 
 @contextlib.contextmanager
 def dataset_read_lock(store: Store, key: str):
@@ -141,17 +117,7 @@ class RecycleBin:
 
     def _recover(self, row):
         op = row.get("operation") or {}
-        # An older failed/pending operation may have replaced the last completed
-        # operation before history existed. Do not call that dataset generation 0.
-        if "cleanup_generation" not in row and self._info(
-            Path(row["dataset_path"])
-        ).get("bodypipeline_revision"):
-            row["cleanup_generation"] = 1
-            row["cleanup_history"] = []
-            self.store.put("recycle", row["id"], row)
         if op.get("state") not in {"running", "pending"}:
-            if record_cleanup(row):
-                self.store.put("recycle", row["id"], row)
             return row
         pid = op.get("pid")
         if pid:
@@ -186,8 +152,6 @@ class RecycleBin:
             "entries": sorted(row["entries"].values(), key=lambda e: e["episode"]),
             "revision": row["revision"],
             "operation": operation,
-            "cleanup_generation": row.get("cleanup_generation", 0),
-            "cleanup_history": row.get("cleanup_history", []),
             "total_episodes": int(info["total_episodes"]),
             "total_frames": int(info["total_frames"]),
             "dataset_name": path.name,
@@ -224,16 +188,6 @@ class RecycleBin:
             ):
                 raise DomainError("只能操作已在回收站中的 Episode", 409)
             if action == "purge":
-                from .datasets import require_mutable_dataset
-
-                job_id = repo.removeprefix("bp/")
-                try:
-                    job = self.store.get("job", job_id) if repo.startswith("bp/") else None
-                except DomainError as exc:
-                    if exc.code != 404:
-                        raise
-                    job = None
-                require_mutable_dataset(self.settings, path, job, store=self.store)
                 tool = executable_path(self.settings.letools_bin)
                 if not tool:
                     raise DomainError("未安装数据清理所需的 letools 运行环境", 503)

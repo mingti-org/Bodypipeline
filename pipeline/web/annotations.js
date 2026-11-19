@@ -53,9 +53,10 @@
   let viewerToken = 0;
   let visible = false;
   let bound = false;
-  let timer = null;
   let initializing = null;
   let loading = false;
+  let optionsAt = 0;
+  let lastRevision = null;
   let detailLoading = false;
   let submitting = false;
   let capTouched = false;
@@ -117,10 +118,6 @@
     const scope = $("server-robot-type")?.value || "";
     return scope ? candidates.filter((item) => item.robot_type === scope) : [];
   }
-  function activeCount() {
-    return rows.filter((row) => ACTIVE.has(row.state)).length;
-  }
-
   function modelInputs() {
     return {
       baseUrl: $("annotation-base-url").value.trim(),
@@ -269,13 +266,14 @@
     }, 400);
   }
 
-  function configure({ api, notice, esc: escFn, bytes }) {
-    ui = { api, notice, esc: escFn, bytes };
+  function configure({ api, notice, esc: escFn, bytes, refresh: refreshLists }) {
+    ui = { api, notice, esc: escFn, bytes, refresh: refreshLists };
+    options = null;
+    optionsAt = 0;
     if (!bound) {
       bind();
       bound = true;
     }
-    void init();
   }
 
   function bind() {
@@ -417,7 +415,11 @@
     if (initializing) return initializing;
     initializing = (async () => {
       try {
-        options = await ui.api("/api/annotations/options");
+        const session = ui;
+        const fresh = await session.api("/api/annotations/options");
+        if (ui !== session) return;
+        options = fresh;
+        optionsAt = Date.now();
         applyOptions();
       } catch (error) {
         showUnavailable(error.message);
@@ -612,41 +614,55 @@
   }
 
   async function refresh() {
-    if (!ui || loading) return;
+    if (visible) await ui?.refresh();
+  }
+
+  function acceptList(key, data) {
+    if (key === "annotationCandidates") {
+      candidates = data.items;
+      renderDatasetOptions();
+      updateSubmit();
+    } else {
+      rows = data.items;
+      renderList();
+    }
+  }
+
+  function resetScope() {
+    candidates = [];
+    rows = [];
+    selectedId = null;
+    detailRow = null;
+    lastRevision = null;
+    closeViewer();
+    $("annotation-detail-panel").hidden = true;
+    renderDatasetOptions();
+    renderList();
+    updateSubmit();
+  }
+
+  async function update(status, force = false) {
+    if (!ui || !visible || loading) return;
+    const session = ui, scope = $("server-robot-type").value;
     if (!options) await init();
     if (!options) return;
     loading = true;
     try {
-      const [candidateResult, list, freshOptions] = await Promise.all([
-        ui.api("/api/annotations/candidates"),
-        ui.api("/api/annotations"),
-        ui.api("/api/annotations/options"),
-      ]);
-      const wasAvailable = Boolean(options?.available);
-      options = freshOptions || options;
-      renderTemplates();
-      candidates = candidateResult.datasets || [];
-      rows = list || [];
-      if (options && !options.available) {
-        showUnavailable(options.reason || "服务器未找到可用的 Argus");
-      } else if (!wasAvailable && options?.available) {
-        applyOptions();
+      const revision = status.revisions.annotation;
+      if (force || revision !== lastRevision || Date.now() - optionsAt >= 30000) {
+        const fresh = await session.api("/api/annotations/options");
+        if (ui !== session || $("server-robot-type").value !== scope) return;
+        const wasAvailable = Boolean(options?.available);
+        options = fresh || options;
+        optionsAt = Date.now();
+        renderTemplates();
+        if (!options.available) showUnavailable(options.reason || "服务器未找到可用的 Argus");
+        else if (!wasAvailable) applyOptions();
+        renderBudget();
       }
-      renderDatasetOptions();
-      renderList();
-      $("nav-annotation-count").textContent = String(activeCount());
-      if (selectedId) {
-        const row = rows.find((item) => item.id === selectedId);
-        if (row) {
-          detailRow = row;
-          renderDetail();
-          await loadDetail(false);
-        } else {
-          selectedId = null;
-          detailRow = null;
-          $("annotation-detail-panel").hidden = true;
-        }
-      }
+      if (ui !== session || $("server-robot-type").value !== scope) return;
+      if (selectedId && (force || lastRevision !== revision || ACTIVE.has(detailRow?.state))) await loadDetail(false);
+      lastRevision = revision;
     } catch (error) {
       if (visible) ui.notice(error.message, true);
     } finally {
@@ -1421,21 +1437,13 @@
 
   function show() {
     visible = true;
-    void init();
-    void refresh();
-    if (!timer) {
-      timer = setInterval(() => {
-        if (visible && !document.hidden) void refresh();
-      }, 5000);
-    }
+    if (!options) void init();
   }
 
   function hide() {
     visible = false;
-    clearInterval(timer);
-    timer = null;
     $("annotation-viewer-video")?.pause();
   }
 
-  window.AnnotationUI = { configure, show, hide };
+  window.AnnotationUI = { configure, show, hide, acceptList, resetScope, update };
 })();

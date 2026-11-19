@@ -3,15 +3,14 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width,initial-scale=1" />
-    <title>BodyPipeline · 具身数据工作台</title>
+    <title>imply · 具身数据工作台</title>
+    <link rel="icon" type="image/png" href="/assets/bodypipeline-icon.png" />
     <script src="/assets/theme.js"></script>
     <link rel="stylesheet" href="/assets/style.css" />
     <script src="/assets/clipboard.js" defer></script>
     <link rel="stylesheet" href="/assets/theme.css" />
     <script src="/assets/client-replay.js" defer></script>
-    <script src="/assets/capture-service.js" defer></script>
-    <script src="/assets/capture-telemetry.js" defer></script>
-    <script src="/assets/preview-stream.js" defer></script>
+    <script src="/assets/dataset-label.js" defer></script>
     <script src="/assets/app.js" defer></script>
     <script src="/assets/annotations.js" defer></script>
   </head>
@@ -19,23 +18,49 @@
     <div id="login-view" class="login-shell">
       <section class="login-card">
         <div class="brand">
-          <span class="brand-icon">B</span> BodyPipeline
+          <img class="brand-icon" src="/assets/bodypipeline-mark.png" alt="" /> imply
           <span class="muted">/ DATA WORKSPACE</span>
         </div>
         <p class="eyebrow">LOCAL FIRST · ROBOT READY</p>
         <h1>从一次示教，<br />到可追溯的数据。</h1>
-        <p class="muted">
-          连接采集工作台或中心数据服务。默认不启动任何机器人设备。
-        </p>
         <form id="login-form">
-          <label for="token">服务访问密钥</label
-          ><input
+          <div id="h800-login-fields" hidden>
+            <label for="username">H800 用户名</label>
+            <input
+              id="username"
+              type="text"
+              autocomplete="username"
+              autocapitalize="none"
+              spellcheck="false"
+              placeholder="例如 guoyunhan"
+            />
+            <label for="login-password">H800 密码</label>
+            <input
+              id="login-password"
+              type="password"
+              autocomplete="current-password"
+              placeholder="密码只用于建立 SSH 会话"
+            />
+            <p class="login-node-label" id="login-node-label">登录节点</p>
+            <input id="login-node" type="hidden" />
+            <div
+              id="login-node-grid"
+              class="login-node-grid"
+              role="radiogroup"
+              aria-labelledby="login-node-label"
+            ></div>
+          </div>
+          <div id="token-login-fields">
+            <label for="token">服务访问密钥</label>
+            <input
             id="token"
             type="password"
             required
             autocomplete="off"
             placeholder="输入管理员配置的访问密钥"
-          /><button class="primary" type="submit">
+          />
+          </div>
+          <button class="primary" type="submit">
             进入工作台 <span>→</span>
           </button>
         </form>
@@ -46,14 +71,14 @@
       <header class="topbar">
         <div class="topbar-left">
           <button id="menu-toggle" class="icon-button mobile-only" type="button" aria-label="打开导航" aria-controls="sidebar" aria-expanded="false"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 6h16M4 12h16M4 18h16"/></svg></button>
-          <a class="brand" href="/" aria-label="BodyPipeline 首页"><span class="brand-icon">B</span> BodyPipeline</a>
+          <a class="brand" href="/" aria-label="imply 首页"><img class="brand-icon" src="/assets/bodypipeline-mark.png" alt="" /> imply</a>
           <span class="product-label">具身数据工作台</span>
         </div>
-        <div class="header-right"><button type="button" class="theme-toggle" data-theme-toggle aria-label="切换深夜与浅色模式"><span class="theme-label-light">浅色模式</span><span class="theme-label-dark">深夜模式</span></button><span id="mode-badge" class="badge"></span><button id="logout" class="text-button">退出登录</button></div>
+        <div class="header-right"><button type="button" class="theme-toggle" data-theme-toggle aria-label="切换深夜与浅色模式"><span class="theme-label-light">浅色模式</span><span class="theme-label-dark">深夜模式</span></button><span id="account-badge" class="badge" hidden></span><span id="mode-badge" class="badge"></span><button id="logout" class="text-button">退出登录</button></div>
       </header>
       <button id="sidebar-overlay" class="sidebar-overlay" type="button" aria-label="关闭导航" tabindex="-1" hidden></button>
       <aside class="sidebar" id="sidebar" aria-label="工作台导航">
-        <div class="sidebar-heading"><span class="workspace-mark"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m12 3 9 5-9 5-9-5 9-5ZM3 12l9 5 9-5M3 16l9 5 9-5"/></svg></span><div><strong>数据工作区</strong><span>BodyPipeline</span></div><button id="menu-close" class="icon-button mobile-only" type="button" aria-label="关闭导航">×</button></div>
+        <div class="sidebar-heading"><span class="workspace-mark"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m12 3 9 5-9 5-9-5 9-5ZM3 12l9 5 9-5M3 16l9 5 9-5"/></svg></span><div><strong>数据工作区</strong><span>imply</span></div><button id="menu-close" class="icon-button mobile-only" type="button" aria-label="关闭导航">×</button></div>
         <p class="nav-section-label">工作台</p>
         <nav aria-label="采集导航" id="client-nav">
           <button class="nav-item active" id="nav-main" data-client-tab="capture" type="button" aria-pressed="true"><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="5" width="13" height="14" rx="2"/><path d="m16 10 5-3v10l-5-3"/></svg><span id="nav-label">采集工作台</span></button>
@@ -66,7 +91,7 @@
           <button class="nav-item" type="button" data-server-tab="merge" aria-pressed="false"><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M3 9h18M8 13h8M8 16h5"/></svg><span>数据集管理</span><span class="nav-count" id="nav-merge-count">0</span></button>
           <button class="nav-item" type="button" data-server-tab="annotations" aria-pressed="false"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 5h16M4 12h10M4 19h7"/><path d="m15 16 2 2 4-4"/></svg><span>自动标注</span><span class="nav-count" id="nav-annotation-count">0</span></button>
         </nav>
-        <div class="sidebar-bottom"><strong><span class="dot"></span> 文件目录存储</strong><p>原始数据保留<br />转换与质检记录可追溯</p><span class="version">BodyPipeline / 0.1</span></div>
+        <div class="sidebar-bottom"><strong><span class="dot"></span> 文件目录存储</strong><p>原始数据保留<br />转换与质检记录可追溯</p><span class="version">imply / 0.1</span></div>
       </aside>
       <div class="workspace" id="workspace">
         <div class="breadcrumb"><span id="workspace-label">机器人采集</span><span aria-hidden="true">/</span><strong id="current-page">采集工作台</strong></div>
@@ -82,7 +107,7 @@
             <div class="online" id="health-label">检查服务状态…</div>
           </div>
           <div id="notice" role="status" hidden></div>
-          <section id="client-view" class="sonic-workbench" hidden>
+          <section id="client-view" hidden>
             <div class="warning" id="mock-warning">
               模拟模式：相机与关节数据由程序生成，不连接真实机器人。
             </div>
@@ -95,7 +120,6 @@
                   <div class="preview-controls"><label for="preview-quality" class="sr-only">预览画质</label><select id="preview-quality"><option value="low">省流预览 · 320px</option><option value="full">清晰预览 · 640px</option></select><button id="preview-toggle" class="secondary" type="button">暂停预览</button></div>
                 </div>
                 <p id="preview-note" class="panel-note small muted">预览独立于原始录制；弱网时可暂停</p>
-                <div id="sonic-sources" class="sonic-source-grid" aria-label="数据源状态"></div>
                 <div id="camera-grid" class="camera-grid"></div>
                 <div class="telemetry">
                   <div>
@@ -121,18 +145,6 @@
                   <input id="dataset-name" list="dataset-names" required maxlength="2000" autocomplete="off" placeholder="选择已有数据集，或输入新任务名称" />
                   <datalist id="dataset-names"></datalist>
                   <p id="capture-dataset-summary" class="small muted">同名任务的采集会持续加入同一数据集；训练 instruction 在 Server 转换时填写。</p>
-                  <div id="managed-capture-fields" hidden>
-                    <label for="capture-instruction">任务描述</label>
-                    <textarea id="capture-instruction" rows="3" autocomplete="off"></textarea>
-                    <div id="managed-capture-options" class="capture-options"></div>
-                    <div class="action-row">
-                      <button id="prepare-capture-service" class="secondary" type="button">启动基础服务</button>
-                      <button id="apply-capture-options" class="secondary" type="button">应用采集配置</button>
-                    </div>
-                    <p id="managed-service-status" class="small" role="status"></p>
-                    <div id="managed-source-status" class="action-row" aria-label="数据源状态"></div>
-                    <div id="managed-episode-actions" class="action-row"></div>
-                  </div>
                   <label for="local-root">本地存储 · 机器人文件系统</label
                   ><select id="local-root"></select>
                   <div class="path-hint" id="local-path"></div>
@@ -152,37 +164,12 @@
                   <button class="primary" id="start-button" type="submit">
                     ● 采集下一个 episode
                   </button>
-                  <p class="small muted" id="capture-safety-note">
+                  <p class="small muted">
                     采集服务不会启动机械臂。停止录制 ≠ 机器人急停。
                   </p>
                 </form>
                 <div id="session-actions"></div>
-                <div id="external-batch-actions" hidden></div>
-                <p id="background-transfer-status" class="small muted"></p>
               </section>
-            <section id="sonic-signal-panel" class="panel sonic-signal-panel" hidden>
-              <div class="panel-heading">
-                <div>
-                  <h2>实时曲线</h2>
-                  <p id="capture-telemetry-summary" class="panel-note small muted">
-                    正在读取机器人数值信号…
-                  </p>
-                </div>
-                <span class="step">LIVE TELEMETRY</span>
-              </div>
-              <div class="sonic-signal-toolbar">
-                <label for="sonic-signal-search" class="sr-only">搜索遥测信号</label>
-                <input id="sonic-signal-search" placeholder="搜索 body_q、action、smpl、planner…" autocomplete="off" />
-                <button id="sonic-signal-clear" class="secondary" type="button">清空选择</button>
-              </div>
-              <div id="sonic-signal-list" class="sonic-signal-list" aria-label="遥测信号">
-                <span class="muted">等待数值信号…</span>
-              </div>
-              <div class="sonic-chart-wrap">
-                <canvas id="sonic-signal-chart" aria-label="机器人实时信号曲线"></canvas>
-              </div>
-              <p class="small muted">最多 16 条曲线；横轴为配置的历史窗口，纵轴自动缩放。曲线区域只读。</p>
-            </section>
             </div>
             <section class="panel">
               <div class="panel-heading"><h2>我的数据集</h2><span class="muted small">同一任务持续追加 episodes</span></div>
@@ -353,8 +340,8 @@
                   <div class="conversion-submit"><button id="conversion-submit" class="primary" type="submit" disabled>提交批量转换</button><span id="conversion-help" class="small muted">请选择数据集并填写 instruction。</span></div>
                 </form>
               </section>
-              <section class="panel">
-                <div class="panel-heading"><h2>已有 LeRobot 版本转换</h2><span class="step">VERSION ROUND-TRIP</span></div>
+              <details class="panel" id="version-conversion-section">
+                <summary class="panel-heading"><h2>已有 LeRobot 版本转换</h2><span class="step">VERSION ROUND-TRIP</span></summary>
                 <form id="version-conversion-form" class="conversion-form">
                   <div class="conversion-grid">
                     <div>
@@ -376,9 +363,9 @@
                   <div id="version-conversion-warning" class="warning" hidden></div>
                   <div class="conversion-submit"><button id="version-conversion-submit" class="primary" type="submit" disabled>创建版本转换任务</button><span id="version-conversion-help" class="small muted">请选择一个可用的 LeRobot 数据集。</span></div>
                 </form>
-              </section>
-              <section class="panel">
-                <div class="panel-heading"><h2>删除首尾静止帧（所有机器人通用）</h2><span class="step">TRIM IDLE BOUNDARIES · ALL ROBOTS</span></div>
+              </details>
+              <details class="panel" id="trim-section">
+                <summary class="panel-heading"><h2>删除首尾静止帧（所有机器人通用）</h2><span class="step">TRIM IDLE BOUNDARIES · ALL ROBOTS</span></summary>
                 <p class="panel-note small muted">所有机器人通用的转换后处理选项：检测每个 Episode 起点与终点的静止画面，只删除首尾空闲帧并保留中间的停顿。来源数据集保持不变，输出是新的独立 LeRobot 数据集。运动阈值由机器人 Profile 提供，页面不按型号分支。</p>
                 <form id="trim-form" class="conversion-form">
                   <div class="conversion-grid">
@@ -433,7 +420,7 @@
                     <tbody id="trim-preview-episodes"></tbody>
                   </table></div>
                 </div>
-              </section>
+              </details>
               <section class="panel">
                 <div class="panel-heading"><h2>转换任务与进度</h2><span class="step">PROCESSING QUEUE</span></div>
                 <div class="table-scroll"><table>
@@ -464,14 +451,14 @@
                   <label>数据类型<select id="dataset-kind"><option value="">全部数据</option><option value="raw">原始数据</option><option value="result">LeRobot 数据集</option></select></label>
                   <label>搜索数据集<input id="dataset-search" type="search" placeholder="输入名称或 ID" /></label>
                 </div>
-                <div class="table-scroll"><table><thead><tr><th>数据集 / 类型</th><th>数据规模</th><th>实际删除范围</th><th>状态</th><th>操作</th></tr></thead><tbody id="dataset-list"></tbody></table></div>
+                <div class="table-scroll"><table><thead><tr><th>数据集 / 类型</th><th>数据规模</th><th>存储位置</th><th>状态</th><th>操作</th></tr></thead><tbody id="dataset-list"></tbody></table></div>
               </section>
               <section class="panel" id="dataset-deletion-panel" hidden>
                 <div class="panel-heading"><h2>删除记录</h2><span class="step">DELETION HISTORY</span></div>
                 <div class="table-scroll"><table><thead><tr><th>数据集</th><th>类型</th><th>状态</th><th>结果 / 操作</th></tr></thead><tbody id="dataset-deletion-list"></tbody></table></div>
               </section>
-              <section class="panel">
-                <div class="panel-heading"><h2>合并为新数据集</h2><span class="step">MERGE DATASETS</span></div>
+              <details class="panel" id="merge-section">
+                <summary class="panel-heading"><h2>合并为新数据集</h2><span class="step">MERGE DATASETS</span></summary>
                 <p class="panel-note small muted">选择至少两个已转换或已导入的 LeRobot 数据集。按勾选顺序拼接 Episodes，保留各自的 instruction，生成独立的新数据集；相同片段不会自动去重。</p>
                 <form id="merge-form" class="conversion-form">
                   <label for="merge-name">新数据集名称 <span class="required">*</span></label>
@@ -486,7 +473,7 @@
                   <div id="merge-warning" class="warning" hidden></div>
                   <div class="conversion-submit"><button id="merge-submit" class="primary" type="submit" disabled>创建合并任务</button><span class="small muted" id="merge-help">请选择至少两个兼容的数据集并填写名称。</span></div>
                 </form>
-              </section>
+              </details>
               <section class="panel">
                 <div class="panel-heading"><h2>合并任务与结果</h2><span class="step">MERGE QUEUE</span></div>
                 <div class="table-scroll"><table><thead><tr><th>新数据集 / 任务</th><th>来源 / 数据规模</th><th>进度</th><th>状态</th><th>操作</th></tr></thead><tbody id="merge-job-list"></tbody></table></div>
@@ -622,11 +609,20 @@
             </div>
             <section class="panel" id="job-detail-panel" hidden>
               <div class="panel-heading"><h2 id="job-detail-title">任务详情</h2><button class="text-button" id="close-detail">关闭</button></div>
+              <form id="dataset-description-form" class="dataset-description-form" hidden>
+                <label for="dataset-description">数据集介绍</label>
+                <textarea id="dataset-description" rows="5" maxlength="10000" placeholder="填写采集场景、任务内容、数据特点或使用备注" aria-describedby="dataset-description-status"></textarea>
+                <div class="action-row">
+                  <button class="primary" id="dataset-description-save" type="submit" disabled>保存介绍</button>
+                  <button class="secondary" id="dataset-description-cancel" type="button" disabled>取消编辑</button>
+                  <span id="dataset-description-status" class="small muted" role="status" aria-live="polite"></span>
+                </div>
+              </form>
               <div id="job-detail"></div>
             </section>
           </section>
           <footer>
-            BodyPipeline
+            imply
             <span>原始数据 · 转换 · 质检 · 预览</span>
           </footer>
         </main>

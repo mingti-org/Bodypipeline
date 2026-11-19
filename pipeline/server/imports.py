@@ -223,6 +223,8 @@ class ImportService:
                     delivery_manifest_sha256=delivery["manifest_sha256"],
                     stage="外部 LeRobot v3 交付已校验登记（只读）",
                 )
+                if delivery.get("batch_name"):
+                    row["batch_name"] = delivery["batch_name"]
             self.store.put("job", key, row)
             return self._lerobot_response(row)
 
@@ -237,6 +239,11 @@ class ImportService:
             "target_format": row["target_format"],
             "episode_count": row["episode_count"],
             "dataset_path": row["dataset_path"],
+            **(
+                {"batch_name": row["batch_name"]}
+                if row.get("batch_name")
+                else {}
+            ),
         }
 
     def _import_hdf5_episodes(self, path: Path, override: str | None, runtime=None):

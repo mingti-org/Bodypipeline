@@ -118,6 +118,7 @@ class Store:
     def __init__(self, path: Path, *, legacy_name: str | None = None):
         self.path = path.absolute()
         self.lock = threading.RLock()
+        self._change_listeners = []
         if self.path.resolve() != self.path:
             raise DomainError("状态目录不得含符号链接", 500)
         # Never start an empty recorder history over existing, unmigrated state.
@@ -171,6 +172,15 @@ class Store:
         # process-wide lock. A stalled shared filesystem must not block reads of
         # unrelated state records.
         atomic_json(path, value)
+        self._changed(kind, key)
+
+    def subscribe(self, listener):
+        """Subscribe to successful local writes for display-cache invalidation."""
+        self._change_listeners.append(listener)
+
+    def _changed(self, kind, key):
+        for listener in self._change_listeners:
+            listener(kind, key)
 
     def get(self, kind: str, key: str) -> dict:
         with self.lock:
@@ -179,7 +189,7 @@ class Store:
                 raise DomainError("记录不存在", 404)
             return self._read(path)
 
-    def all(self, kind: str) -> list[dict]:
+    def all(self, kind: str, *, with_ids: bool = False) -> list[dict]:
         with self.lock:
             directory = confined(self.path, self._component(kind))
             try:
@@ -195,6 +205,8 @@ class Store:
                 if path.suffix != ".json":
                     continue
                 value = self._read(self._file(kind, path.stem))
+                if with_ids and "id" not in value:
+                    value = {**value, "id": path.stem}
                 created = value.get("created_at", 0)
                 if type(created) not in (int, float):
                     raise DomainError(f"状态文件 created_at 无效：{path}", 500)
@@ -208,6 +220,7 @@ class Store:
             if path.exists():
                 path.unlink()
                 fsync_dir(path.parent)
+        self._changed(kind, key)
 
 
 class ProcessLock:

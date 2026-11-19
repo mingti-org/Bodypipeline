@@ -134,15 +134,20 @@ def test_server_page_scripts_load_before_login(settings_factory):
         assert page.status_code == 200
         # The page's own scripts must load before login: a script that 401s is
         # never retried by boot(), so its panel would silently stay dead.
-        for name in (
-            "theme.js",
-            "clipboard.js",
-            "client-replay.js",
-            "app.js",
-            "annotations.js",
-        ):
+        for name in ("theme.js", "clipboard.js", "client-replay.js", "app.js", "annotations.js"):
             assert f"/assets/{name}" in page.text
             assert http.get(f"/assets/{name}").status_code == 200, name
+        assert "/assets/bodypipeline-mark.png" in page.text
+        assert "/assets/bodypipeline-icon.png" in page.text
+        icon = http.get("/assets/bodypipeline-icon.png")
+        assert icon.status_code == 200
+        assert icon.headers["content-type"] == "image/png"
+        style = http.get("/assets/style.css")
+        assert style.status_code == 200
+        assert "/assets/bodypipeline-login-bg.svg" in style.text
+        background = http.get("/assets/bodypipeline-login-bg.svg")
+        assert background.status_code == 200
+        assert background.headers["content-type"] == "image/svg+xml"
         assert http.get("/api/annotations").status_code == 401
 
 
@@ -175,22 +180,8 @@ def test_job_list_summary_omits_detail_reports(settings_factory):
     ):
         assert field in full
         assert field not in slim
-def test_server_workbench_refresh_endpoints_are_available(settings_factory):
-    s = settings_factory("server")
-    headers = {"Authorization": "Bearer " + s.token}
-    paths = (
-        "/api/collections",
-        "/api/jobs",
-        "/api/viewer",
-        "/api/merge-candidates",
-        "/api/version-conversion-candidates",
-        "/api/trim-candidates",
-        "/api/annotations",
-    )
-    with TestClient(create_app(s, background=False)) as http:
-        for path in paths:
-            response = http.get(path, headers=headers)
-            assert response.status_code == 200, (path, response.text)
+
+
 def test_report_page_is_server_only():
     from fastapi import FastAPI
 

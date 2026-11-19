@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from pipeline.server.storage import share_data_path
 from pipeline.shared.core import atomic_json
 
 
@@ -83,4 +84,5 @@ def write_hdf5_preset(
     }
     path = source.parent / "letools-hdf5-preset.json"
     atomic_json(path, preset)
+    share_data_path(path)
     return path

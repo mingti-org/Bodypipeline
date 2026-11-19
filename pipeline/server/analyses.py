@@ -28,6 +28,7 @@ import uuid
 from pathlib import Path
 
 from pipeline.shared.core import DomainError, executable_path, now
+from pipeline.shared.identity import Principal
 
 from .datasets import dataset_for_job
 from .storage import storage_path
@@ -197,7 +198,14 @@ class AnalysisRunner:
         }
 
     # ------------------------------------------------------------------ enqueue
-    def enqueue(self, jid: str, mode: str = "local", episodes: list[int] | None = None):
+    def enqueue(
+        self,
+        jid: str,
+        mode: str = "local",
+        episodes: list[int] | None = None,
+        *,
+        principal: Principal | None = None,
+    ):
         if mode not in MODES:
             raise DomainError("分析模式必须为 local 或 full", 400)
         with self.lock:
@@ -230,6 +238,18 @@ class AnalysisRunner:
                 "error": None,
                 "dataset_path": str(data),
                 "robot_type": job.get("robot_type"),
+                **(
+                    principal.job_metadata()
+                    if principal is not None
+                    else {
+                        "owner_user_id": job.get("owner_user_id"),
+                        "owner_uid": job.get("owner_uid"),
+                        "submitted_as": job.get("submitted_as"),
+                        "slurm_user": job.get("slurm_user"),
+                        "slurm_execution_id": job.get("slurm_execution_id"),
+                        "submission_auth": job.get("submission_auth"),
+                    }
+                ),
             }
             return self.save(row)
 

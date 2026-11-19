@@ -221,7 +221,9 @@ class DeliveryScanner:
                 self.datasets.check_import(str(batch / "lerobot"))
                 path = self.imports.resolve(str(batch / "lerobot"))
                 registered = self.imports._import_lerobot(
-                    path, data["robot_type"], delivery=data
+                    path,
+                    data["robot_type"],
+                    delivery={**data, "batch_name": batch.name},
                 )
             row.update(
                 state="REGISTERED",

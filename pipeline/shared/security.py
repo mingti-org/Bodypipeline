@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import hmac
 import os
@@ -9,12 +10,14 @@ from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 
 from .core import DomainError
+from .identity import Principal
 from .web import themed_html
 
 VIEWER_LOGIN_PAGE = """<!doctype html>
 <html lang="zh-CN"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>登录数据预览 · BodyPipeline</title>
+<title>登录数据预览 · imply</title>
+<link rel="icon" type="image/png" href="/bodypipeline-icon.png">
 <style>
 :root { font-family: Inter, -apple-system, BlinkMacSystemFont, "Segoe UI",
   "PingFang SC", "Microsoft YaHei", sans-serif; color: #292e36; }
@@ -25,8 +28,7 @@ main { width: min(420px, 100%); background: #fff; border: 1px solid #e0e3e8;
   border-radius: 8px; padding: 30px 30px 26px; }
 .brand { display: flex; align-items: center; gap: 10px; margin-bottom: 22px;
   font-size: 19px; font-weight: 700; letter-spacing: -.4px; }
-.mark { display: grid; place-items: center; width: 28px; height: 30px;
-  border-radius: 6px; background: #2455eb; color: #fff; font-size: 19px; }
+.mark { display: block; width: 112px; height: 30px; object-fit: contain; }
 h1 { font-size: 20px; margin: 0 0 8px; letter-spacing: -.3px; }
 p.hint { margin: 0 0 20px; font-size: 12.5px; line-height: 1.75; color: #6b7280; }
 label { display: block; font-size: 12px; font-weight: 550; color: #47505f;
@@ -42,7 +44,7 @@ button:disabled { opacity: .55; cursor: not-allowed; }
 #error { min-height: 18px; margin: 12px 0 0; font-size: 12px; color: #b4404c; }
 </style></head>
 <body><main class="viewer-login-card">
-<div class="brand"><span class="mark">B</span> BodyPipeline</div>
+<div class="brand"><img class="mark" src="/bodypipeline-mark.png" alt=""> imply</div>
 <h1>登录数据预览</h1>
 <p class="hint">预览服务与 Server 工作台使用同一个访问密钥（<code>PIPELINE_TOKEN</code>）。</p>
 <form id="login-form">
@@ -100,9 +102,19 @@ def trusted_network_enabled(settings) -> bool:
     )
 
 
-def install_security(app: FastAPI, settings, device_prefix: str | None = None):
+def install_security(
+    app: FastAPI,
+    settings,
+    device_prefix: str | None = None,
+    user_sessions=None,
+):
     cookie_name = f"pipeline_{settings.role}"
     login_password = settings.login_password or settings.token
+    identity_mode = bool(
+        settings.role == "server"
+        and user_sessions is not None
+        and getattr(user_sessions, "enabled", False)
+    )
     cookie_key = (
         hmac.new(
             settings.token.encode(),
@@ -146,9 +158,34 @@ def install_security(app: FastAPI, settings, device_prefix: str | None = None):
             for device_key, identity in settings.device_registry():
                 if device_key and bearer and hmac.compare_digest(bearer, device_key):
                     request.state.device = identity
+                    request.state.principal = Principal(
+                        username=f"device:{identity['robot_id']}",
+                        auth_method="device-token",
+                        is_admin=False,
+                    )
                     token_ok = True
                     break
-        cookie_ok = not is_device and valid_cookie(request.cookies.get(cookie_name))
+        elif token_ok:
+            request.state.principal = Principal(
+                username="service-account",
+                auth_method="service-token",
+                is_admin=True,
+            )
+        cookie_ok = False
+        if not is_device and not token_ok:
+            cookie = request.cookies.get(cookie_name)
+            if identity_mode:
+                principal = user_sessions.principal(cookie)
+                if principal is not None:
+                    request.state.principal = principal
+                    cookie_ok = True
+            elif valid_cookie(cookie):
+                request.state.principal = Principal(
+                    username="service-account",
+                    auth_method="browser-token",
+                    is_admin=True,
+                )
+                cookie_ok = True
         return token_ok or cookie_ok, cookie_ok and not token_ok
 
     @app.middleware("http")
@@ -162,7 +199,14 @@ def install_security(app: FastAPI, settings, device_prefix: str | None = None):
             # The Visualizer gateway has no per-dataset authorisation of its own,
             # so it shares the Server's admin token. Browsers get a login form;
             # everything else (video ranges, Doctor JSON, data bridge) gets 401.
-            if trusted or p in ("/api/login", "/api/logout", "/healthz"):
+            if trusted or p in (
+                "/api/login",
+                "/api/logout",
+                "/api/auth-options",
+                "/healthz",
+                "/bodypipeline-icon.png",
+                "/bodypipeline-mark.png",
+            ):
                 response = await call_next(request)
             else:
                 authorised, cookie_only = credentials(request)
@@ -206,17 +250,15 @@ def install_security(app: FastAPI, settings, device_prefix: str | None = None):
                 "/",
                 "/healthz",
                 "/api/login",
+                "/api/auth-options",
                 "/assets/app.js",
                 "/assets/annotations.js",
+                "/assets/bodypipeline-icon.png",
+                "/assets/bodypipeline-login-bg.svg",
+                "/assets/bodypipeline-mark.png",
                 "/assets/client-replay.js",
-                "/assets/capture-service.js",
-                "/assets/capture-telemetry.js",
-                "/assets/preview-stream.js",
-                "/assets/sonic-client.css",
-                "/assets/sonic-client.js",
-                "/assets/g1-onboard_collection.css",
-                "/assets/g1-onboard_collection.js",
                 "/assets/clipboard.js",
+                "/assets/dataset-label.js",
                 "/assets/theme.js",
                 "/assets/theme.css",
                 "/assets/style.css",
@@ -230,14 +272,7 @@ def install_security(app: FastAPI, settings, device_prefix: str | None = None):
             or (settings.role == "client" and p == "/replay")
         )
         device_path = bool(device_prefix and p.startswith(device_prefix))
-        if settings.role == "client":
-            # Client is intentionally open on its trusted robot network. The
-            # device token is still required separately when this Client calls
-            # the Server upload API.
-            response = await call_next(request)
-        elif (trusted and not device_path) or (
-            public and settings.role != "viewer"
-        ):
+        if (trusted and not device_path) or (public and settings.role != "viewer"):
             response = await call_next(request)
         else:
             authorised, cookie_only = credentials(request)
@@ -245,7 +280,11 @@ def install_security(app: FastAPI, settings, device_prefix: str | None = None):
                 return JSONResponse(
                     {"detail": "请先登录或提供有效凭据"}, status_code=401
                 )
-            if cookie_only and request.method not in ("GET", "HEAD", "OPTIONS"):
+            if (
+                cookie_only
+                and request.method not in ("GET", "HEAD", "OPTIONS")
+                and request.url.path != "/api/logout"
+            ):
                 origin = request.headers.get("origin")
                 expected = f"{request.url.scheme}://{request.url.netloc}"
                 if origin != expected:
@@ -255,31 +294,27 @@ def install_security(app: FastAPI, settings, device_prefix: str | None = None):
         response.headers["Referrer-Policy"] = "no-referrer"
         response.headers["Cache-Control"] = "no-store"
         if settings.role != "viewer":
-            if p == "/capture-visualizer/" or (
-                p == "/" and getattr(app.state, "native_client_page", False)
-            ):
-                # The trusted upstream visualizer keeps its original inline
-                # bootstrap and styles. In native-client mode it is the document
-                # itself, with Client APIs still protected by this middleware.
-                response.headers["Content-Security-Policy"] = (
-                    "default-src 'self'; img-src 'self' blob: data:; "
-                    "script-src 'self' 'unsafe-inline'; "
-                    "style-src 'self' 'unsafe-inline'; frame-ancestors 'none'"
-                )
-            else:
-                response.headers["Content-Security-Policy"] = (
-                    "default-src 'self'; img-src 'self' blob: data:; "
-                    "script-src 'self'; style-src 'self'; "
-                    "frame-ancestors 'none'"
-                )
+            response.headers["Content-Security-Policy"] = (
+                "default-src 'self'; img-src 'self' blob: data:; script-src 'self'; style-src 'self'; frame-ancestors 'none'"
+            )
         return response
 
     attempts = {}
 
+    @app.get("/api/auth-options")
+    def auth_options():
+        return {
+            "user_login": identity_mode,
+            "login_nodes": list(getattr(user_sessions, "login_nodes", ()))
+            if identity_mode
+            else [],
+            "session_ttl_seconds": int(getattr(user_sessions, "ttl", 0))
+            if identity_mode
+            else 0,
+        }
+
     @app.post("/api/login")
     async def login(request: Request):
-        if settings.role == "client":
-            raise DomainError("Client 未启用密钥登录", 404)
         # Do not expose credentials in URLs, logs, localStorage, or HTML.
         from json import JSONDecodeError, loads
 
@@ -302,6 +337,35 @@ def install_security(app: FastAPI, settings, device_prefix: str | None = None):
         if len(attempts) > 10000:
             attempts.clear()
         attempts[address] = recent + [time.time()]
+        if identity_mode:
+            if (
+                not isinstance(body, dict)
+                or not isinstance(body.get("username"), str)
+                or not isinstance(body.get("password"), str)
+                or not isinstance(body.get("login_node"), str)
+            ):
+                raise DomainError("请输入 H800 用户名、密码和登录节点", 400)
+            session = await asyncio.to_thread(
+                user_sessions.login,
+                body["username"],
+                body["password"],
+                body["login_node"],
+            )
+            attempts.pop(address, None)
+            principal = session.principal()
+            response = JSONResponse(
+                {"ok": True, "user": principal.public()}
+            )
+            response.set_cookie(
+                cookie_name,
+                session.session_id,
+                httponly=True,
+                secure=settings.cookie_secure,
+                samesite="strict",
+                max_age=user_sessions.ttl,
+                path="/",
+            )
+            return response
         if (
             not isinstance(body, dict)
             or not isinstance(body.get("token"), str)
@@ -323,13 +387,14 @@ def install_security(app: FastAPI, settings, device_prefix: str | None = None):
             secure=settings.cookie_secure,
             samesite="strict",
             max_age=8 * 3600,
+            path="/",
         )
         return response
 
     @app.post("/api/logout")
-    def logout():
-        if settings.role == "client":
-            raise DomainError("Client 未启用密钥登录", 404)
+    def logout(request: Request):
+        if identity_mode:
+            user_sessions.logout(request.cookies.get(cookie_name))
         response = JSONResponse({"ok": True})
-        response.delete_cookie(cookie_name)
+        response.delete_cookie(cookie_name, path="/")
         return response

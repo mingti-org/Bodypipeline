@@ -57,7 +57,7 @@ def recover_operation(store, row):
         row["entries"] = entries
         op.update(
             state="completed",
-            progress="清理完成，服务器中所选片段已删除",
+            progress="清理完成，H800 中所选片段已删除",
             finished_at=time.time(),
             remaining_episodes=marker["total_episodes"],
             deleted_frames=marker["deleted_frames"],

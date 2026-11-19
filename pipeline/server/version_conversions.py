@@ -10,6 +10,7 @@ from pathlib import Path
 
 from pipeline.shared.collections import dataset_name
 from pipeline.shared.core import DomainError, atomic_json, digest, executable_path, now
+from pipeline.shared.identity import Principal
 
 from .datasets import DATA_READY_STATES, TARGET_FORMATS, dataset_for_job
 from .merges import source_snapshot
@@ -48,10 +49,13 @@ class VersionConversionRunner:
         if row.get("entries"):
             raise DomainError("来源存在回收站 Episode，请先还原或永久清理再转换版本")
 
-    def _describe(self, job):
-        path = dataset_for_job(self.settings, job)
+    def _describe(self, job, metadata=None):
+        path = dataset_for_job(self.settings, job) if metadata is None else None
         try:
-            info = json.loads((path / "meta/info.json").read_text(encoding="utf-8"))
+            if metadata is None:
+                info = json.loads((path / "meta/info.json").read_text(encoding="utf-8"))
+            else:
+                path, info = metadata(job)
             if not isinstance(info, dict):
                 raise ValueError("meta/info.json 必须是 JSON 对象")
             version = info.get("codebase_version")
@@ -92,9 +96,9 @@ class VersionConversionRunner:
         except (OSError, ValueError, KeyError, TypeError, AttributeError) as exc:
             raise DomainError(f"来源数据集无法进行版本转换：{exc}", 409) from exc
 
-    def candidates(self):
+    def candidates(self, jobs=None, metadata=None):
         rows = []
-        for job in self.store.all("job"):
+        for job in self.store.all("job") if jobs is None else jobs:
             if job["state"] not in DATA_READY_STATES and not job.get("dataset_ready"):
                 continue
             # An in-place trim shares the source path and is tracked on the
@@ -114,7 +118,7 @@ class VersionConversionRunner:
                 "created_at": job.get("created_at"),
             }
             try:
-                row.update(self._describe(job), selectable=True)
+                row.update(self._describe(job, metadata=metadata), selectable=True)
             except (DomainError, OSError) as exc:
                 row.update(selectable=False, reason=str(exc))
             rows.append(row)
@@ -126,6 +130,8 @@ class VersionConversionRunner:
         target_format,
         name=None,
         run_doctor=True,
+        *,
+        principal: Principal | None = None,
     ):
         if target_format not in TARGET_FORMATS:
             raise DomainError("目标格式必须为 v3.0 / v2.1", 400)
@@ -171,6 +177,11 @@ class VersionConversionRunner:
                     "name": output_name,
                     "run_doctor": run_doctor,
                     "letools": LETOOLS_COMMIT,
+                    "submitted_by": (
+                        "service-account"
+                        if principal is None or principal.is_admin
+                        else principal.username
+                    ),
                 }
             )
             for row in self.store.all("job"):
@@ -216,6 +227,7 @@ class VersionConversionRunner:
                 "source_count": source["episode_count"],
                 "episode_count": source["episode_count"],
                 "frame_count": source["frame_count"],
+                **self.runner.submission_metadata(principal),
             }
             for field in ("runtime_id", "provider", "profile", "profile_hash"):
                 if source_job.get(field) is not None:

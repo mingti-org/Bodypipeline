@@ -21,6 +21,7 @@ import uuid
 from pathlib import Path
 
 from pipeline.shared.core import DomainError, atomic_json, digest, now
+from pipeline.shared.identity import Principal
 
 from . import argus_annotation
 from .datasets import dataset_for_job
@@ -53,8 +54,9 @@ class BudgetExceeded(DomainError):
 
 
 class AnnotationRunner:
-    def __init__(self, settings, store, catalog=None):
+    def __init__(self, settings, store, catalog=None, *, runner=None):
         self.settings, self.store, self.catalog = settings, store, catalog
+        self.runner = runner
         self.lock = threading.RLock()
         self.shutdown_requested = threading.Event()
         self.cancel_events: dict[str, threading.Event] = {}
@@ -213,18 +215,21 @@ class AnnotationRunner:
         }
 
     # --------------------------------------------------------------- candidates
-    def candidates(self) -> list[dict]:
-        annotations = self.store.all("annotation")
+    def candidates(self, jobs=None, annotations=None, metadata=None) -> list[dict]:
+        annotations = self.store.all("annotation") if annotations is None else annotations
         by_job: dict[str, list[dict]] = {}
         for row in annotations:
             by_job.setdefault(row.get("job_id"), []).append(row)
         rows = []
-        for job in self.store.all("job"):
+        for job in self.store.all("job") if jobs is None else jobs:
             if job.get("state") in {"DELETING", "DELETE_FAILED", "DELETED"}:
                 continue
             try:
-                data = dataset_for_job(self.settings, job)
-                info = json.loads((data / "meta/info.json").read_text())
+                if metadata is None:
+                    data = dataset_for_job(self.settings, job)
+                    info = json.loads((data / "meta/info.json").read_text())
+                else:
+                    data, info = metadata(job)
             except (DomainError, OSError, ValueError, KeyError):
                 continue
             if info.get("codebase_version") not in {"v2.1", "v3.0"}:
@@ -281,6 +286,7 @@ class AnnotationRunner:
         api_key: str | None = None,
         template_id: str | None = None,
         template_revision: int | None = None,
+        principal: Principal | None = None,
     ):
         with self.lock:
             job = self.store.get("job", job_id)
@@ -443,6 +449,18 @@ class AnnotationRunner:
                 "error": None,
                 "cancel_requested": False,
                 "finished_at": None,
+                **(
+                    principal.job_metadata()
+                    if principal is not None
+                    else {
+                        "owner_user_id": None,
+                        "owner_uid": None,
+                        "submitted_as": "service-account",
+                        "slurm_user": None,
+                        "slurm_execution_id": None,
+                        "submission_auth": "internal",
+                    }
+                ),
             }
             row["work_path"] = str(
                 storage_path(self.settings, row, "annotations", row["id"])
@@ -521,7 +539,12 @@ class AnnotationRunner:
             return self.save(row, stage="正在取消", cancel_requested=True)
 
     def resume(
-        self, aid: str, *, base_url: str | None = None, api_key: str | None = None
+        self,
+        aid: str,
+        *,
+        base_url: str | None = None,
+        api_key: str | None = None,
+        principal: Principal | None = None,
     ):
         with self.lock:
             row = self.store.get("annotation", aid)
@@ -587,6 +610,8 @@ class AnnotationRunner:
                     4,
                 )
             )
+            if principal is not None:
+                fields.update(principal.job_metadata())
             if self._preparation_refused(row.get("error") or ""):
                 fields["fresh_start"] = True
             elif not row.get("episodes_done") and not float(row.get("cost_usd") or 0):

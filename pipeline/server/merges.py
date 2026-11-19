@@ -15,6 +15,7 @@ from pathlib import Path
 
 from pipeline.shared.collections import dataset_name
 from pipeline.shared.core import DomainError, atomic_json, digest, executable_path, now
+from pipeline.shared.identity import Principal
 
 from .datasets import DATA_READY_STATES, TARGET_FORMATS, dataset_for_job
 from .recycle import dataset_lock
@@ -81,10 +82,13 @@ class MergeRunner:
         if row.get("entries"):
             raise DomainError("来源存在回收站 Episode，请先还原或永久清理再合并")
 
-    def _describe(self, job):
-        path = dataset_for_job(self.settings, job)
+    def _describe(self, job, metadata=None):
+        path = dataset_for_job(self.settings, job) if metadata is None else None
         try:
-            info = json.loads((path / "meta/info.json").read_text())
+            if metadata is None:
+                info = json.loads((path / "meta/info.json").read_text())
+            else:
+                path, info = metadata(job)
             version, fps = info["codebase_version"], info["fps"]
             episodes, frames = info["total_episodes"], info["total_frames"]
             kind = robot_type(info["robot_type"])
@@ -133,9 +137,9 @@ class MergeRunner:
         except (OSError, ValueError, KeyError, TypeError) as exc:
             raise DomainError(f"来源元数据无法合并：{exc}", 409) from exc
 
-    def candidates(self):
+    def candidates(self, jobs=None, metadata=None):
         rows = []
-        for job in self.store.all("job"):
+        for job in self.store.all("job") if jobs is None else jobs:
             if job["state"] not in DATA_READY_STATES and not job.get("dataset_ready"):
                 continue
             # An in-place trim shares the source path and is tracked on the
@@ -154,7 +158,7 @@ class MergeRunner:
                 "created_at": job.get("created_at"),
             }
             try:
-                row.update(self._describe(job), selectable=True)
+                row.update(self._describe(job, metadata=metadata), selectable=True)
             except (DomainError, OSError) as exc:
                 row.update(selectable=False, reason=str(exc))
             rows.append(row)
@@ -189,7 +193,13 @@ class MergeRunner:
                 )
         return sources
 
-    def enqueue(self, source_job_ids, name):
+    def enqueue(
+        self,
+        source_job_ids,
+        name,
+        *,
+        principal: Principal | None = None,
+    ):
         name = dataset_name(name)
         if not 2 <= len(source_job_ids) <= 100 or len(set(source_job_ids)) != len(
             source_job_ids
@@ -207,7 +217,15 @@ class MergeRunner:
             for source in sources:
                 source.update(source_snapshot(Path(source["dataset_path"])))
             key = "merge:" + digest(
-                [name, [(s["job_id"], s["signature"]) for s in sources]]
+                [
+                    name,
+                    [(s["job_id"], s["signature"]) for s in sources],
+                    (
+                        "service-account"
+                        if principal is None or principal.is_admin
+                        else principal.username
+                    ),
+                ]
             )
             for row in self.store.all("job"):
                 if row.get("key") == key and row["state"] in {"QUEUED", "RUNNING"}:
@@ -233,6 +251,7 @@ class MergeRunner:
                 "run_doctor": False,
                 "source_count": sum(s["episode_count"] for s in sources),
                 "frame_count": sum(s["frame_count"] for s in sources),
+                **self.runner.submission_metadata(principal),
             }
             records = [self.store.get("job", jid) for jid in source_job_ids]
             # Preserve common, server-owned analysis context when every source

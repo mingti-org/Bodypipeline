@@ -1,9 +1,20 @@
 "use client";
 
 import Link from "next/link";
-import React, { useEffect, useMemo, useState } from "react";
+import React, {
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 import { useFlaggedEpisodes } from "@/context/flagged-episodes-context";
 import { EpisodeScoreBadge, EpisodeScorePanel, useEpisodeScores } from "@/components/episode-scores";
+import {
+  readEpisodeScroll,
+  writeEpisodePage,
+  writeEpisodeScroll,
+} from "@/utils/episode-navigation-state";
 
 import type { DatasetDisplayInfo } from "@/app/[org]/[dataset]/[episode]/fetch-data";
 
@@ -37,7 +48,7 @@ const Sidebar: React.FC<SidebarProps> = ({
   onEpisodeSelect,
 }) => {
   const [mobileVisible, setMobileVisible] = useState(false);
-  const { flagged, count, toggle, remap, canReload, storageError } = useFlaggedEpisodes();
+  const { flagged, count, toggle } = useFlaggedEpisodes();
   const { result: scores, retry: retryScores } = useEpisodeScores(datasetInfo.repoId);
   const scoreByEpisode = useMemo(() => new Map(scores.report?.episodes.map(row => [row.episode_index, row]) || []), [scores.report]);
   const [recycle, setRecycle] = useState<{entries: {episode: number}[]; revision: number; total_episodes: number; operation?: {id: string; state: string; mapping?: Record<string, number>}} | null>(null);
@@ -47,27 +58,18 @@ const Sidebar: React.FC<SidebarProps> = ({
   const api = `/api/recycle/${encodeURIComponent(datasetInfo.repoId.split("/")[1])}`;
   useEffect(() => {
     let active = true;
-    let request = 0;
     const load = async () => {
-      const current = ++request;
       try {
         const response = await fetch(api, {cache: "no-store"});
         const result = await response.json();
         if (!response.ok) throw new Error(result.detail || "无法读取回收站");
-        if (active && current === request) {
-          if (!remap(result)) {
-            setNotice("待检查版本已更新，请重试");
-            return;
-          }
+        if (active) {
           const operation = result.operation;
           if (operation?.state === "completed") {
             const key = `recycle-generation:${datasetInfo.repoId}`;
             if (sessionStorage.getItem(key) !== operation.id) {
-              if (!canReload()) {
-                setRecycle(result);
-                setNotice("编号已更新；本页待检查记录尚未保存，暂停自动刷新，请核对浏览器存储");
-                return;
-              }
+              const previous: number[] = JSON.parse(sessionStorage.getItem("flagged-episodes") || "[]");
+              sessionStorage.setItem("flagged-episodes", JSON.stringify(previous.filter(i => operation.mapping?.[i] !== undefined).map(i => operation.mapping[i])));
               sessionStorage.setItem(key, operation.id);
               window.location.reload();
               return;
@@ -75,13 +77,13 @@ const Sidebar: React.FC<SidebarProps> = ({
           }
           setRecycle(result);
         }
-      } catch (error) { if (active && current === request) setNotice(String(error instanceof Error ? error.message : error)); }
+      } catch (error) { if (active) setNotice(String(error instanceof Error ? error.message : error)); }
     };
     void load();
     const timer = setInterval(load, 5000);
     window.addEventListener("focus", load);
     return () => { active = false; clearInterval(timer); window.removeEventListener("focus", load); };
-  }, [api, datasetInfo.repoId, remap, canReload]);
+  }, [api, datasetInfo.repoId]);
   const trashed = useMemo(() => new Set(recycle?.entries.map(e => e.episode) || []), [recycle]);
   const cleaning = ["pending", "running"].includes(recycle?.operation?.state || "");
   async function changeEpisode(episode: number, action: "trash" | "restore") {
@@ -107,10 +109,85 @@ const Sidebar: React.FC<SidebarProps> = ({
     const episodes = !showFlaggedOnly || count === 0 ? paginatedEpisodes : [...flagged].sort((a, b) => a - b);
     return episodes.filter(episode => !trashed.has(episode));
   }, [paginatedEpisodes, showFlaggedOnly, flagged, count, trashed]);
+  const navRef = useRef<HTMLElement | null>(null);
+
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    writeEpisodePage(
+      sessionStorage,
+      datasetInfo.repoId,
+      currentPage,
+      episodeId,
+    );
+  }, [currentPage, datasetInfo.repoId, episodeId]);
+
+  useLayoutEffect(() => {
+    const nav = navRef.current;
+    if (!nav || typeof window === "undefined") return;
+
+    let frame: number | null = null;
+    const saveScroll = () => {
+      if (frame !== null) cancelAnimationFrame(frame);
+      frame = requestAnimationFrame(() => {
+        frame = null;
+        writeEpisodeScroll(
+          sessionStorage,
+          datasetInfo.repoId,
+          showFlaggedOnly,
+          nav.scrollTop,
+          episodeId,
+        );
+      });
+    };
+    nav.addEventListener("scroll", saveScroll, {passive: true});
+
+    const saved = readEpisodeScroll(
+      sessionStorage,
+      datasetInfo.repoId,
+      showFlaggedOnly,
+      episodeId,
+    );
+    const maxScroll = Math.max(0, nav.scrollHeight - nav.clientHeight);
+    if (saved !== null && saved <= maxScroll) {
+      nav.scrollTop = saved;
+    } else {
+      const active = nav.querySelector<HTMLElement>('[aria-current="page"]');
+      if (active) active.scrollIntoView({block: "nearest"});
+      else nav.scrollTop = 0;
+    }
+
+    return () => {
+      nav.removeEventListener("scroll", saveScroll);
+      if (frame !== null) cancelAnimationFrame(frame);
+    };
+  }, [
+    currentPage,
+    datasetInfo.repoId,
+    displayEpisodes.length,
+    episodeId,
+    mobileVisible,
+    showFlaggedOnly,
+  ]);
+
+  const changePage = (action: () => void) => {
+    const nav = navRef.current;
+    if (nav) {
+      nav.scrollTop = 0;
+      writeEpisodeScroll(
+        sessionStorage,
+        datasetInfo.repoId,
+        showFlaggedOnly,
+        0,
+        episodeId,
+      );
+    }
+    action();
+  };
 
   return (
     <div className="flex z-10 shrink-0">
       <nav
+        ref={navRef}
         className={`shrink-0 overflow-y-auto bg-[var(--surface-0)] border-r border-white/5 p-4 break-words w-60 ${
           mobileVisible ? "block" : "hidden"
         } md:block`}
@@ -136,9 +213,6 @@ const Sidebar: React.FC<SidebarProps> = ({
         </dl>
 
         <EpisodeScorePanel result={scores} episodeId={episodeId} retry={retryScores} />
-
-        <a href={`/${datasetInfo.repoId}/batch`} className="pipeline-batch-link"><span aria-hidden="true">▦</span> 批量视频预览</a>
-        {storageError && <p role="alert" className="pipeline-recycle-notice">{storageError}</p>}
 
         <a href={`/${datasetInfo.repoId}/trash`} className="pipeline-recycle-link"><TrashIcon /> 回收站 <span>{recycle?.entries.length ?? "…"}</span></a>
         {notice && <div role="status" className="pipeline-recycle-notice">{notice} {undo !== null && <button disabled={busy || cleaning} onClick={() => changeEpisode(undo, "restore")}>撤销</button>}</div>}
@@ -175,6 +249,7 @@ const Sidebar: React.FC<SidebarProps> = ({
                   <div className={itemClass}>
                     <button
                       onClick={() => onEpisodeSelect(episode)}
+                      aria-current={active ? "page" : undefined}
                       className="flex-1 text-left"
                     >
                       Episode {episode}
@@ -197,6 +272,7 @@ const Sidebar: React.FC<SidebarProps> = ({
                   <div className={itemClass}>
                     <Link
                       href={`./episode_${episode}`}
+                      aria-current={active ? "page" : undefined}
                       className="flex-1 text-left"
                     >
                       Episode {episode}
@@ -224,7 +300,7 @@ const Sidebar: React.FC<SidebarProps> = ({
         {!showFlaggedOnly && totalPages > 1 && (
           <div className="mt-3 flex items-center gap-2 text-[10px] uppercase tracking-wide text-slate-400">
             <button
-              onClick={prevPage}
+              onClick={() => changePage(prevPage)}
               className={`px-2 py-1 rounded-md border border-white/10 transition-colors hover:bg-white/5 hover:text-slate-200 ${
                 currentPage === 1 ? "cursor-not-allowed opacity-40" : ""
               }`}
@@ -236,7 +312,7 @@ const Sidebar: React.FC<SidebarProps> = ({
               {currentPage} / {totalPages}
             </span>
             <button
-              onClick={nextPage}
+              onClick={() => changePage(nextPage)}
               className={`ml-auto px-2 py-1 rounded-md border border-white/10 transition-colors hover:bg-white/5 hover:text-slate-200 ${
                 currentPage === totalPages
                   ? "cursor-not-allowed opacity-40"

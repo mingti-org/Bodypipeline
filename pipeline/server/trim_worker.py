@@ -775,8 +775,10 @@ def trim_manual(spec: dict) -> dict:
 
 def _write_metadata(path: Path, value: dict) -> None:
     from pipeline.shared.core import atomic_json
+    from pipeline.server.storage import share_data_path
 
     atomic_json(path, value)
+    share_data_path(path)
 
 
 def run(spec_path: str) -> dict:

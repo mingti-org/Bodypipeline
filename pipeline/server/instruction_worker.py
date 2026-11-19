@@ -205,10 +205,7 @@ class InstructionApplyRunner:
                     and (
                         row.get("fingerprint") == fingerprint
                         or (
-                            (
-                                row.get("fingerprint") is None
-                                or "episode_indices" not in row
-                            )
+                            row.get("fingerprint") is None
                             and row.get("revision") == draft["revision"]
                         )
                     )
