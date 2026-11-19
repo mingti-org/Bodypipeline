@@ -213,7 +213,9 @@ def test_environment_is_isolated_and_uses_flora_caches(tmp_path, settings_factor
     assert env["HF_HOME"] == str(tmp_path / "hf")
     assert env["HF_ENDPOINT"] == "https://hf-mirror.example"
     assert env["HF_HUB_DISABLE_TELEMETRY"] == "1"
+    assert env["HF_HUB_OFFLINE"] == "1"
     assert env["FLORA_GENERATION_MAX_SECONDS"] == "900"
+    assert env["TRANSFORMERS_OFFLINE"] == "1"
     assert env["CUDA_VISIBLE_DEVICES"] == "0"
     assert not any(name.startswith("PIPELINE_ARGUS_") for name in env)
     assert not any(name.startswith("OPENAI_") for name in env)
