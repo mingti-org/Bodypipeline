@@ -63,10 +63,14 @@ def _model_directory_ready(path: Path) -> bool:
             ):
                 return False
             total_size = (index.get("metadata") or {}).get("total_size")
-            if type(total_size) is int and sum(
-                file.stat().st_size for file in weight_files
-            ) != total_size:
-                return False
+            if type(total_size) is int:
+                actual_size = sum(file.stat().st_size for file in weight_files)
+                # safetensors index metadata counts tensor payload bytes. Each
+                # shard also carries a small JSON header, so an exact equality
+                # check rejects complete multi-shard checkpoints.
+                header_allowance = max(1024 * 1024, len(weight_files) * 131072)
+                if actual_size < total_size or actual_size - total_size > header_allowance:
+                    return False
         except (OSError, TypeError, ValueError):
             return False
     return True

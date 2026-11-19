@@ -157,8 +157,11 @@ def ready(path):
         if not shards or any(not file.is_file() or file.stat().st_size <= 0 for file in shards):
             return False, "one or more indexed safetensors shards are missing"
         total = (index.get("metadata") or {}).get("total_size")
-        if type(total) is int and sum(file.stat().st_size for file in shards) != total:
-            return False, "safetensors shards are incomplete"
+        if type(total) is int:
+            actual = sum(file.stat().st_size for file in shards)
+            allowance = max(1024 * 1024, len(shards) * 131072)
+            if actual < total or actual - total > allowance:
+                return False, "safetensors shards are incomplete"
     return True, ""
 
 missing = False
