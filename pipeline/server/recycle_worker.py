@@ -44,6 +44,9 @@ def recover_operation(store, row):
     if _published(row):
         marker = json.loads((Path(row["dataset_path"]) / MARKER).read_text())
         mapping = marker["mapping"]
+        from .merges import source_snapshot
+
+        to_signature = source_snapshot(Path(row["dataset_path"]))["signature"]
         entries = {
             str(mapping[key]): {**entry, "episode": mapping[key]}
             for key, entry in op["entries_before"].items()
@@ -62,7 +65,10 @@ def recover_operation(store, row):
             remaining_episodes=marker["total_episodes"],
             deleted_frames=marker["deleted_frames"],
             mapping=mapping,
+            to_signature=to_signature,
         )
+        if isinstance(marker.get("from_signature"), str):
+            op["from_signature"] = marker["from_signature"]
     else:
         if stage.exists():
             shutil.rmtree(stage)
@@ -490,8 +496,20 @@ def run(store, key, operation):
                 if not os.access(directory, os.W_OK | os.X_OK):
                     raise PermissionError(f"无法清理数据目录：{directory}")
             snapshot = _snapshot(root)
+            from .merges import source_snapshot
+
+            from_signature = source_snapshot(root)["signature"]
+            if snapshot != _snapshot(root):
+                raise ValueError("检查清理来源期间数据集发生变化，已取消本次清理")
             result = rebuild(root, stage, set(op["episodes"]), progress)
-            atomic_json(stage / MARKER, {**result, "operation": operation})
+            atomic_json(
+                stage / MARKER,
+                {
+                    **result,
+                    "operation": operation,
+                    "from_signature": from_signature,
+                },
+            )
             # atomic_json uses private state-file permissions. Dataset metadata
             # must keep the original team's access after directory publication.
             for path in [stage, *stage.rglob("*")]:

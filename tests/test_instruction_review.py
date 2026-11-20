@@ -304,6 +304,115 @@ def test_chained_manual_trims_rebase_the_latest_instruction_revision(instruction
     assert head["revision"] == 4
 
 
+@pytest.mark.parametrize("signed_cleanup", [True, False])
+def test_recycle_cleanup_remaps_saved_instruction_draft(
+    instruction_app, monkeypatch, signed_cleanup
+):
+    runner = instruction_app.state.runner
+    client = client_for(instruction_app)
+    path = runner.settings.root / "source"
+    cleanup_marker = path / "meta/recycle-cleanup.json"
+
+    def source(*_args):
+        indexes = (0, 1, 2) if not cleanup_marker.exists() else (0, 1)
+        return {
+            "fps": 10,
+            "tasks": [
+                {"task_index": 0, "task": "pick"},
+                {"task_index": 1, "task": "place"},
+                {"task_index": 2, "task": "stack"},
+            ],
+            "episodes": [
+                {
+                    "episode_index": index,
+                    "frames": 6 - index,
+                    "task_index": index,
+                    "instruction": ("pick", "place", "stack")[index],
+                }
+                for index in indexes
+            ],
+        }
+
+    monkeypatch.setattr(InstructionReview, "_source", source)
+    head = client.get("/api/instructions/source").json()
+    head = client.put(
+        "/api/instructions/source/template",
+        json={**versioned(head), "template": instruction_template()},
+    ).json()
+    selections = [
+        {"object": "红色方块", "target": "左侧盒子"},
+        {"object": "蓝色圆柱", "target": "左侧盒子"},
+        {"object": "蓝色圆柱", "target": "右侧盒子"},
+    ]
+    for episode, selected in enumerate(selections):
+        response = client.put(
+            f"/api/instructions/source/episodes/{episode}",
+            json={**versioned(head), "selections": selected},
+        )
+        assert response.status_code == 200, response.text
+        head = response.json()
+
+    before_signature = source_snapshot(path)["signature"]
+    cleanup_marker.write_text(json.dumps({"cleanup": "remove-episode-1"}))
+    after_signature = source_snapshot(path)["signature"]
+    review = InstructionReview(runner.settings, runner.store)
+    key, resolved_path, _ = review.resolve("source")
+    assert resolved_path == path
+    draft = runner.store.get("instruction_draft", key)
+    history = {
+        "id": "remove-episode-1",
+        "from": 0,
+        "to": 1,
+        "mapping": {"0": 0, "2": 1},
+    }
+    if signed_cleanup:
+        history.update(
+            from_signature=before_signature,
+            to_signature=after_signature,
+        )
+    runner.store.put(
+        "recycle",
+        key,
+        {
+            "id": key,
+            "dataset_path": str(path),
+            "entries": {},
+            "revision": 1,
+            "created_at": 1,
+            "cleanup_generation": 1,
+            "cleanup_history": [history],
+            "operation": {
+                "id": "remove-episode-1",
+                "state": "completed",
+                "mapping": {"0": 0, "2": 1},
+                "started_at": draft["updated_at"] + 1,
+            },
+        },
+    )
+
+    loaded = client.get("/api/instructions/source")
+    assert loaded.status_code == 200, loaded.text
+    loaded = loaded.json()
+    assert loaded["revision"] == head["revision"] + 1
+    assert loaded["source_signature"] == after_signature
+    assert loaded["assignment_count"] == 2
+
+    first = client.get("/api/instructions/source/episodes/0").json()
+    assert first["selections"] == selections[0]
+    remapped = client.get("/api/instructions/source/episodes/1").json()
+    assert remapped["selections"] == selections[2]
+    assert remapped["rendered"] == "请将蓝色圆柱放入右侧盒子"
+
+    rebased = runner.store.get("instruction_draft", key)
+    assert rebased["last_recycle_rebase"]["cleanup_id"] == "remove-episode-1"
+    assert rebased["last_recycle_rebase"]["removed_episodes"] == [1]
+    assert rebased["last_recycle_rebase"]["remapped_episodes"] == [[2, 1]]
+
+    stable = client.get("/api/instructions/source")
+    assert stable.status_code == 200, stable.text
+    assert stable.json()["revision"] == loaded["revision"]
+
+
 def test_stale_drafts_source_changes_and_locks_are_rejected(instruction_app):
     runner = instruction_app.state.runner
     client = client_for(instruction_app)

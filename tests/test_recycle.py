@@ -130,6 +130,8 @@ def test_cleanup_history_is_ordered_bounded_and_idempotent():
             "id": str(index),
             "state": "completed",
             "mapping": {"1": 0},
+            "from_signature": "a" * 64,
+            "to_signature": "b" * 64,
         }
         assert record_cleanup(row)
         assert not record_cleanup(row)
@@ -141,6 +143,8 @@ def test_cleanup_history_is_ordered_bounded_and_idempotent():
         "from": 34,
         "to": 35,
         "mapping": {"1": 0},
+        "from_signature": "a" * 64,
+        "to_signature": "b" * 64,
     }
     row["operation"] = {"id": "failed", "state": "failed"}
     assert not record_cleanup(row)

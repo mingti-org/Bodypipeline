@@ -30,14 +30,16 @@ def record_cleanup(row):
     if any(item["id"] == op["id"] for item in history):
         return False
     generation = row.get("cleanup_generation", 0)
-    history.append(
-        {
-            "id": op["id"],
-            "from": generation,
-            "to": generation + 1,
-            "mapping": op["mapping"],
-        }
-    )
+    entry = {
+        "id": op["id"],
+        "from": generation,
+        "to": generation + 1,
+        "mapping": op["mapping"],
+    }
+    for field in ("from_signature", "to_signature", "started_at", "finished_at"):
+        if field in op:
+            entry[field] = op[field]
+    history.append(entry)
     row["cleanup_generation"] = generation + 1
     # Maps can be large. Older browsers outside this window must recheck flags.
     row["cleanup_history"] = history[-32:]
