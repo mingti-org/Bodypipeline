@@ -41,7 +41,7 @@ class Principal:
         }
 
     def job_metadata(self) -> dict:
-        if self.is_admin:
+        if self.is_admin or self.auth_method != "h800-ssh":
             return {
                 "owner_user_id": None,
                 "owner_uid": None,
@@ -50,6 +50,11 @@ class Principal:
                 "slurm_execution_id": None,
                 "submission_auth": self.auth_method,
             }
+        if not self.execution_id:
+            raise DomainError(
+                "任务发起者的 H800 登录会话不可用；请重新登录",
+                401,
+            )
         return {
             "owner_user_id": self.username,
             "owner_uid": self.uid,

@@ -313,6 +313,164 @@ def test_principal_metadata_contains_owner_but_never_password():
     }
 
 
+def test_captured_command_uses_bound_user_without_local_fallback(
+    settings_factory, tmp_path
+):
+    settings = settings_factory("server")
+    store = Store(settings.root / "state")
+
+    class Broker:
+        def __init__(self):
+            self.calls = []
+
+        def session_for_execution(self, execution_id):
+            assert execution_id == "execution-a"
+            return SimpleNamespace(username="alice", uid=1001)
+
+        def run(self, session, argv, **kwargs):
+            self.calls.append((session, argv, kwargs))
+            return SimpleNamespace(returncode=0, stdout='{"ok": true}', stderr="")
+
+    broker = Broker()
+    runner = JobRunner(
+        settings,
+        SimpleNamespace(store=store),
+        user_sessions=broker,
+    )
+    metadata = {
+        "owner_user_id": "alice",
+        "owner_uid": 1001,
+        "submitted_as": "alice",
+        "slurm_user": "alice",
+        "slurm_execution_id": "execution-a",
+        "submission_auth": "h800-ssh",
+    }
+
+    with runner.bind_record_session(metadata):
+        result = runner.run_captured(
+            ["/workspace/.venv/bin/python", "worker.py"],
+            timeout=30,
+        )
+
+    assert result.stdout == '{"ok": true}'
+    assert broker.calls[0][1] == [
+        "/workspace/.venv/bin/python",
+        "worker.py",
+    ]
+
+
+def test_permission_probe_uses_remote_test_argv(
+    settings_factory, tmp_path, monkeypatch
+):
+    settings = settings_factory(
+        "server",
+        user_sessions={"enabled": True, "login_nodes": ["H800-node11"]},
+    )
+    store = Store(settings.root / "state")
+    broker = SlurmIdentityBroker(settings)
+    session = UserSession(
+        session_id="opaque",
+        execution_id="execution-a",
+        username="alice",
+        uid=1001,
+        login_node="H800-node11",
+        control_path=tmp_path / "control",
+        expires_at=now() + 60,
+    )
+    with broker._lock:
+        broker._by_token[session.session_id] = session
+        broker._by_execution[session.execution_id] = session
+    runner = JobRunner(
+        settings,
+        SimpleNamespace(store=store),
+        user_sessions=broker,
+    )
+    calls = []
+
+    def run(active, argv, **kwargs):
+        calls.append((active, argv))
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(broker, "run", run)
+    writable = settings.root / "dataset"
+    (writable / "meta").mkdir(parents=True)
+    (writable / "meta/info.json").write_text("{}")
+    principal = session.principal()
+
+    runner.require_principal_path_access(
+        principal, writable, writable=True
+    )
+
+    assert all(active is session for active, _ in calls)
+    assert calls[-1][1][:2] == ["/usr/bin/test", "-w"]
+    assert str(writable) == calls[-1][1][-1]
+
+
+def test_personal_metadata_requires_execution_handle():
+    principal = Principal(
+        username="alice",
+        uid=1001,
+        auth_method="h800-ssh",
+        execution_id=None,
+    )
+    with pytest.raises(DomainError, match="H800 登录会话"):
+        JobRunner.submission_metadata(principal)
+
+
+def test_device_identity_remains_service_account():
+    device = Principal(
+        username="device:tianji-01",
+        auth_method="device-token",
+        is_admin=False,
+    )
+    assert JobRunner.submission_metadata(device) == {
+        "owner_user_id": None,
+        "owner_uid": None,
+        "submitted_as": "service-account",
+        "slurm_user": None,
+        "slurm_execution_id": None,
+        "submission_auth": "device-token",
+    }
+
+
+def test_execution_handle_cannot_cross_users(settings_factory):
+    settings = settings_factory("server")
+    store = Store(settings.root / "state")
+
+    class Broker:
+        def session_for_execution(self, execution_id):
+            return SimpleNamespace(username="bob", uid=1002)
+
+    runner = JobRunner(
+        settings,
+        SimpleNamespace(store=store),
+        user_sessions=Broker(),
+    )
+    row = {
+        "owner_user_id": "alice",
+        "owner_uid": 1001,
+        "submitted_as": "alice",
+        "slurm_user": "alice",
+        "slurm_execution_id": "execution-a",
+        "submission_auth": "h800-ssh",
+    }
+
+    with pytest.raises(DomainError, match="提交人不匹配"):
+        with runner.bind_record_session(row):
+            pass
+
+
+def test_captured_command_requires_explicit_binding(settings_factory):
+    settings = settings_factory("server")
+    store = Store(settings.root / "state")
+    runner = JobRunner(
+        settings,
+        SimpleNamespace(store=store),
+    )
+    with pytest.raises(DomainError, match="必须绑定提交人身份"):
+        runner.run_captured(["true"], timeout=1)
+
+
 def test_task_apis_never_return_private_execution_handle(settings_factory):
     settings = settings_factory("server")
     app = create_app(settings, background=False)
@@ -446,7 +604,14 @@ def test_slurm_command_uses_the_submitting_users_control_master(
     work.mkdir()
 
     with runner.bind_record_session(
-        {"slurm_execution_id": session.execution_id}
+        {
+            "owner_user_id": "alice",
+            "owner_uid": 1001,
+            "submitted_as": "alice",
+            "slurm_user": "alice",
+            "slurm_execution_id": session.execution_id,
+            "submission_auth": "h800-ssh",
+        }
     ):
         code, _, _ = runner.command(["/opt/letools", "convert"], work, "convert")
 

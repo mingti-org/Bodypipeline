@@ -73,6 +73,7 @@ class JobRunner:
     @contextmanager
     def bind_record_session(self, row):
         execution_id = row.get("slurm_execution_id")
+        personal = row.get("submission_auth") == "h800-ssh"
         session = None
         if execution_id:
             if self.user_sessions is None:
@@ -83,12 +84,36 @@ class JobRunner:
                     "任务发起者的 H800 登录会话已过期；请重新登录并重新提交任务",
                     401,
                 )
+            expected = {
+                "username": row.get("slurm_user"),
+                "uid": row.get("owner_uid"),
+            }
+            actual = {
+                "username": session.username,
+                "uid": session.uid,
+            }
+            if (
+                row.get("owner_user_id") != session.username
+                or row.get("submitted_as") != session.username
+                or expected != actual
+            ):
+                raise DomainError(
+                    "任务执行会话与提交人不匹配；已拒绝执行", 403
+                )
+        elif personal:
+            raise DomainError(
+                "任务发起者的 H800 登录会话不可用；请重新登录",
+                401,
+            )
         previous = self.execution_session
+        previous_bound = getattr(self._execution_context, "bound", False)
         self._execution_context.session = session
+        self._execution_context.bound = True
         try:
             yield session
         finally:
             self._execution_context.session = previous
+            self._execution_context.bound = previous_bound
 
     @staticmethod
     def submission_metadata(principal: Principal | None) -> dict:
@@ -102,6 +127,76 @@ class JobRunner:
                 "submission_auth": "internal",
             }
         return principal.job_metadata()
+
+    @contextmanager
+    def bind_principal(self, principal):
+        metadata = self.submission_metadata(principal)
+        with self.bind_record_session(metadata) as session:
+            yield session
+
+    def run_captured(self, argv, *, timeout, remote_env=None):
+        command = [str(value) for value in argv]
+        environment = self.settings.tool_environment()
+        if not getattr(self._execution_context, "bound", False):
+            raise DomainError(
+                "任务执行前必须绑定提交人身份；已拒绝未绑定执行", 500
+            )
+        session = self.execution_session
+        if session is None:
+            return subprocess.run(
+                command,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+                env=environment,
+            )
+        return self.user_sessions.run(
+            session,
+            command,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            env=environment,
+            remote_env=remote_env,
+        )
+
+    def require_principal_path_access(
+        self, principal, dataset, *, writable=False
+    ):
+        if (
+            principal is None
+            or principal.is_admin
+            or principal.auth_method != "h800-ssh"
+        ):
+            return
+        dataset = Path(dataset).resolve()
+        checks = [
+            ["-x", str(dataset)],
+            ["-r", str(dataset)],
+            ["-r", str(dataset / "meta/info.json")],
+        ]
+        if writable:
+            for relative in ("meta", "data", "videos"):
+                path = dataset / relative
+                if path.exists():
+                    checks.append(["-w", str(path)])
+            checks.append(["-w", str(dataset)])
+        with self.bind_principal(principal) as session:
+            if session is None:
+                raise DomainError("任务需要 H800 用户会话", 503)
+            for check in checks:
+                result = self.user_sessions.run(
+                    session,
+                    ["/usr/bin/test", *check],
+                    capture_output=True,
+                    text=True,
+                    timeout=15,
+                )
+                if result.returncode:
+                    raise DomainError(
+                        f"H800 用户 {principal.username} 无权访问数据集路径",
+                        403,
+                    )
 
     def recover(self):
         for job in self.store.all("job"):
