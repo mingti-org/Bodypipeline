@@ -349,7 +349,8 @@ def test_embedded_server_owns_gateway_only_apis(settings_factory, monkeypatch):
         lambda preview: {"state": "QUEUED"},
     )
     with TestClient(app, headers=headers) as client:
-        assert client.get("/api/episode-scores/source").json() == {"state": "NONE"}
+        score_status = client.get("/api/episode-scores/source")
+        assert score_status.json() == {"state": "NONE"}
         score = client.post("/api/episode-scores/source")
         assert score.status_code == 202
         assert score.json() == {"state": "QUEUED"}
@@ -382,6 +383,17 @@ def test_embedded_server_owns_gateway_only_apis(settings_factory, monkeypatch):
         )
         assert trashed.status_code == 200
         assert [row["episode"] for row in trashed.json()["entries"]] == [1]
+
+    for response in (
+        score_status,
+        score,
+        recycle,
+        trashed,
+        trim,
+        status,
+        preview,
+    ):
+        assert response.headers["cache-control"] == "no-store"
 
 
 @pytest.mark.parametrize(

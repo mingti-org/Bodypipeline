@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import json
 import os
@@ -37,11 +38,57 @@ class EpisodeScoreCache:
         )
         self.lock = threading.RLock()
         self.pending = {}
+        self.claims = {}
         self.stopping = threading.Event()
 
     def close(self):
         self.stopping.set()
         self.pool.shutdown(wait=True, cancel_futures=True)
+        with self.lock:
+            claims = self.claims
+            self.claims = {}
+        for claim in claims.values():
+            self._release_claim(claim)
+
+    def _acquire_claim(self, key):
+        directory = self.store.path / "episode-score-locks"
+        directory.mkdir(exist_ok=True)
+        claim = (directory / f"{key}.lock").open("a")
+        try:
+            fcntl.flock(claim, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            claim.close()
+            return None
+        return claim
+
+    @staticmethod
+    def _release_claim(claim):
+        if claim is None or claim.closed:
+            return
+        try:
+            fcntl.flock(claim, fcntl.LOCK_UN)
+        finally:
+            claim.close()
+
+    def _claim_is_held(self, key):
+        claim = self._acquire_claim(key)
+        if claim is None:
+            return True
+        self._release_claim(claim)
+        return False
+
+    def _persisted(self, key, signature):
+        try:
+            result = self.store.get("episode-score", key)
+        except DomainError as exc:
+            if exc.code != 404:
+                raise
+            return {"state": "NONE"}
+        if result.get("signature") != signature:
+            return {"state": "NONE"}
+        if not isinstance(result.get("state"), str):
+            return {"state": "NONE"}
+        return result or {"state": "NONE"}
 
     def _identity(self, preview):
         root = Path(preview["dataset_path"])
@@ -51,18 +98,14 @@ class EpisodeScoreCache:
     def status(self, preview):
         with self.lock:
             _, key, signature = self._identity(preview)
-            try:
-                result = self.store.get("episode-score", key)
-            except DomainError as exc:
-                if exc.code != 404:
-                    raise
-                result = {}
-            if result.get("signature") != signature or (
-                result.get("state") in {"QUEUED", "RUNNING"}
-                and (key not in self.pending or self.pending[key].done())
-            ):
-                return {"state": "NONE"}
-            return result or {"state": "NONE"}
+            result = self._persisted(key, signature)
+            if result["state"] not in {"QUEUED", "RUNNING"}:
+                return result
+            pending = self.pending.get(key)
+            if pending is None or pending.done():
+                if not self._claim_is_held(key):
+                    return {"state": "NONE"}
+            return result
 
     def start(self, preview):
         with self.lock:
@@ -70,22 +113,64 @@ class EpisodeScoreCache:
             current = self.status(preview)
             if current["state"] in {"QUEUED", "RUNNING", "COMPLETED"}:
                 return current
-            if key in self.pending and not self.pending[key].done():
-                return {"state": "RUNNING"}
-            tool = executable_path(self.settings.letools_bin)
-            python = Path(tool).with_name("python") if tool else None
-            if python is None or not python.is_file() or not os.access(python, os.X_OK):
-                raise DomainError("未找到 LeTools Python，无法运行 Episode 评分", 503)
-            result = {
-                "state": "QUEUED",
-                "signature": signature,
-                "created_at": time.time(),
-            }
-            self.store.put("episode-score", key, result)
-            self.pending[key] = self.pool.submit(
-                self._run, root, key, signature, str(python)
-            )
+            claim = self._acquire_claim(key)
+            if claim is None:
+                current = self._persisted(key, signature)
+                if current["state"] != "NONE":
+                    return current
+                return {"state": "RUNNING", "signature": signature}
+
+            try:
+                current = self._persisted(key, signature)
+                if current["state"] == "COMPLETED":
+                    self._release_claim(claim)
+                    return current
+                tool = executable_path(self.settings.letools_bin)
+                python = Path(tool).with_name("python") if tool else None
+                if (
+                    python is None
+                    or not python.is_file()
+                    or not os.access(python, os.X_OK)
+                ):
+                    raise DomainError(
+                        "未找到 LeTools Python，无法运行 Episode 评分", 503
+                    )
+                result = {
+                    "state": "QUEUED",
+                    "signature": signature,
+                    "created_at": time.time(),
+                }
+                self.store.put("episode-score", key, result)
+                self.claims[key] = claim
+            except BaseException:
+                if self.claims.get(key) is claim:
+                    self.claims.pop(key, None)
+                self._release_claim(claim)
+                raise
+            try:
+                pending = self.pool.submit(
+                    self._execute_claimed,
+                    root,
+                    key,
+                    signature,
+                    str(python),
+                    claim,
+                )
+            except BaseException:
+                self.claims.pop(key, None)
+                self._release_claim(claim)
+                raise
+            self.pending[key] = pending
             return result
+
+    def _execute_claimed(self, root, key, signature, python, claim):
+        try:
+            self._run(root, key, signature, python)
+        finally:
+            with self.lock:
+                if self.claims.get(key) is claim:
+                    self.claims.pop(key, None)
+                self._release_claim(claim)
 
     def _run(self, root, key, signature, python):
         result = {"state": "RUNNING", "signature": signature, "created_at": time.time()}

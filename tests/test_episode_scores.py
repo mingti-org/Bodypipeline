@@ -76,6 +76,96 @@ def test_score_cache_async_dedup_restart_and_invalidation(
         cache.close()
 
 
+def test_score_cache_claim_blocks_duplicate_worker_across_caches(
+    settings_factory, tmp_path, monkeypatch
+):
+    settings = settings_factory("viewer", letools_bin=sys.executable)
+    store = Store(settings.root / "state")
+    root = dataset(tmp_path / "dataset")
+    preview = {"dataset_path": str(root)}
+    first = EpisodeScoreCache(settings, store)
+    second = EpisodeScoreCache(settings, store)
+    entered = Event()
+    gate = Event()
+    calls = []
+
+    def run(active_root, key, signature, python):
+        calls.append((active_root, python))
+        entered.set()
+        gate.wait(5)
+        store.put(
+            "episode-score",
+            key,
+            {
+                "state": "COMPLETED",
+                "signature": signature,
+                "report": {"episodes": []},
+            },
+        )
+
+    monkeypatch.setattr(first, "_run", run)
+    monkeypatch.setattr(second, "_run", run)
+    try:
+        assert first.start(preview)["state"] == "QUEUED"
+        assert entered.wait(2)
+
+        shared = second.start(preview)
+        assert shared["state"] in {"QUEUED", "RUNNING"}
+        assert second.status(preview)["state"] in {"QUEUED", "RUNNING"}
+        assert len(calls) == 1
+
+        gate.set()
+    finally:
+        gate.set()
+        second.close()
+        first.close()
+
+    assert len(calls) == 1
+
+
+def test_score_cache_reclaims_stale_persisted_job(
+    settings_factory, tmp_path, monkeypatch
+):
+    settings = settings_factory("viewer", letools_bin=sys.executable)
+    store = Store(settings.root / "state")
+    root = dataset(tmp_path / "dataset")
+    preview = {"dataset_path": str(root)}
+    signature = dataset_signature(root)
+    key = hashlib.sha256(str(root).encode()).hexdigest()
+    store.put(
+        "episode-score",
+        key,
+        {
+            "state": "RUNNING",
+            "signature": signature,
+            "created_at": 123,
+        },
+    )
+    cache = EpisodeScoreCache(settings, store)
+    calls = []
+
+    def run(_root, score_key, score_signature, _python):
+        calls.append(score_key)
+        store.put(
+            "episode-score",
+            score_key,
+            {
+                "state": "COMPLETED",
+                "signature": score_signature,
+                "report": {"episodes": []},
+            },
+        )
+
+    monkeypatch.setattr(cache, "_run", run)
+    try:
+        assert cache.status(preview) == {"state": "NONE"}
+        assert cache.start(preview)["state"] == "QUEUED"
+        assert wait_for_score(cache, preview)["state"] == "COMPLETED"
+        assert calls == [key]
+    finally:
+        cache.close()
+
+
 def test_score_cache_rejects_stale_and_incomplete_output(
     settings_factory, tmp_path, monkeypatch
 ):

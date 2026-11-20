@@ -247,12 +247,18 @@ class ViewerTransport:
         )
 
     async def bp_transport(self, request, dataset_id, path):
+        preview = self.registry.lookup(f"bp/{dataset_id}")
+        if preview is None:
+            return JSONResponse(
+                {"detail": "预览已过期或不存在，请在管理台重新打开"},
+                status_code=404,
+                headers={"Cache-Control": "no-store"},
+            )
         episode = path.removeprefix("episode_")
         if (
             path.startswith("episode_")
             and episode.isdigit()
             and self.service_ready()
-            and self.registry.lookup(f"bp/{dataset_id}") is not None
         ):
             status = await asyncio.to_thread(
                 self.recycle.status, f"bp/{dataset_id}"
@@ -271,6 +277,7 @@ class ViewerTransport:
                 request,
                 self.registry,
                 f"bp/{dataset_id}/{path}",
+                preview=preview,
             )
         return await self.proxy_ui(request, f"bp/{dataset_id}/{path}")
 

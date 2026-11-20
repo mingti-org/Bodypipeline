@@ -108,6 +108,52 @@ def test_server_embeds_only_allowlisted_viewer_routes(
     assert seen == [f"http://127.0.0.1:{settings.viewer_ui_port}/bp/job-a/episode_0"]
 
 
+@pytest.mark.parametrize(
+    ("service_state", "headers"),
+    [
+        ("READY", {}),
+        ("STARTING", {"Accept": "text/html"}),
+    ],
+)
+def test_embedded_missing_preview_never_reaches_upstream_or_startup(
+    settings_factory, monkeypatch, service_state, headers
+):
+    import httpx
+
+    settings = settings_factory(
+        "server",
+        viewer_gateway={"embedded": True},
+        viewer_origin="http://testserver",
+    )
+    app = create_app(settings, background=False)
+    upstream_calls = []
+
+    async def upstream(request):
+        upstream_calls.append(request)
+        return httpx.Response(200, stream=httpx.ByteStream(b"unexpected"))
+
+    real_client = httpx.AsyncClient
+    monkeypatch.setattr(
+        "pipeline.server.viewer_gateway.httpx.AsyncClient",
+        lambda **kwargs: real_client(
+            transport=httpx.MockTransport(upstream), **kwargs
+        ),
+    )
+    auth = {"Authorization": "Bearer " + settings.token}
+    with TestClient(app) as client:
+        app.state.ingest.store.put(
+            "viewer", "service", {"state": service_state}
+        )
+        response = client.get(
+            "/bp/missing/episode_0",
+            headers={**auth, **headers},
+        )
+
+    assert response.status_code == 404
+    assert "正在启动 LeRobot Visualizer" not in response.text
+    assert upstream_calls == []
+
+
 def test_embedded_viewer_uses_server_cookie_and_never_forwards_it(
     settings_factory, tmp_path, monkeypatch
 ):
@@ -670,10 +716,12 @@ def test_data_service_confines_paths_and_unknown_repos(settings_factory, tmp_pat
         )
 
 
-def test_gateway_proxies_ui_when_service_ready(settings_factory, monkeypatch):
+def test_gateway_proxies_ui_when_service_ready(
+    settings_factory, tmp_path, monkeypatch
+):
     import httpx
 
-    s = settings_factory("viewer")
+    s = settings_factory("viewer", import_roots=[tmp_path])
     store = Store(s.root / "state")
     seen = []
 
@@ -686,7 +734,11 @@ def test_gateway_proxies_ui_when_service_ready(settings_factory, monkeypatch):
         "pipeline.server.viewer_gateway.httpx.AsyncClient",
         lambda **kwargs: real_client(transport=httpx.MockTransport(upstream), **kwargs),
     )
-    with TestClient(create_gateway(s)) as browser:
+    app = create_gateway(s)
+    app.state.viewer_transport.registry.register(
+        "job-a", make_recycle_dataset(tmp_path)
+    )
+    with TestClient(app) as browser:
         browser.post("/api/login", json={"token": s.token})
         waiting = browser.get("/bp/job-a/episode_0", headers={"Accept": "text/html"})
         assert waiting.status_code == 200

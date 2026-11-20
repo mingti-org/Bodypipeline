@@ -133,14 +133,19 @@ def _byte_range(header: str | None, size: int) -> tuple[int, int] | None:
     return start, end
 
 
-def serve_dataset_file(request: Request, registry: PreviewRegistry, path: str):
+def serve_dataset_file(
+    request: Request,
+    registry: PreviewRegistry,
+    path: str,
+    preview: dict | None = None,
+):
     """Serve ``bp/<job>/resolve/main/<file>`` from the registered dataset root."""
 
     parts = path.split("/", 4)
     if len(parts) != 5 or parts[2] != "resolve" or parts[3] != "main":
         return Response(status_code=404)
     repo_id = f"{parts[0]}/{parts[1]}"
-    row = registry.lookup(repo_id)
+    row = preview if preview is not None else registry.lookup(repo_id)
     if row is None:
         return Response(
             '{"detail":"预览已过期或不存在，请在管理台重新打开"}',

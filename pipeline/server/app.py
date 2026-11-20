@@ -709,22 +709,31 @@ def create_app(settings, background=True):
 
     if embedded_enabled(settings):
 
+        def embedded_json(payload, status_code=200):
+            return JSONResponse(
+                payload,
+                status_code=status_code,
+                headers={"Cache-Control": "no-store"},
+            )
+
         @app.get("/api/episode-scores/{dataset_id}")
         def embedded_score_status(dataset_id: str):
             row = registered_preview(viewer_transport, dataset_id)
             result = viewer_transport.scores.status(row)
-            return JSONResponse(result, headers={"Cache-Control": "no-store"})
+            return embedded_json(result)
 
         @app.post("/api/episode-scores/{dataset_id}", status_code=202)
         def embedded_score_start(dataset_id: str):
             row = registered_preview(viewer_transport, dataset_id)
             result = viewer_transport.scores.start(row)
-            return JSONResponse(result, status_code=202)
+            return embedded_json(result, status_code=202)
 
         @app.get("/api/recycle/{dataset_id}")
         def embedded_recycle_status(dataset_id: str):
             registered_preview(viewer_transport, dataset_id)
-            return viewer_transport.recycle.status(f"bp/{dataset_id}")
+            return embedded_json(
+                viewer_transport.recycle.status(f"bp/{dataset_id}")
+            )
 
         @app.post("/api/recycle/{dataset_id}/{action}")
         def embedded_recycle_change(
@@ -733,11 +742,13 @@ def create_app(settings, background=True):
             registered_preview(viewer_transport, dataset_id)
             if action not in {"trash", "restore", "purge"}:
                 raise DomainError("不支持的回收站操作", 404)
-            return viewer_transport.recycle.change(
-                f"bp/{dataset_id}",
-                action,
-                sorted(set(body.episodes)),
-                body.revision,
+            return embedded_json(
+                viewer_transport.recycle.change(
+                    f"bp/{dataset_id}",
+                    action,
+                    sorted(set(body.episodes)),
+                    body.revision,
+                )
             )
 
         @app.post("/api/manual-trims/{dataset_id}", status_code=202)
@@ -751,7 +762,7 @@ def create_app(settings, background=True):
                 run_doctor=body.run_doctor,
                 in_place=body.in_place,
             )
-            return job_response(job)
+            return embedded_json(job_response(job), status_code=202)
 
         def manual_trim_job(dataset_id: str, job_id: str) -> dict:
             preview = registered_preview(viewer_transport, dataset_id)
@@ -776,7 +787,7 @@ def create_app(settings, background=True):
 
         @app.get("/api/manual-trims/{dataset_id}/jobs/{job_id}")
         def embedded_manual_trim_status(dataset_id: str, job_id: str):
-            return job_response(manual_trim_job(dataset_id, job_id))
+            return embedded_json(job_response(manual_trim_job(dataset_id, job_id)))
 
         @app.post("/api/manual-trims/{dataset_id}/jobs/{job_id}/preview")
         def embedded_manual_trim_preview(dataset_id: str, job_id: str):
@@ -790,7 +801,7 @@ def create_app(settings, background=True):
                 raise DomainError("裁剪尚未完成，暂时无法预览", 409)
             with runner.lock:
                 opened = viewer.open(ingest.store.get("job", job_id))
-            return {"url": opened.get("url")}
+            return embedded_json({"url": opened.get("url")})
 
     @app.get("/api/jobs")
     def jobs(summary: bool = False):
