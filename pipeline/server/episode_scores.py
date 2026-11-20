@@ -230,6 +230,10 @@ class EpisodeScoreCache:
                         timeout=self.settings.command_timeout,
                     )
             if completed.returncode:
+                if self.runner is not None:
+                    raise ValueError(
+                        "评分程序执行失败；远程诊断已隐藏"
+                    )
                 raise ValueError(
                     completed.stderr[-1200:] or "评分程序执行失败"
                 )

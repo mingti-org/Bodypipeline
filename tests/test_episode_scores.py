@@ -115,6 +115,71 @@ def test_episode_score_uses_submitter_control_master(
     assert "slurm_execution_id" not in result
 
 
+def test_episode_score_failure_does_not_persist_captured_stderr(
+    settings_factory, tmp_path
+):
+    settings = settings_factory("server", letools_bin=sys.executable)
+    root = dataset(tmp_path / "dataset")
+    store = Store(settings.root / "state")
+    principal = Principal(
+        username="alice",
+        uid=1001,
+        login_node="H800-node11",
+        execution_id="execution-a",
+        auth_method="h800-ssh",
+    )
+    control_path = "/tmp/bp-control/alice/private-control.ctl"
+    session_token = "SSH_SESSION_TOKEN_8f93c"
+
+    class Runner:
+        def require_principal_path_access(
+            self, principal, path, *, writable=False
+        ):
+            assert principal.username == "alice"
+            assert Path(path) == root
+
+        @staticmethod
+        def submission_metadata(principal):
+            return principal.job_metadata()
+
+        @contextmanager
+        def bind_record_session(self, row):
+            yield object()
+
+        def run_captured(self, argv, *, timeout, remote_env=None):
+            return SimpleNamespace(
+                returncode=255,
+                stdout="",
+                stderr=(
+                    f"ssh: ControlPath={control_path} "
+                    f"session={session_token}: connection failed"
+                ),
+            )
+
+    cache = EpisodeScoreCache(settings, store, runner=Runner())
+    try:
+        cache.start({"dataset_path": str(root)}, principal=principal)
+        result = wait_for_score(
+            cache,
+            {"dataset_path": str(root)},
+            principal=principal,
+        )
+        key = cache._identity({"dataset_path": str(root)}, principal)[1]
+        stored = store.get("episode-score", key)
+    finally:
+        cache.close()
+
+    stored_text = json.dumps(stored)
+    public_text = json.dumps(result)
+    assert stored["state"] == "FAILED"
+    assert stored["slurm_execution_id"] == "execution-a"
+    assert "评分程序执行失败" in stored["error"]
+    assert control_path not in stored_text
+    assert session_token not in stored_text
+    assert control_path not in public_text
+    assert session_token not in public_text
+
+
 def test_episode_score_keys_are_per_submitter(settings_factory, tmp_path):
     settings = settings_factory("server")
     store = Store(settings.root / "state")
