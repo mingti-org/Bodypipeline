@@ -8,7 +8,7 @@ from typing import Literal
 from urllib.parse import quote
 
 from fastapi import Body, FastAPI, Query, Request, Response
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel, ConfigDict, Field, StrictBool, StrictInt
 
 from pipeline.shared.collections import (
@@ -48,7 +48,12 @@ from .subtask_review import DraftRequest, RevisionExportRequest, SubtaskReview
 from .task_annotations import TemplateLibrary, TemplateRequest
 from .user_sessions import SlurmIdentityBroker
 from .viewer import ViewerManager
-from .viewer_gateway import ManualTrimRequest, ViewerTransport, embedded_enabled
+from .viewer_gateway import (
+    ManualTrimRequest,
+    RecycleSelection,
+    ViewerTransport,
+    embedded_enabled,
+)
 
 # Fields only the per-job detail view needs. They are the bulk of the listing
 # response and are re-fetched from /api/jobs/{id} when a job is opened.
@@ -202,6 +207,16 @@ class DatasetDeletionRequest(BaseModel):
 
 
 log = logging.getLogger("pipeline.server")
+
+
+def registered_preview(transport: ViewerTransport, dataset_id: str) -> dict:
+    row = transport.registry.lookup(f"bp/{dataset_id}")
+    if row is None:
+        raise DomainError(
+            "预览已过期或不存在，请在管理台重新打开",
+            404,
+        )
+    return row
 
 
 def create_app(settings, background=True):
@@ -691,6 +706,91 @@ def create_app(settings, background=True):
             result["dataset_available"] = False
             result["dataset_unavailable_reason"] = str(exc)
         return result
+
+    if embedded_enabled(settings):
+
+        @app.get("/api/episode-scores/{dataset_id}")
+        def embedded_score_status(dataset_id: str):
+            row = registered_preview(viewer_transport, dataset_id)
+            result = viewer_transport.scores.status(row)
+            return JSONResponse(result, headers={"Cache-Control": "no-store"})
+
+        @app.post("/api/episode-scores/{dataset_id}", status_code=202)
+        def embedded_score_start(dataset_id: str):
+            row = registered_preview(viewer_transport, dataset_id)
+            result = viewer_transport.scores.start(row)
+            return JSONResponse(result, status_code=202)
+
+        @app.get("/api/recycle/{dataset_id}")
+        def embedded_recycle_status(dataset_id: str):
+            registered_preview(viewer_transport, dataset_id)
+            return viewer_transport.recycle.status(f"bp/{dataset_id}")
+
+        @app.post("/api/recycle/{dataset_id}/{action}")
+        def embedded_recycle_change(
+            dataset_id: str, action: str, body: RecycleSelection
+        ):
+            registered_preview(viewer_transport, dataset_id)
+            if action not in {"trash", "restore", "purge"}:
+                raise DomainError("不支持的回收站操作", 404)
+            return viewer_transport.recycle.change(
+                f"bp/{dataset_id}",
+                action,
+                sorted(set(body.episodes)),
+                body.revision,
+            )
+
+        @app.post("/api/manual-trims/{dataset_id}", status_code=202)
+        def embedded_manual_trim_start(dataset_id: str, body: ManualTrimRequest):
+            row = registered_preview(viewer_transport, dataset_id)
+            job = trims.enqueue_manual(
+                row["job_id"],
+                body.episode_index,
+                body.remove_ranges,
+                name=body.name,
+                run_doctor=body.run_doctor,
+                in_place=body.in_place,
+            )
+            return job_response(job)
+
+        def manual_trim_job(dataset_id: str, job_id: str) -> dict:
+            preview = registered_preview(viewer_transport, dataset_id)
+            if not job_id or any(
+                character
+                not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_"
+                for character in job_id
+            ):
+                raise DomainError("裁剪任务编号无效", 404)
+            try:
+                job = ingest.store.get("job", job_id)
+            except DomainError as exc:
+                if exc.code == 404:
+                    raise DomainError("裁剪任务不存在", 404) from exc
+                raise
+            if (
+                job.get("operation") != "manual_trim"
+                or job.get("source_job_id") != preview["job_id"]
+            ):
+                raise DomainError("裁剪任务不存在", 404)
+            return job
+
+        @app.get("/api/manual-trims/{dataset_id}/jobs/{job_id}")
+        def embedded_manual_trim_status(dataset_id: str, job_id: str):
+            return job_response(manual_trim_job(dataset_id, job_id))
+
+        @app.post("/api/manual-trims/{dataset_id}/jobs/{job_id}/preview")
+        def embedded_manual_trim_preview(dataset_id: str, job_id: str):
+            job = manual_trim_job(dataset_id, job_id)
+            if job.get("state") not in {
+                "COMPLETED",
+                "CONVERTED",
+                "SYNTHETIC_READY",
+                "QUARANTINED",
+            }:
+                raise DomainError("裁剪尚未完成，暂时无法预览", 409)
+            with runner.lock:
+                opened = viewer.open(ingest.store.get("job", job_id))
+            return {"url": opened.get("url")}
 
     @app.get("/api/jobs")
     def jobs(summary: bool = False):

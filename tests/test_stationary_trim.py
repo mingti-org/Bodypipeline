@@ -329,6 +329,192 @@ def test_detect_dataset_adds_episode_index_and_summary():
 
 
 # ---------------------------------------------------------------------------- api
+def test_embedded_server_owns_gateway_only_apis(settings_factory, monkeypatch):
+    settings = settings_factory(
+        "server",
+        letools_bin=sys.executable,
+        viewer_gateway={"embedded": True},
+        viewer_origin="http://testserver",
+        server_url="http://127.0.0.1:1",
+    )
+    app = create_app(settings, background=False)
+    seed(app)
+    source_path = app.state.runner.settings.root / "work/source/dataset"
+    app.state.viewer.registry.register("source", source_path)
+    headers = {"Authorization": "Bearer " + settings.token}
+
+    monkeypatch.setattr(
+        app.state.viewer_transport.scores,
+        "start",
+        lambda preview: {"state": "QUEUED"},
+    )
+    with TestClient(app, headers=headers) as client:
+        assert client.get("/api/episode-scores/source").json() == {"state": "NONE"}
+        score = client.post("/api/episode-scores/source")
+        assert score.status_code == 202
+        assert score.json() == {"state": "QUEUED"}
+        recycle = client.get("/api/recycle/source")
+        assert recycle.status_code == 200
+        trim = client.post(
+            "/api/manual-trims/source",
+            json={"episode_index": 0, "remove_ranges": [[1, 2]]},
+        )
+        assert trim.status_code == 202, trim.text
+        job = trim.json()
+        assert job["operation"] == "manual_trim"
+        assert job["manual_episode"] == 0
+        assert job["manual_removed_ranges"] == [[1, 2]]
+        assert job["run_doctor"] is False
+        assert job["in_place"] is True
+        status = client.get(f"/api/manual-trims/source/jobs/{job['id']}")
+        assert status.status_code == 200
+        assert status.json()["id"] == job["id"]
+        preview = client.post(f"/api/manual-trims/source/jobs/{job['id']}/preview")
+        assert preview.status_code == 409
+        invalid_action = client.post(
+            "/api/recycle/source/invalid",
+            json={"episodes": [1], "revision": 0},
+        )
+        assert invalid_action.status_code == 404
+        trashed = client.post(
+            "/api/recycle/source/trash",
+            json={"episodes": [1], "revision": 0},
+        )
+        assert trashed.status_code == 200
+        assert [row["episode"] for row in trashed.json()["entries"]] == [1]
+
+
+@pytest.mark.parametrize(
+    ("method", "path", "body"),
+    [
+        ("GET", "/api/episode-scores/missing", None),
+        ("POST", "/api/episode-scores/missing", None),
+        ("GET", "/api/recycle/missing", None),
+        (
+            "POST",
+            "/api/recycle/missing/trash",
+            {"episodes": [0], "revision": 0},
+        ),
+        (
+            "POST",
+            "/api/manual-trims/missing",
+            {"episode_index": 0, "remove_ranges": [[1, 2]]},
+        ),
+        ("GET", "/api/manual-trims/missing/jobs/job-id", None),
+        ("POST", "/api/manual-trims/missing/jobs/job-id/preview", None),
+    ],
+)
+def test_embedded_apis_require_registered_preview(settings_factory, method, path, body):
+    settings = settings_factory(
+        "server",
+        letools_bin=sys.executable,
+        viewer_gateway={"embedded": True},
+    )
+    app = create_app(settings, background=False)
+    headers = {"Authorization": "Bearer " + settings.token}
+    with TestClient(app, headers=headers) as client:
+        response = client.request(method, path, json=body)
+    assert response.status_code == 404
+
+
+def test_embedded_manual_trim_jobs_require_matching_preview(
+    settings_factory, monkeypatch
+):
+    settings = settings_factory(
+        "server",
+        letools_bin=sys.executable,
+        viewer_gateway={"embedded": True},
+    )
+    app = create_app(settings, background=False)
+    _, source_path = seed(app)
+    seed(app, "other")
+    app.state.viewer.registry.register("source", source_path)
+    store = app.state.ingest.store
+    store.put(
+        "job",
+        "manual-ok",
+        {
+            "id": "manual-ok",
+            "key": "manual-ok",
+            "state": "QUEUED",
+            "operation": "manual_trim",
+            "source_job_id": "source",
+            "created_at": 1,
+        },
+    )
+    store.put(
+        "job",
+        "manual-foreign",
+        {
+            "id": "manual-foreign",
+            "key": "manual-foreign",
+            "state": "QUEUED",
+            "operation": "manual_trim",
+            "source_job_id": "other",
+            "created_at": 1,
+        },
+    )
+    store.put(
+        "job",
+        "ordinary",
+        {
+            "id": "ordinary",
+            "key": "ordinary",
+            "state": "QUEUED",
+            "created_at": 1,
+        },
+    )
+    monkeypatch.setattr(
+        app.state.viewer,
+        "open",
+        lambda job: {"url": f"/bp/{job['id']}/episode_0"},
+    )
+    headers = {"Authorization": "Bearer " + settings.token}
+
+    with TestClient(app, headers=headers) as client:
+        assert client.get("/api/manual-trims/source/jobs/manual-ok").status_code == 200
+        for job_id in ("bad.id", "missing-job", "manual-foreign", "ordinary"):
+            assert (
+                client.get(f"/api/manual-trims/source/jobs/{job_id}").status_code == 404
+            )
+        assert (
+            client.post("/api/manual-trims/source/jobs/manual-ok/preview").status_code
+            == 409
+        )
+        row = store.get("job", "manual-ok")
+        row["state"] = "COMPLETED"
+        store.put("job", "manual-ok", row)
+        opened = client.post("/api/manual-trims/source/jobs/manual-ok/preview")
+        assert opened.status_code == 200
+        assert opened.json() == {"url": "/bp/manual-ok/episode_0"}
+
+
+def test_embedded_gateway_apis_stay_absent_when_disabled(settings_factory):
+    settings = settings_factory("server", letools_bin=sys.executable)
+    app = create_app(settings, background=False)
+    headers = {"Authorization": "Bearer " + settings.token}
+    requests = [
+        ("GET", "/api/episode-scores/source", None),
+        ("POST", "/api/episode-scores/source", None),
+        ("GET", "/api/recycle/source", None),
+        (
+            "POST",
+            "/api/recycle/source/trash",
+            {"episodes": [0], "revision": 0},
+        ),
+        (
+            "POST",
+            "/api/manual-trims/source",
+            {"episode_index": 0, "remove_ranges": [[1, 2]]},
+        ),
+        ("GET", "/api/manual-trims/source/jobs/job-id", None),
+        ("POST", "/api/manual-trims/source/jobs/job-id/preview", None),
+    ]
+    with TestClient(app, headers=headers) as client:
+        for method, path, body in requests:
+            assert client.request(method, path, json=body).status_code == 404
+
+
 def test_trim_api_auth_candidates_policy_and_preview_dedup(settings_factory):
     settings = settings_factory("server", letools_bin=sys.executable)
     app = create_app(settings, background=False)
