@@ -60,6 +60,63 @@ def test_embedded_enabled_is_default_off(settings_factory):
     )
 
 
+def test_server_embeds_only_allowlisted_viewer_routes(
+    settings_factory, tmp_path, monkeypatch
+):
+    import httpx
+
+    settings = settings_factory(
+        "server",
+        import_roots=[tmp_path],
+        viewer_gateway={"embedded": True},
+        viewer_origin="http://testserver",
+    )
+    app = create_app(settings, background=False)
+    app.state.viewer.registry.register(
+        "job-a", make_recycle_dataset(tmp_path, "viewer")
+    )
+    seen = []
+
+    async def upstream(request):
+        seen.append(str(request.url))
+        return httpx.Response(200, stream=httpx.ByteStream(b"<html>viewer</html>"))
+
+    real_client = httpx.AsyncClient
+    monkeypatch.setattr(
+        "pipeline.server.viewer_gateway.httpx.AsyncClient",
+        lambda **kwargs: real_client(transport=httpx.MockTransport(upstream), **kwargs),
+    )
+    headers = {"Authorization": "Bearer " + settings.token}
+
+    with TestClient(app, headers=headers) as client:
+        # Startup recovery intentionally interrupts any persisted READY viewer.
+        app.state.ingest.store.put("viewer", "service", {"state": "READY"})
+        page = client.get("/bp/job-a/episode_0")
+        assert page.status_code == 200
+        assert page.text == "<html>viewer</html>"
+        assert (
+            client.get("/_data/bp/job-a/resolve/main/videos/a.mp4").status_code == 200
+        )
+        assert client.get("/assets/app.js").status_code == 200
+        assert client.get("/api/config").json()["role"] == "server"
+        root = client.get("/")
+        assert root.status_code == 200
+        assert "text/html" in root.headers["content-type"]
+        assert client.get("/not-owned-by-viewer").status_code == 404
+
+    assert seen == [f"http://127.0.0.1:{settings.viewer_ui_port}/bp/job-a/episode_0"]
+
+
+def test_server_viewer_transport_is_opt_in(settings_factory):
+    settings = settings_factory("server")
+    app = create_app(settings, background=False)
+    with TestClient(
+        app, headers={"Authorization": "Bearer " + settings.token}
+    ) as client:
+        assert client.get("/bp/job-a/episode_0").status_code == 404
+        assert client.get("/api/config").status_code == 200
+
+
 def test_registry_registers_expires_and_removes(settings_factory, tmp_path):
     s = settings_factory("viewer")
     store = Store(s.root / "state")

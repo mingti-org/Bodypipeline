@@ -48,7 +48,7 @@ from .subtask_review import DraftRequest, RevisionExportRequest, SubtaskReview
 from .task_annotations import TemplateLibrary, TemplateRequest
 from .user_sessions import SlurmIdentityBroker
 from .viewer import ViewerManager
-from .viewer_gateway import ManualTrimRequest
+from .viewer_gateway import ManualTrimRequest, ViewerTransport, embedded_enabled
 
 # Fields only the per-job detail view needs. They are the bulk of the listing
 # response and are re-fetched from /api/jobs/{id} when a job is opened.
@@ -374,12 +374,20 @@ def create_app(settings, background=True):
                         viewer.stop()
                     finally:
                         try:
-                            user_sessions.close_all()
+                            viewer_transport.close()
                         finally:
-                            lock.release()
+                            try:
+                                user_sessions.close_all()
+                            finally:
+                                lock.release()
 
     app = FastAPI(title="Embodied Pipeline Server", lifespan=lifespan)
-    app.state.ingest, app.state.runner, app.state.viewer = ingest, runner, viewer
+    viewer_transport = ViewerTransport(settings, ingest.store, viewer.registry)
+    app.state.ingest = ingest
+    app.state.runner = runner
+    app.state.viewer = viewer
+    app.state.viewer_transport = viewer_transport
+    app.state.episode_scores = viewer_transport.scores
     app.state.user_sessions = user_sessions
     app.state.imports = imports
     app.state.deliveries = deliveries
@@ -397,6 +405,8 @@ def create_app(settings, background=True):
         device_prefix="/device/",
         user_sessions=user_sessions,
     )
+    if embedded_enabled(settings):
+        viewer_transport.register(app, embedded=True)
     app.add_middleware(
         ListCompressionMiddleware,
         paths={
