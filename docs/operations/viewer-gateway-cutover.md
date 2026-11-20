@@ -33,8 +33,13 @@ evidence set. If the deployment tooling exposes both a release/build ID and a
 git commit, record both.
 
 Store the evidence in the release ticket or under
-`artifacts/viewer-gateway-cutover/<date>/`. Use screenshots or response
-captures that do not expose `PIPELINE_TOKEN`, cookies, or other credentials.
+`artifacts/viewer-gateway-cutover/<date>/`.
+Sanitize screenshots and response captures before retaining them. Do not capture
+or retain
+`slurm_execution_id`, SSH execution handles, `ControlPath` paths or session
+identifiers, passwords, cookies, tokens, or other private execution
+identifiers. If a capture cannot be fully sanitized, do not retain it. For the
+required cookie check, record only cookie names and count with values redacted.
 
 ## Ordered Cutover Sequence
 
@@ -81,7 +86,8 @@ process exactly once after saving both values. Do not restart 8082.
 
 ### 7. Run Health, Route, and Browser Smoke Checks
 
-Run these checks from the Server host and retain their HTTP status and output:
+Run these checks from the Server host and retain their HTTP status and sanitized
+output:
 
 ```bash
 curl -fsS http://127.0.0.1:8081/healthz
@@ -112,16 +118,18 @@ each of these checks:
     requested.
 ```
 
-For the byte-range check, use an existing registered preview and retain the
-request URL, `Range` header, `206` status, and `Content-Range` response. For
-the cookie check, retain the browser's cookie inventory with values redacted.
+For the byte-range check, use an existing registered preview and retain a
+sanitized request URL, `Range` header, `206` status, and `Content-Range`
+response. For the cookie check, retain only the cookie names and count with
+values redacted.
 
 ### 8. Validate with a Non-Admin H800 Browser
 
 Before exposing the cutover to users, authenticate from an H800 browser as a
 non-admin user and repeat the browser checks above. Record the user class,
 browser, timestamp, preview job, and results without recording credentials.
-An administrator-only success is not sufficient evidence for this step.
+Record only sanitized records and no private execution handles. An
+administrator-only success is not sufficient evidence for this step.
 
 ### 9. Observe for One Full Work Cycle
 
@@ -153,6 +161,14 @@ the interactive 8081 browser surface.
 
 ## Required Evidence
 
+Before attaching any screenshot or response capture to the release ticket,
+sanitize it and verify that it omits `slurm_execution_id`, SSH execution
+handles, `ControlPath` paths or session identifiers, passwords, cookies,
+tokens, and all other private execution identifiers. In particular, raw
+`/api/config` output must not be attached. Remove `slurm_execution_id` from
+`/api/config` and from any user/bootstrap payload, then verify the sanitized
+copies omit that key before the evidence is attached.
+
 Attach the following evidence to the release ticket:
 
 - Pre-cutover and post-cutover release identifiers, with timestamps.
@@ -161,7 +177,8 @@ Attach the following evidence to the release ticket:
 - Output and status for every health and route curl command.
 - Browser evidence for all ten authenticated checks.
 - Byte-range request and response evidence showing `206` and `Content-Range`.
-- Browser cookie inventory showing the single `pipeline_server` cookie.
+- Browser cookie inventory showing only the single `pipeline_server` cookie
+  name and count, with the cookie value omitted.
 - Non-admin H800 browser evidence and the user class used.
 - Observation start and end times, failures, and final decision.
 - The rollback operator and trigger, if any rollback occurs.
