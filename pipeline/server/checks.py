@@ -7,7 +7,7 @@ import threading
 import uuid
 
 from pipeline.shared.core import DomainError, executable_path, now
-from pipeline.shared.identity import Principal
+from pipeline.shared.identity import Principal, public_execution_record
 
 from .datasets import dataset_for_job
 from .quality import DOCTOR_CHECK_IDS, doctor_gate
@@ -65,7 +65,7 @@ class QualityRunner:
                 "created_at": now(),
                 "error": None,
                 "target_format": job.get("target_format", "v3.0"),
-                **(
+                **public_execution_record(
                     principal.job_metadata()
                     if principal is not None
                     else {
@@ -73,7 +73,6 @@ class QualityRunner:
                         "owner_uid": job.get("owner_uid"),
                         "submitted_as": job.get("submitted_as"),
                         "slurm_user": job.get("slurm_user"),
-                        "slurm_execution_id": job.get("slurm_execution_id"),
                         "submission_auth": job.get("submission_auth"),
                     }
                 ),

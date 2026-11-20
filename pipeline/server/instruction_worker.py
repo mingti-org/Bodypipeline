@@ -16,6 +16,7 @@ from pipeline.shared.core import (
     executable_path,
     now,
 )
+from pipeline.shared.identity import public_execution_record
 
 from .instruction_review import ApplyInstructionsRequest, InstructionReview
 from .recycle import dataset_lock
@@ -28,21 +29,23 @@ class InstructionApplyRunner:
 
     @staticmethod
     def _public(row):
-        return {
-            key: row.get(key)
-            for key in (
-                "id",
-                "dataset_id",
-                "state",
-                "stage",
-                "progress",
-                "created_at",
-                "started_at",
-                "finished_at",
-                "report",
-                "error",
-            )
-        }
+        return public_execution_record(
+            {
+                key: row.get(key)
+                for key in (
+                    "id",
+                    "dataset_id",
+                    "state",
+                    "stage",
+                    "progress",
+                    "created_at",
+                    "started_at",
+                    "finished_at",
+                    "report",
+                    "error",
+                )
+            }
+        )
 
     @staticmethod
     def _body(row):

@@ -313,6 +313,97 @@ def test_principal_metadata_contains_owner_but_never_password():
     }
 
 
+def test_task_apis_never_return_private_execution_handle(settings_factory):
+    settings = settings_factory("server")
+    app = create_app(settings, background=False)
+    app.state.runner.store.put(
+        "job",
+        "job-a",
+        {
+            "id": "job-a",
+            "state": "QUEUED",
+            "created_at": 1,
+            "owner_user_id": "alice",
+            "submitted_as": "alice",
+            "slurm_user": "alice",
+            "slurm_execution_id": "private-execution-token",
+            "submission_auth": "h800-ssh",
+        },
+    )
+    app.state.runner.store.put(
+        "trim_preview",
+        "preview-a",
+        {
+            "id": "preview-a",
+            "job_id": "job-a",
+            "state": "QUEUED",
+            "created_at": 1,
+            "slurm_execution_id": "private-execution-token",
+        },
+    )
+    app.state.runner.store.put(
+        "check",
+        "check-a",
+        {
+            "id": "check-a",
+            "job_id": "job-a",
+            "state": "QUEUED",
+            "created_at": 1,
+            "slurm_execution_id": "private-execution-token",
+        },
+    )
+    app.state.runner.store.put(
+        "analysis",
+        "analysis-a",
+        {
+            "id": "analysis-a",
+            "job_id": "job-a",
+            "state": "QUEUED",
+            "created_at": 1,
+            "slurm_execution_id": "private-execution-token",
+        },
+    )
+    app.state.runner.store.put(
+        "annotation",
+        "annotation-a",
+        {
+            "id": "annotation-a",
+            "job_id": "job-a",
+            "state": "QUEUED",
+            "created_at": 1,
+            "slurm_execution_id": "private-execution-token",
+        },
+    )
+    headers = {"Authorization": "Bearer " + settings.token}
+
+    with TestClient(app, headers=headers) as client:
+        job = client.get("/api/jobs/job-a")
+        previews = client.get("/api/jobs/job-a/trim-previews")
+        checks = client.get("/api/jobs/job-a/checks")
+        analyses = client.get("/api/jobs/job-a/analyses")
+        analysis = client.get("/api/analyses/analysis-a")
+        annotations = client.get("/api/annotations")
+        annotation = client.get("/api/annotations/annotation-a")
+
+    assert job.status_code == 200
+    job_body = job.json()
+    assert "slurm_execution_id" not in job_body
+    assert job_body["owner_user_id"] == "alice"
+    assert job_body["submitted_as"] == "alice"
+    assert job_body["slurm_user"] == "alice"
+    assert job_body["submission_auth"] == "h800-ssh"
+    assert (
+        app.state.runner.store.get("job", "job-a")["slurm_execution_id"]
+        == "private-execution-token"
+    )
+    assert previews.status_code == 200
+    assert "private-execution-token" not in previews.text
+    for response in (checks, analyses, analysis, annotations, annotation):
+        assert response.status_code == 200
+        assert "slurm_execution_id" not in response.text
+        assert "private-execution-token" not in response.text
+
+
 def test_slurm_command_uses_the_submitting_users_control_master(
     settings_factory, tmp_path, monkeypatch
 ):

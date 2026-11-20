@@ -28,7 +28,7 @@ import uuid
 from pathlib import Path
 
 from pipeline.shared.core import DomainError, executable_path, now
-from pipeline.shared.identity import Principal
+from pipeline.shared.identity import Principal, public_execution_record
 
 from .datasets import dataset_for_job
 from .storage import storage_path
@@ -238,7 +238,7 @@ class AnalysisRunner:
                 "error": None,
                 "dataset_path": str(data),
                 "robot_type": job.get("robot_type"),
-                **(
+                **public_execution_record(
                     principal.job_metadata()
                     if principal is not None
                     else {
@@ -246,7 +246,6 @@ class AnalysisRunner:
                         "owner_uid": job.get("owner_uid"),
                         "submitted_as": job.get("submitted_as"),
                         "slurm_user": job.get("slurm_user"),
-                        "slurm_execution_id": job.get("slurm_execution_id"),
                         "submission_auth": job.get("submission_auth"),
                     }
                 ),

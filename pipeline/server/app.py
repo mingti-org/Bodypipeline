@@ -17,7 +17,11 @@ from pipeline.shared.collections import (
     visible_collection_uploads,
 )
 from pipeline.shared.core import DomainError, ProcessLock, executable_path
-from pipeline.shared.identity import Principal, require_task_access
+from pipeline.shared.identity import (
+    Principal,
+    public_execution_record,
+    require_task_access,
+)
 from pipeline.shared.security import install_security
 from pipeline.shared.web import ListCompressionMiddleware, mount_ui
 
@@ -676,7 +680,10 @@ def create_app(settings, background=True):
         )
 
     def job_response(row, summary=False, metadata=None):
-        result = {**row, "target_format": row.get("target_format", "v3.0")}
+        result = {
+            **public_execution_record(row),
+            "target_format": row.get("target_format", "v3.0"),
+        }
         result["robot_type"] = row.get("robot_type") or row.get("profile", {}).get(
             "robot_type"
         )
@@ -852,7 +859,7 @@ def create_app(settings, background=True):
     @app.get("/api/jobs/{jid}/trim-previews")
     def trim_preview_list(jid: str):
         ingest.store.get("job", jid)
-        return trims.listing(jid)
+        return [public_execution_record(row) for row in trims.listing(jid)]
 
     @app.post("/api/jobs/{jid}/trim-previews", status_code=202)
     def trim_preview_start(
@@ -860,15 +867,17 @@ def create_app(settings, background=True):
     ):
         accessible_job(jid, request, action="检测")
         options = (body or TrimPreviewRequest()).options
-        return trims.enqueue_preview(
-            jid,
-            options.model_dump(),
-            principal=principal(request),
+        return public_execution_record(
+            trims.enqueue_preview(
+                jid,
+                options.model_dump(),
+                principal=principal(request),
+            )
         )
 
     @app.get("/api/trim-previews/{pid}")
     def trim_preview(pid: str, offset: int = 0, limit: int = 200):
-        return trims.preview(pid, offset, limit)
+        return public_execution_record(trims.preview(pid, offset, limit))
 
     @app.post("/api/jobs/{jid}/trims", status_code=202)
     def trim_start(jid: str, body: TrimRequest, request: Request):
@@ -941,12 +950,18 @@ def create_app(settings, background=True):
                 )
             except DomainError:
                 pass
-        return checks.enqueue(jid, principal=principal(request))
+        return public_execution_record(
+            checks.enqueue(jid, principal=principal(request))
+        )
 
     @app.get("/api/jobs/{jid}/checks")
     def job_checks(jid: str):
         ingest.store.get("job", jid)
-        return [r for r in ingest.store.all("check") if r["job_id"] == jid]
+        return [
+            public_execution_record(row)
+            for row in ingest.store.all("check")
+            if row["job_id"] == jid
+        ]
 
     @app.post("/api/jobs/{jid}/analyses", status_code=202)
     def run_analysis(
@@ -956,21 +971,27 @@ def create_app(settings, background=True):
     ):
         accessible_job(jid, request, action="分析")
         options = body or AnalysisRequest()
-        return analyses.enqueue(
-            jid,
-            mode=options.mode,
-            episodes=options.episodes,
-            principal=principal(request),
+        return public_execution_record(
+            analyses.enqueue(
+                jid,
+                mode=options.mode,
+                episodes=options.episodes,
+                principal=principal(request),
+            )
         )
 
     @app.get("/api/jobs/{jid}/analyses")
     def job_analyses(jid: str):
         ingest.store.get("job", jid)
-        return [r for r in ingest.store.all("analysis") if r["job_id"] == jid]
+        return [
+            public_execution_record(row)
+            for row in ingest.store.all("analysis")
+            if row["job_id"] == jid
+        ]
 
     @app.get("/api/analyses/{aid}")
     def analysis(aid: str):
-        return ingest.store.get("analysis", aid)
+        return public_execution_record(ingest.store.get("analysis", aid))
 
     @app.post("/api/analyses/{aid}/cancel")
     def cancel_analysis(aid: str, request: Request):
@@ -979,7 +1000,7 @@ def create_app(settings, background=True):
             principal(request),
             action="取消",
         )
-        return analyses.cancel(aid)
+        return public_execution_record(analyses.cancel(aid))
 
     @app.get("/api/analyses/{aid}/budget")
     def analysis_budget(aid: str):
@@ -1084,33 +1105,35 @@ def create_app(settings, background=True):
             key=lambda row: float(row.get("created_at") or 0),
             reverse=True,
         )
-        return rows
+        return [public_execution_record(row) for row in rows]
 
     @app.post("/api/annotations", status_code=202)
     def annotation_start(body: AnnotationRequest, request: Request):
         accessible_job(body.job_id, request, action="标注")
-        return annotations.enqueue(
-            body.job_id,
-            note=body.note,
-            model=body.model,
-            cap_usd=body.cap_usd,
-            concurrency=body.concurrency,
-            reasoning=body.reasoning,
-            sample_fps=body.sample_fps,
-            inspection=body.inspection,
-            field_dictionary=body.field_dictionary,
-            max_tokens=body.max_tokens,
-            base_url=body.base_url,
-            api_key=body.api_key,
-            template_id=body.template_id,
-            template_revision=body.template_revision,
-            engine=body.engine,
-            principal=principal(request),
+        return public_execution_record(
+            annotations.enqueue(
+                body.job_id,
+                note=body.note,
+                model=body.model,
+                cap_usd=body.cap_usd,
+                concurrency=body.concurrency,
+                reasoning=body.reasoning,
+                sample_fps=body.sample_fps,
+                inspection=body.inspection,
+                field_dictionary=body.field_dictionary,
+                max_tokens=body.max_tokens,
+                base_url=body.base_url,
+                api_key=body.api_key,
+                template_id=body.template_id,
+                template_revision=body.template_revision,
+                engine=body.engine,
+                principal=principal(request),
+            )
         )
 
     @app.get("/api/annotations/{aid}")
     def annotation(aid: str):
-        return ingest.store.get("annotation", aid)
+        return public_execution_record(ingest.store.get("annotation", aid))
 
     @app.get("/api/annotations/{aid}/budget")
     def annotation_budget(aid: str):
@@ -1126,7 +1149,7 @@ def create_app(settings, background=True):
             principal(request),
             action="取消",
         )
-        return annotations.cancel(aid)
+        return public_execution_record(annotations.cancel(aid))
 
     @app.post("/api/annotations/{aid}/resume")
     def annotation_resume(
@@ -1139,11 +1162,13 @@ def create_app(settings, background=True):
             principal(request),
             action="续跑",
         )
-        return annotations.resume(
-            aid,
-            base_url=body.base_url if body else None,
-            api_key=body.api_key if body else None,
-            principal=principal(request),
+        return public_execution_record(
+            annotations.resume(
+                aid,
+                base_url=body.base_url if body else None,
+                api_key=body.api_key if body else None,
+                principal=principal(request),
+            )
         )
 
     @app.get("/api/annotations/{aid}/episodes")
@@ -1217,10 +1242,12 @@ def create_app(settings, background=True):
             principal(request),
             action="导出",
         )
-        return runner.subtask_exports.enqueue(
-            aid,
-            body.name if body else None,
-            principal=principal(request),
+        return public_execution_record(
+            runner.subtask_exports.enqueue(
+                aid,
+                body.name if body else None,
+                principal=principal(request),
+            )
         )
 
     @app.get("/api/checks/{cid}/logs/{name}")

@@ -4,6 +4,16 @@ from dataclasses import dataclass
 
 from .core import DomainError
 
+PRIVATE_EXECUTION_FIELDS = frozenset({"slurm_execution_id"})
+
+
+def public_execution_record(row: dict) -> dict:
+    return {
+        key: value
+        for key, value in row.items()
+        if key not in PRIVATE_EXECUTION_FIELDS
+    }
+
 
 @dataclass(frozen=True)
 class Principal:

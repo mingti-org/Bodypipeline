@@ -21,7 +21,7 @@ import uuid
 from pathlib import Path
 
 from pipeline.shared.core import DomainError, atomic_json, digest, now
-from pipeline.shared.identity import Principal
+from pipeline.shared.identity import Principal, public_execution_record
 
 from . import argus_annotation, flora_annotation, flora_media_worker
 from .annotation_backends import BACKENDS, DEFAULT_ENGINE, backend_for
@@ -527,7 +527,7 @@ class AnnotationRunner:
                 "error": None,
                 "cancel_requested": False,
                 "finished_at": None,
-                **(
+                **public_execution_record(
                     principal.job_metadata()
                     if principal is not None
                     else {
@@ -535,7 +535,6 @@ class AnnotationRunner:
                         "owner_uid": None,
                         "submitted_as": "service-account",
                         "slurm_user": None,
-                        "slurm_execution_id": None,
                         "submission_auth": "internal",
                     }
                 ),
@@ -729,7 +728,9 @@ class AnnotationRunner:
                     )
                 )
             if principal is not None:
-                fields.update(principal.job_metadata())
+                fields.update(
+                    public_execution_record(principal.job_metadata())
+                )
             if self._preparation_refused(row.get("error") or ""):
                 fields["fresh_start"] = True
             elif not row.get("episodes_done") and not float(row.get("cost_usd") or 0):

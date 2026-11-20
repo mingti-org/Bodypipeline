@@ -24,7 +24,7 @@ from pathlib import Path
 
 from pipeline.shared.collections import dataset_name
 from pipeline.shared.core import DomainError, atomic_json, digest, executable_path, now
-from pipeline.shared.identity import Principal
+from pipeline.shared.identity import Principal, public_execution_record
 
 from . import static_intervals
 from .datasets import DATA_READY_STATES, TARGET_FORMATS, dataset_for_job
@@ -384,7 +384,9 @@ class TrimRunner:
                 "source_snapshot": snapshot,
                 "policy": policy,
                 "python": python,
-                **self.runner.submission_metadata(principal),
+                **public_execution_record(
+                    self.runner.submission_metadata(principal)
+                ),
             }
             self.store.put("trim_preview", row["id"], row)
             return row
