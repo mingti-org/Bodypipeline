@@ -401,7 +401,9 @@ def create_app(settings, background=True):
                                 lock.release()
 
     app = FastAPI(title="Embodied Pipeline Server", lifespan=lifespan)
-    viewer_transport = ViewerTransport(settings, ingest.store, viewer.registry)
+    viewer_transport = ViewerTransport(
+        settings, ingest.store, viewer.registry, runner=runner
+    )
     app.state.ingest = ingest
     app.state.runner = runner
     app.state.viewer = viewer
@@ -724,15 +726,19 @@ def create_app(settings, background=True):
             )
 
         @app.get("/api/episode-scores/{dataset_id}")
-        def embedded_score_status(dataset_id: str):
+        def embedded_score_status(dataset_id: str, request: Request):
             row = registered_preview(viewer_transport, dataset_id)
-            result = viewer_transport.scores.status(row)
+            result = viewer_transport.scores.status(
+                row, principal=principal(request)
+            )
             return embedded_json(result)
 
         @app.post("/api/episode-scores/{dataset_id}", status_code=202)
-        def embedded_score_start(dataset_id: str):
+        def embedded_score_start(dataset_id: str, request: Request):
             row = registered_preview(viewer_transport, dataset_id)
-            result = viewer_transport.scores.start(row)
+            result = viewer_transport.scores.start(
+                row, principal=principal(request)
+            )
             return embedded_json(result, status_code=202)
 
         @app.get("/api/recycle/{dataset_id}")

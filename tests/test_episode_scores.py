@@ -3,16 +3,20 @@ import json
 import subprocess
 import sys
 import time
+from contextlib import contextmanager
 from pathlib import Path
-from threading import Event
+from threading import Event, get_ident
+from types import SimpleNamespace
 
 import pytest
 from fastapi.testclient import TestClient
 
+from pipeline.server.app import create_app
 from pipeline.server.episode_scores import EpisodeScoreCache, dataset_signature
 from pipeline.server.viewer import create_gateway
 from pipeline.server.viewer_data import PreviewRegistry
 from pipeline.shared.core import Store
+from pipeline.shared.identity import Principal
 
 WORKER = Path(__file__).resolve().parents[1] / "pipeline/server/episode_score_worker.py"
 
@@ -25,14 +29,209 @@ def dataset(root):
     return root
 
 
-def wait_for_score(cache, preview):
+def wait_for_score(cache, preview, principal=None):
     deadline = time.monotonic() + 10
     while time.monotonic() < deadline:
-        result = cache.status(preview)
+        result = cache.status(preview, principal=principal)
         if result["state"] not in {"QUEUED", "RUNNING"}:
             return result
         time.sleep(0.01)
     pytest.fail("评分未结束")
+
+
+def test_episode_score_uses_submitter_control_master(
+    settings_factory, tmp_path
+):
+    settings = settings_factory("server", letools_bin=sys.executable)
+    root = dataset(tmp_path / "dataset")
+    store = Store(settings.root / "state")
+    principal = Principal(
+        username="alice",
+        uid=1001,
+        login_node="H800-node11",
+        execution_id="execution-a",
+        auth_method="h800-ssh",
+    )
+    report = {
+        "episodes": [{"episode_index": 0, "overall_score": 100}],
+        "total_episodes": 1,
+    }
+
+    class Runner:
+        def __init__(self):
+            self.metadata = None
+            self.argv = None
+            self.bound_thread = None
+            self.captured_thread = None
+
+        def require_principal_path_access(
+            self, principal, path, *, writable=False
+        ):
+            assert principal.username == "alice"
+            assert Path(path) == root
+
+        @staticmethod
+        def submission_metadata(principal):
+            return principal.job_metadata()
+
+        @contextmanager
+        def bind_record_session(self, row):
+            self.metadata = dict(row)
+            self.bound_thread = get_ident()
+            yield object()
+
+        def run_captured(self, argv, *, timeout, remote_env=None):
+            self.argv = argv
+            self.captured_thread = get_ident()
+            return SimpleNamespace(
+                returncode=0,
+                stdout=json.dumps(report),
+                stderr="",
+            )
+
+    runner = Runner()
+    cache = EpisodeScoreCache(settings, store, runner=runner)
+    try:
+        queued = cache.start(
+            {"dataset_path": str(root)},
+            principal=principal,
+        )
+        result = wait_for_score(
+            cache,
+            {"dataset_path": str(root)},
+            principal=principal,
+        )
+    finally:
+        cache.close()
+
+    assert queued["submitted_as"] == "alice"
+    assert runner.metadata["slurm_user"] == "alice"
+    assert runner.metadata["slurm_execution_id"] == "execution-a"
+    assert runner.bound_thread == runner.captured_thread
+    assert runner.bound_thread != get_ident()
+    assert runner.argv[1].endswith("episode_score_worker.py")
+    assert result["state"] == "COMPLETED"
+    assert result["submitted_as"] == "alice"
+    assert "slurm_execution_id" not in result
+
+
+def test_episode_score_keys_are_per_submitter(settings_factory, tmp_path):
+    settings = settings_factory("server")
+    store = Store(settings.root / "state")
+    root = dataset(tmp_path / "dataset")
+    cache = EpisodeScoreCache(settings, store)
+    alice = Principal(
+        username="alice",
+        uid=1001,
+        auth_method="h800-ssh",
+        execution_id="execution-a",
+    )
+    bob = Principal(
+        username="bob",
+        uid=1002,
+        auth_method="h800-ssh",
+        execution_id="execution-b",
+    )
+    try:
+        alice_key = cache._identity({"dataset_path": str(root)}, alice)[1]
+        bob_key = cache._identity({"dataset_path": str(root)}, bob)[1]
+        service_key = cache._identity({"dataset_path": str(root)}, None)[1]
+    finally:
+        cache.close()
+
+    assert len({alice_key, bob_key, service_key}) == 3
+
+
+def test_embedded_score_endpoint_passes_principal(
+    settings_factory, tmp_path, monkeypatch
+):
+    settings = settings_factory(
+        "server",
+        viewer_gateway={"embedded": True},
+        user_sessions={
+            "enabled": True,
+            "login_nodes": ["H800-node11"],
+        },
+    )
+    app = create_app(settings, background=False)
+    app.state.viewer.registry.register(
+        "job-a", dataset(tmp_path / "dataset")
+    )
+    monkeypatch.setattr(
+        app.state.user_sessions,
+        "principal",
+        lambda cookie: Principal(
+            username="alice",
+            uid=1001,
+            login_node="H800-node11",
+            execution_id="execution-a",
+            auth_method="h800-ssh",
+        ),
+    )
+    captured = []
+    monkeypatch.setattr(
+        app.state.viewer_transport.scores,
+        "start",
+        lambda preview, *, principal: captured.append(principal)
+        or {"state": "QUEUED"},
+    )
+
+    with TestClient(app) as client:
+        client.cookies.set(
+            "pipeline_server", "opaque-user-cookie", domain="testserver"
+        )
+        response = client.post(
+            "/api/episode-scores/job-a",
+            headers={"Origin": "http://testserver"},
+        )
+
+    assert response.status_code == 202
+    assert captured[0].username == "alice"
+
+
+def test_embedded_score_status_passes_principal(
+    settings_factory, tmp_path, monkeypatch
+):
+    settings = settings_factory(
+        "server",
+        viewer_gateway={"embedded": True},
+        user_sessions={
+            "enabled": True,
+            "login_nodes": ["H800-node11"],
+        },
+    )
+    app = create_app(settings, background=False)
+    app.state.viewer.registry.register(
+        "job-a", dataset(tmp_path / "dataset")
+    )
+    principal = Principal(
+        username="alice",
+        uid=1001,
+        login_node="H800-node11",
+        execution_id="execution-a",
+        auth_method="h800-ssh",
+    )
+    monkeypatch.setattr(
+        app.state.user_sessions,
+        "principal",
+        lambda cookie: principal,
+    )
+    captured = []
+    monkeypatch.setattr(
+        app.state.viewer_transport.scores,
+        "status",
+        lambda preview, *, principal: captured.append(principal)
+        or {"state": "NONE"},
+    )
+
+    with TestClient(app) as client:
+        client.cookies.set(
+            "pipeline_server", "opaque-user-cookie", domain="testserver"
+        )
+        response = client.get("/api/episode-scores/job-a")
+
+    assert response.status_code == 200
+    assert captured[0] is principal
 
 
 def test_score_cache_async_dedup_restart_and_invalidation(
@@ -46,7 +245,7 @@ def test_score_cache_async_dedup_restart_and_invalidation(
     gate = Event()
     calls = []
 
-    def run(_root, key, signature, python):
+    def run(_root, key, signature, python, _metadata):
         calls.append(python)
         gate.wait(5)
         store.put(
@@ -89,7 +288,7 @@ def test_score_cache_claim_blocks_duplicate_worker_across_caches(
     gate = Event()
     calls = []
 
-    def run(active_root, key, signature, python):
+    def run(active_root, key, signature, python, _metadata):
         calls.append((active_root, python))
         entered.set()
         gate.wait(5)
@@ -131,7 +330,12 @@ def test_score_cache_reclaims_stale_persisted_job(
     root = dataset(tmp_path / "dataset")
     preview = {"dataset_path": str(root)}
     signature = dataset_signature(root)
-    key = hashlib.sha256(str(root).encode()).hexdigest()
+    key = hashlib.sha256(
+        json.dumps(
+            {"path": str(root), "submitted_as": "service-account"},
+            sort_keys=True,
+        ).encode()
+    ).hexdigest()
     store.put(
         "episode-score",
         key,
@@ -144,7 +348,7 @@ def test_score_cache_reclaims_stale_persisted_job(
     cache = EpisodeScoreCache(settings, store)
     calls = []
 
-    def run(_root, score_key, score_signature, _python):
+    def run(_root, score_key, score_signature, _python, _metadata):
         calls.append(score_key)
         store.put(
             "episode-score",
@@ -174,29 +378,35 @@ def test_score_cache_rejects_stale_and_incomplete_output(
     root = dataset(tmp_path / "dataset")
     cache = EpisodeScoreCache(settings, store)
     report = {"episodes": [{"episode_index": 0}], "total_episodes": 1}
-
-    class Process:
-        returncode = 0
-
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *args):
-            return False
-
-        def communicate(self, **kwargs):
-            return json.dumps(report), ""
-
     monkeypatch.setattr(
-        "pipeline.server.episode_scores.subprocess.Popen", lambda *a, **k: Process()
+        "pipeline.server.episode_scores.subprocess.run",
+        lambda *args, **kwargs: SimpleNamespace(
+            returncode=0,
+            stdout=json.dumps(report),
+            stderr="",
+        ),
     )
+    metadata = {
+        "owner_user_id": None,
+        "owner_uid": None,
+        "submitted_as": "service-account",
+        "slurm_user": None,
+        "slurm_execution_id": None,
+        "submission_auth": "internal",
+    }
     try:
         signature = dataset_signature(root)
         (root / "meta/info.json").write_text('{"changed": true}')
-        cache._run(root, "stale", signature, sys.executable)
+        cache._run(root, "stale", signature, sys.executable, metadata)
         assert "发生变化" in store.get("episode-score", "stale")["error"]
         report["episodes"] = []
-        cache._run(root, "incomplete", dataset_signature(root), sys.executable)
+        cache._run(
+            root,
+            "incomplete",
+            dataset_signature(root),
+            sys.executable,
+            metadata,
+        )
         assert "未覆盖" in store.get("episode-score", "incomplete")["error"]
     finally:
         cache.close()

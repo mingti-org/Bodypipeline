@@ -223,12 +223,12 @@ async def proxy_next_response(request: Request, url: str):
 
 
 class ViewerTransport:
-    def __init__(self, settings, store, registry):
+    def __init__(self, settings, store, registry, runner=None):
         self.settings = settings
         self.store = store
         self.registry = registry
         self.doctor = DoctorCache(settings)
-        self.scores = EpisodeScoreCache(settings, store)
+        self.scores = EpisodeScoreCache(settings, store, runner=runner)
         self.recycle = RecycleBin(settings, store, registry)
 
     def register(self, app, *, embedded):

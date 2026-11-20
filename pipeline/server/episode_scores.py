@@ -13,6 +13,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from pipeline.shared.core import DomainError, executable_path
+from pipeline.shared.identity import public_execution_record
 
 SCORING_VERSION = "doctor-ff947533-vector-shards-v1"
 
@@ -31,8 +32,9 @@ def dataset_signature(root: Path) -> str:
 
 
 class EpisodeScoreCache:
-    def __init__(self, settings, store):
+    def __init__(self, settings, store, runner=None):
         self.settings, self.store = settings, store
+        self.runner = runner
         self.pool = ThreadPoolExecutor(
             max_workers=1, thread_name_prefix="episode-score"
         )
@@ -90,41 +92,55 @@ class EpisodeScoreCache:
             return {"state": "NONE"}
         return result or {"state": "NONE"}
 
-    def _identity(self, preview):
+    def _identity(self, preview, principal=None):
         root = Path(preview["dataset_path"])
-        key = hashlib.sha256(str(root).encode()).hexdigest()
+        submitter = (
+            principal.username
+            if (
+                principal is not None
+                and not principal.is_admin
+                and principal.auth_method == "h800-ssh"
+            )
+            else "service-account"
+        )
+        key = hashlib.sha256(
+            json.dumps(
+                {"path": str(root), "submitted_as": submitter},
+                sort_keys=True,
+            ).encode()
+        ).hexdigest()
         return root, key, dataset_signature(root)
 
-    def status(self, preview):
+    def status(self, preview, *, principal=None):
         with self.lock:
-            _, key, signature = self._identity(preview)
+            _, key, signature = self._identity(preview, principal)
             result = self._persisted(key, signature)
             if result["state"] not in {"QUEUED", "RUNNING"}:
-                return result
+                return public_execution_record(result)
             pending = self.pending.get(key)
             if pending is None or pending.done():
                 if not self._claim_is_held(key):
                     return {"state": "NONE"}
-            return result
+            return public_execution_record(result)
 
-    def start(self, preview):
+    def start(self, preview, *, principal=None):
         with self.lock:
-            root, key, signature = self._identity(preview)
-            current = self.status(preview)
+            root, key, signature = self._identity(preview, principal)
+            current = self.status(preview, principal=principal)
             if current["state"] in {"QUEUED", "RUNNING", "COMPLETED"}:
                 return current
             claim = self._acquire_claim(key)
             if claim is None:
                 current = self._persisted(key, signature)
                 if current["state"] != "NONE":
-                    return current
+                    return public_execution_record(current)
                 return {"state": "RUNNING", "signature": signature}
 
             try:
                 current = self._persisted(key, signature)
                 if current["state"] == "COMPLETED":
                     self._release_claim(claim)
-                    return current
+                    return public_execution_record(current)
                 tool = executable_path(self.settings.letools_bin)
                 python = Path(tool).with_name("python") if tool else None
                 if (
@@ -135,10 +151,25 @@ class EpisodeScoreCache:
                     raise DomainError(
                         "未找到 LeTools Python，无法运行 Episode 评分", 503
                     )
+                if self.runner is not None:
+                    self.runner.require_principal_path_access(principal, root)
+                    metadata = self.runner.submission_metadata(principal)
+                elif principal is not None:
+                    metadata = principal.job_metadata()
+                else:
+                    metadata = {
+                        "owner_user_id": None,
+                        "owner_uid": None,
+                        "submitted_as": "service-account",
+                        "slurm_user": None,
+                        "slurm_execution_id": None,
+                        "submission_auth": "internal",
+                    }
                 result = {
                     "state": "QUEUED",
                     "signature": signature,
                     "created_at": time.time(),
+                    **metadata,
                 }
                 self.store.put("episode-score", key, result)
                 self.claims[key] = claim
@@ -155,54 +186,54 @@ class EpisodeScoreCache:
                     signature,
                     str(python),
                     claim,
+                    metadata,
                 )
             except BaseException:
                 self.claims.pop(key, None)
                 self._release_claim(claim)
                 raise
             self.pending[key] = pending
-            return result
+            return public_execution_record(result)
 
-    def _execute_claimed(self, root, key, signature, python, claim):
+    def _execute_claimed(self, root, key, signature, python, claim, metadata):
         try:
-            self._run(root, key, signature, python)
+            self._run(root, key, signature, python, metadata)
         finally:
             with self.lock:
                 if self.claims.get(key) is claim:
                     self.claims.pop(key, None)
                 self._release_claim(claim)
 
-    def _run(self, root, key, signature, python):
-        result = {"state": "RUNNING", "signature": signature, "created_at": time.time()}
+    def _run(self, root, key, signature, python, metadata):
+        result = {
+            "state": "RUNNING",
+            "signature": signature,
+            "created_at": time.time(),
+            **metadata,
+        }
         self.store.put("episode-score", key, result)
         try:
             worker = Path(__file__).with_name("episode_score_worker.py")
-            with subprocess.Popen(
-                [python, str(worker), str(root)],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                env=self.settings.tool_environment(),
-            ) as process:
-                try:
-                    deadline = time.monotonic() + self.settings.command_timeout
-                    while True:
-                        if self.stopping.is_set():
-                            raise InterruptedError("Viewer 停止；可重新计算评分")
-                        if time.monotonic() >= deadline:
-                            raise TimeoutError("Episode 评分超时，可重试")
-                        try:
-                            output, error = process.communicate(timeout=0.5)
-                            break
-                        except subprocess.TimeoutExpired:
-                            pass
-                except BaseException:
-                    process.kill()
-                    process.communicate()
-                    raise
-            if process.returncode:
-                raise ValueError(error[-1200:] or "评分程序执行失败")
-            report = json.loads(output)
+            argv = [python, str(worker), str(root)]
+            if self.runner is None:
+                completed = subprocess.run(
+                    argv,
+                    capture_output=True,
+                    text=True,
+                    timeout=self.settings.command_timeout,
+                    env=self.settings.tool_environment(),
+                )
+            else:
+                with self.runner.bind_record_session(metadata):
+                    completed = self.runner.run_captured(
+                        argv,
+                        timeout=self.settings.command_timeout,
+                    )
+            if completed.returncode:
+                raise ValueError(
+                    completed.stderr[-1200:] or "评分程序执行失败"
+                )
+            report = json.loads(completed.stdout)
             json.dumps(report, allow_nan=False)
             rows = report["episodes"]
             total = report["total_episodes"]

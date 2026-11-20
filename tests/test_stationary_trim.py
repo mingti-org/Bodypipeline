@@ -540,7 +540,7 @@ def test_embedded_server_owns_gateway_only_apis(settings_factory, monkeypatch):
     monkeypatch.setattr(
         app.state.viewer_transport.scores,
         "start",
-        lambda preview: {"state": "QUEUED"},
+        lambda preview, *, principal: {"state": "QUEUED"},
     )
     with TestClient(app, headers=headers) as client:
         score_status = client.get("/api/episode-scores/source")
