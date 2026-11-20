@@ -126,6 +126,7 @@ class Settings:
     # network such as Tailscale, the browser login can be disabled entirely.
     trusted_network: bool = False
     viewer_origin: str = "http://127.0.0.1:8082"
+    viewer_gateway: dict = field(default_factory=dict)
     viewer_ui_port: int = 3100
     viewer_data_port: int = 8765
     viewer_ttl: int = 1800
@@ -190,11 +191,26 @@ class Settings:
             raise ValueError("conversion_prepare_in_allocation 必须是布尔值")
         if type(self.trusted_network) is not bool:
             raise ValueError("trusted_network 必须是布尔值")
+        self._validate_viewer_gateway_configuration()
         from .execution_budget import ExecutionBudget
 
         ExecutionBudget.resolve(self.slurm)
         self._validate_user_sessions_configuration()
         self._validate_flora_configuration()
+
+    def _validate_viewer_gateway_configuration(self):
+        if not isinstance(self.viewer_gateway, dict):
+            raise ValueError("viewer_gateway 必须是对象")
+        unknown = set(self.viewer_gateway) - {"embedded"}
+        if unknown:
+            raise ValueError(
+                f"viewer_gateway 包含未知字段：{', '.join(sorted(unknown))}"
+            )
+        if (
+            "embedded" in self.viewer_gateway
+            and type(self.viewer_gateway["embedded"]) is not bool
+        ):
+            raise ValueError("viewer_gateway.embedded 必须为布尔值")
 
     @classmethod
     def load(cls, role: str, path: str | None = None):

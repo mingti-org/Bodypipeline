@@ -20,6 +20,29 @@ def make_dataset(root, name="ds"):
     return data
 
 
+def test_viewer_gateway_configuration_is_strict(settings_factory):
+    assert settings_factory("server").viewer_gateway == {}
+    assert settings_factory(
+        "server", viewer_gateway={"embedded": True}
+    ).viewer_gateway == {"embedded": True}
+
+    with pytest.raises(ValueError, match="viewer_gateway"):
+        settings_factory("server", viewer_gateway={"embedded": 1})
+
+    with pytest.raises(ValueError, match="viewer_gateway"):
+        settings_factory("server", viewer_gateway={"unknown": True})
+
+
+def test_embedded_enabled_is_default_off(settings_factory):
+    from pipeline.server.viewer_gateway import embedded_enabled
+
+    assert embedded_enabled(settings_factory("server")) is False
+    assert (
+        embedded_enabled(settings_factory("server", viewer_gateway={"embedded": True}))
+        is True
+    )
+
+
 def test_registry_registers_expires_and_removes(settings_factory, tmp_path):
     s = settings_factory("viewer")
     store = Store(s.root / "state")
