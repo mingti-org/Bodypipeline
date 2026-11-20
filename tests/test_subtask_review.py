@@ -13,10 +13,11 @@ from fastapi.testclient import TestClient
 from pipeline.server.app import create_app
 from pipeline.server.merges import source_snapshot
 from pipeline.server.recycle import dataset_lock
-from pipeline.server.subtask_review import SubtaskReview
+from pipeline.server.subtask_review import RevisionExportRequest, SubtaskReview
 from pipeline.server.viewer import create_gateway
 from pipeline.server.viewer_bootstrap import patch_subtask_review
 from pipeline.server.viewer_data import PreviewRegistry
+from pipeline.shared.identity import Principal
 
 SCENARIO = Path(__file__).parent / "fixtures/merge_scenario.py"
 
@@ -549,6 +550,47 @@ def test_export_revision_conflict_and_recycle_guard(review_app, monkeypatch, tmp
     result = runner.store.get("job", jid)
     assert result["state"] == "FAILED" and "提交后发生变化" in result["error"]
     assert not result.get("dataset_path")
+
+
+def test_review_export_dedup_uses_canonical_service_identity(
+    review_app, monkeypatch, tmp_path
+):
+    runner = review_app.state.runner
+    tool = tmp_path / "letools"
+    tool.write_text("#!/bin/sh\n")
+    tool.chmod(0o755)
+    tool.with_name("python").write_text("placeholder")
+    monkeypatch.setattr(runner.settings, "letools_bin", str(tool))
+    client = client_for(review_app)
+    initial = client.get(URL).json()
+    assert (
+        client.post(URL, json=body(initial, initial["segments"])).status_code
+        == 200
+    )
+    head = client.get(URL).json()
+    request = RevisionExportRequest(
+        revision=head["revision"],
+        source_signature=head["source_signature"],
+    )
+    first_device = Principal(
+        username="device:robot-a",
+        auth_method="device-token",
+    )
+    second_device = Principal(
+        username="device:robot-b",
+        auth_method="device-token",
+    )
+
+    first = runner.subtask_exports.enqueue_review(
+        "source", request, principal=first_device
+    )
+    second = runner.subtask_exports.enqueue_review(
+        "source", request, principal=second_device
+    )
+
+    assert second["id"] == first["id"]
+    assert first["submitted_as"] == "service-account"
+    assert first["submission_auth"] == "device-token"
 
 
 def hashes(root):

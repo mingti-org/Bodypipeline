@@ -261,6 +261,320 @@ def test_instruction_apply_routes_pass_the_authenticated_principal(
     assert all(call[3].is_admin for call in calls)
 
 
+def test_embedded_instruction_apply_passes_browser_principal(
+    settings_factory, monkeypatch
+):
+    settings = settings_factory(
+        "server",
+        viewer_gateway={"embedded": True},
+        user_sessions={
+            "enabled": True,
+            "login_nodes": ["H800-node11"],
+        },
+    )
+    app = create_app(settings, background=False)
+    user = Principal(
+        username="alice",
+        uid=1001,
+        login_node="H800-node11",
+        execution_id="execution-a",
+        auth_method="h800-ssh",
+    )
+    monkeypatch.setattr(
+        app.state.user_sessions,
+        "principal",
+        lambda cookie: user if cookie == "opaque-user-cookie" else None,
+    )
+    captured = []
+
+    def enqueue(dataset_id, body, episode_indices=None, *, principal):
+        captured.append(
+            {
+                "dataset_id": dataset_id,
+                "episode_indices": episode_indices,
+                "principal": principal,
+            }
+        )
+        return {"id": "apply-a", "state": "QUEUED"}
+
+    monkeypatch.setattr(app.state.instruction_apply, "enqueue", enqueue)
+    with TestClient(app) as client:
+        client.cookies.set("pipeline_server", "opaque-user-cookie")
+        response = client.post(
+            "/api/instructions/source/apply",
+            json={
+                "revision": 0,
+                "source_signature": "a" * 64,
+            },
+            headers={"Origin": "http://testserver"},
+        )
+
+    assert response.status_code == 202
+    assert captured[0]["dataset_id"] == "source"
+    assert captured[0]["episode_indices"] is None
+    assert captured[0]["principal"] is user
+
+
+def test_other_viewer_compute_routes_forward_principal(
+    settings_factory, tmp_path, monkeypatch
+):
+    settings = settings_factory(
+        "server",
+        viewer_gateway={"embedded": True},
+        user_sessions={
+            "enabled": True,
+            "login_nodes": ["H800-node11"],
+        },
+    )
+    app = create_app(settings, background=False)
+    dataset = tmp_path / "dataset"
+    (dataset / "meta").mkdir(parents=True)
+    (dataset / "meta/info.json").write_text("{}")
+    app.state.runner.store.put(
+        "job",
+        "source",
+        {
+            "id": "source",
+            "state": "CONVERTED",
+            "dataset_path": str(dataset),
+            "created_at": 1,
+        },
+    )
+    app.state.viewer.registry.register("source", dataset)
+    user = Principal(
+        username="alice",
+        uid=1001,
+        login_node="H800-node11",
+        execution_id="execution-a",
+        auth_method="h800-ssh",
+    )
+    monkeypatch.setattr(
+        app.state.user_sessions,
+        "principal",
+        lambda cookie: user if cookie == "opaque-user-cookie" else None,
+    )
+    seen = {}
+
+    def episode_enqueue(
+        dataset_id, body, episode_indices=None, *, principal
+    ):
+        seen["episode"] = (dataset_id, episode_indices, principal)
+        return {"id": "apply-a", "state": "QUEUED"}
+
+    def manual_enqueue(
+        job_id,
+        episode,
+        ranges,
+        name=None,
+        run_doctor=False,
+        in_place=True,
+        *,
+        principal,
+    ):
+        seen["manual"] = (job_id, principal)
+        return {
+            "id": "trim-a",
+            "state": "QUEUED",
+            "operation": "manual_trim",
+            "dataset_path": str(dataset),
+        }
+
+    def review_enqueue(dataset_id, body, *, principal):
+        seen["review"] = (dataset_id, principal)
+        return {"id": "export-a", "state": "QUEUED"}
+
+    def score_start(preview, *, principal):
+        seen["score"] = (preview["job_id"], principal)
+        return {"state": "QUEUED"}
+
+    monkeypatch.setattr(
+        app.state.instruction_apply, "enqueue", episode_enqueue
+    )
+    monkeypatch.setattr(app.state.trims, "enqueue_manual", manual_enqueue)
+    monkeypatch.setattr(
+        app.state.runner.subtask_exports,
+        "enqueue_review",
+        review_enqueue,
+    )
+    monkeypatch.setattr(
+        app.state.viewer_transport.scores, "start", score_start
+    )
+    origin = {"Origin": "http://testserver"}
+
+    with TestClient(app) as client:
+        client.cookies.set("pipeline_server", "opaque-user-cookie")
+        episode = client.post(
+            "/api/instructions/source/episodes/0/apply",
+            json={"revision": 0, "source_signature": "a" * 64},
+            headers=origin,
+        )
+        manual = client.post(
+            "/api/manual-trims/source",
+            json={"episode_index": 0, "remove_ranges": [[1, 2]]},
+            headers=origin,
+        )
+        review = client.post(
+            "/api/subtask-review/source/exports",
+            json={"revision": 0, "source_signature": "a" * 64},
+            headers=origin,
+        )
+        score = client.post(
+            "/api/episode-scores/source",
+            json={
+                "username": "mallory",
+                "execution_id": "untrusted-handle",
+                "is_admin": True,
+            },
+            headers=origin,
+        )
+        client.cookies.clear()
+        anonymous_score = client.post(
+            "/api/episode-scores/source",
+            json={
+                "username": "mallory",
+                "execution_id": "untrusted-handle",
+                "is_admin": True,
+            },
+            headers=origin,
+        )
+
+    assert episode.status_code == 202
+    assert manual.status_code == 202
+    assert review.status_code == 202
+    assert score.status_code == 202
+    assert anonymous_score.status_code == 401
+    assert seen["episode"][0] == "source"
+    assert seen["episode"][1] == {0}
+    assert seen["manual"][0] == "source"
+    assert seen["review"][0] == "source"
+    assert seen["score"][0] == "source"
+    assert seen["episode"][2] is user
+    assert seen["manual"][1] is user
+    assert seen["review"][1] is user
+    assert seen["score"][1] is user
+
+
+def test_embedded_compute_apis_keep_machine_token_as_service_account(
+    settings_factory, monkeypatch
+):
+    settings = settings_factory(
+        "server",
+        viewer_gateway={"embedded": True},
+    )
+    app = create_app(settings, background=False)
+    captured = []
+
+    def enqueue(dataset_id, body, episode_indices=None, *, principal):
+        captured.append(principal)
+        return {"id": "apply-a", "state": "QUEUED"}
+
+    monkeypatch.setattr(app.state.instruction_apply, "enqueue", enqueue)
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/instructions/source/apply",
+            json={"revision": 0, "source_signature": "a" * 64},
+            headers={
+                "Authorization": "Bearer "
+                + app.state.runner.settings.token
+            },
+        )
+
+    assert response.status_code == 202
+    assert captured[0].is_admin is True
+    assert captured[0].username == "service-account"
+    assert captured[0].auth_method == "service-token"
+    assert (
+        app.state.runner.submission_metadata(captured[0])["submitted_as"]
+        == "service-account"
+    )
+
+
+@pytest.mark.parametrize(
+    ("path", "payload"),
+    [
+        (
+            "/api/instructions/source/apply",
+            {"revision": 0, "source_signature": "a" * 64},
+        ),
+        (
+            "/api/instructions/source/episodes/0/apply",
+            {"revision": 0, "source_signature": "a" * 64},
+        ),
+        (
+            "/api/manual-trims/source",
+            {"episode_index": 0, "remove_ranges": [[1, 2]]},
+        ),
+        (
+            "/api/subtask-review/source/exports",
+            {"revision": 0, "source_signature": "a" * 64},
+        ),
+    ],
+)
+def test_viewer_compute_bodies_reject_identity_fields(
+    settings_factory, monkeypatch, path, payload
+):
+    settings = settings_factory(
+        "server",
+        viewer_gateway={"embedded": True},
+        user_sessions={
+            "enabled": True,
+            "login_nodes": ["H800-node11"],
+        },
+    )
+    app = create_app(settings, background=False)
+    principal = Principal(
+        username="alice",
+        uid=1001,
+        login_node="H800-node11",
+        execution_id="execution-a",
+        auth_method="h800-ssh",
+    )
+    monkeypatch.setattr(
+        app.state.user_sessions,
+        "principal",
+        lambda cookie: principal
+        if cookie == "opaque-user-cookie"
+        else None,
+    )
+
+    def reject_compute(*args, **kwargs):
+        pytest.fail("identity-bearing request reached a compute handler")
+
+    monkeypatch.setattr(
+        app.state.instruction_apply, "enqueue", reject_compute
+    )
+    monkeypatch.setattr(app.state.trims, "enqueue_manual", reject_compute)
+    monkeypatch.setattr(
+        app.state.runner.subtask_exports,
+        "enqueue_review",
+        reject_compute,
+    )
+    injected = {
+        **payload,
+        "username": "mallory",
+        "uid": 9999,
+        "login_node": "untrusted-node",
+        "execution_id": "untrusted-handle",
+        "is_admin": True,
+    }
+
+    with TestClient(app) as client:
+        anonymous = client.post(
+            path,
+            json=injected,
+            headers={"Origin": "http://testserver"},
+        )
+        client.cookies.set("pipeline_server", "opaque-user-cookie")
+        authenticated = client.post(
+            path,
+            json=injected,
+            headers={"Origin": "http://testserver"},
+        )
+
+    assert anonymous.status_code == 401
+    assert authenticated.status_code == 422
+
+
 def test_apply_job_rewrites_real_dataset_in_place_and_updates_viewer(
     settings_factory, tmp_path, letools_binary
 ):

@@ -642,16 +642,13 @@ class SubtaskExportRunner:
                 source_job, source, snapshot, plan = review.export_plan(dataset_id, body)
                 source_name = source_job.get("dataset_name") or dataset_id
                 output_name = dataset_name(body.name or f"{str(source_name)[:1970]}-revised")
+                metadata = self.runner.submission_metadata(principal)
                 key = "subtask-review:" + digest(
                     {
                         "source": str(source),
                         "plan": plan["digest"],
                         "name": output_name,
-                        "submitted_by": (
-                            "service-account"
-                            if principal is None or principal.is_admin
-                            else principal.username
-                        ),
+                        "submitted_by": metadata["submitted_as"],
                     }
                 )
                 for existing in self.store.all("job"):
@@ -674,7 +671,7 @@ class SubtaskExportRunner:
                     "processing_mode": "real", "run_doctor": False,
                     "source_count": plan["dataset"]["total_episodes"],
                     "episode_count": plan["dataset"]["total_episodes"], "frame_count": None,
-                    **self.runner.submission_metadata(principal),
+                    **metadata,
                 }
                 for field in ("runtime_id", "provider", "profile", "profile_hash"):
                     if source_job.get(field) is not None:
