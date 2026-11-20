@@ -293,7 +293,14 @@ def install_security(
         response.headers["X-Content-Type-Options"] = "nosniff"
         response.headers["Referrer-Policy"] = "no-referrer"
         response.headers["Cache-Control"] = "no-store"
-        if settings.role != "viewer":
+        viewer_gateway = getattr(settings, "viewer_gateway", {})
+        embedded_viewer_page = (
+            settings.role == "server"
+            and isinstance(viewer_gateway, dict)
+            and viewer_gateway.get("embedded") is True
+            and p.startswith("/bp/")
+        )
+        if settings.role != "viewer" and not embedded_viewer_page:
             response.headers["Content-Security-Policy"] = (
                 "default-src 'self'; img-src 'self' blob: data:; script-src 'self'; style-src 'self'; frame-ancestors 'none'"
             )

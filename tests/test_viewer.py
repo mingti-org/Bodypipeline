@@ -95,6 +95,10 @@ def test_server_embeds_only_allowlisted_viewer_routes(
         page = client.get("/bp/job-a/episode_0")
         assert page.status_code == 200
         assert page.text == "<html>viewer</html>"
+        # Next.js bootstraps the page with inline scripts. The Server CSP is
+        # intentionally limited to Server-owned pages so the embedded Viewer
+        # keeps the policy supplied by its own build.
+        assert "Content-Security-Policy" not in page.headers
         assert (
             client.get("/_data/bp/job-a/resolve/main/videos/a.mp4").status_code == 200
         )
@@ -103,6 +107,7 @@ def test_server_embeds_only_allowlisted_viewer_routes(
         root = client.get("/")
         assert root.status_code == 200
         assert "text/html" in root.headers["content-type"]
+        assert "script-src 'self'" in root.headers["Content-Security-Policy"]
         assert client.get("/not-owned-by-viewer").status_code == 404
 
     assert seen == [f"http://127.0.0.1:{settings.viewer_ui_port}/bp/job-a/episode_0"]
