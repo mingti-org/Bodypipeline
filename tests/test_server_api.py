@@ -1,10 +1,19 @@
 import hashlib
+import json
+from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
 from test_ingest import manifest
 
 from pipeline.server.app import create_app
+
+
+def test_deployed_server_config_defaults_viewer_gateway_off():
+    config = json.loads(
+        Path("configs/server.deployed.example.json").read_text(encoding="utf-8")
+    )
+    assert config["viewer_gateway"] == {"embedded": False}
 
 
 def test_device_isolation_and_ownership(settings_factory, monkeypatch):

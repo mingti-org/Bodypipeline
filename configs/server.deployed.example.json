@@ -8,6 +8,9 @@
   "min_free_bytes": 10737418240,
   "server_url": "http://127.0.0.1:8081",
   "viewer_origin": "http://127.0.0.1:8082",
+  "viewer_gateway": {
+    "embedded": false
+  },
   "viewer_ui_port": 13100,
   "viewer_data_port": 18765,
   "letools_bin": "letools",
