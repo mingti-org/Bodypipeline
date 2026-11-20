@@ -41,5 +41,8 @@
   "viewer_origin": "http://127.0.0.1:8082",
   "viewer_gateway": {
     "embedded": false
+  },
+  "viewer_execution_identity": {
+    "enabled": false
   }
 }

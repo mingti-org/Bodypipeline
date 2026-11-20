@@ -6,6 +6,7 @@ import os
 import subprocess
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from fastapi.testclient import TestClient
@@ -129,10 +130,17 @@ def test_manual_trim_persists_submitting_user_and_redacts_handle(
     assert stored["submission_auth"] == "h800-ssh"
 
 
-def test_manual_trim_preflight_rejection_does_not_enqueue(
+def test_manual_trim_permission_denial_does_not_enqueue(
     settings_factory, monkeypatch
 ):
-    settings = settings_factory("server", letools_bin=sys.executable)
+    settings = settings_factory(
+        "server",
+        letools_bin=sys.executable,
+        user_sessions={
+            "enabled": True,
+            "login_nodes": ["H800-node11"],
+        },
+    )
     app = create_app(settings, background=False)
     seed(app)
     principal = Principal(
@@ -142,13 +150,23 @@ def test_manual_trim_preflight_rejection_does_not_enqueue(
         execution_id="execution-a",
         auth_method="h800-ssh",
     )
+    session = SimpleNamespace(username="alice", uid=1001)
+    calls = []
 
-    def deny(_principal, _path, writable):
-        assert writable is True
-        raise DomainError("H800 用户 alice 无权访问数据集路径", 403)
+    monkeypatch.setattr(
+        app.state.user_sessions,
+        "session_for_execution",
+        lambda execution_id: session,
+    )
 
-    monkeypatch.setattr(app.state.runner, "require_principal_path_access", deny)
-    with pytest.raises(DomainError, match="无权访问"):
+    def run(active, argv, **kwargs):
+        assert active is session
+        calls.append(argv)
+        writable_probe = argv[:2] == ["/usr/bin/test", "-w"]
+        return SimpleNamespace(returncode=1 if writable_probe else 0)
+
+    monkeypatch.setattr(app.state.user_sessions, "run", run)
+    with pytest.raises(DomainError, match="无权访问") as denied:
         app.state.trims.enqueue_manual(
             "source",
             0,
@@ -156,6 +174,8 @@ def test_manual_trim_preflight_rejection_does_not_enqueue(
             principal=principal,
         )
 
+    assert denied.value.code == 403
+    assert calls[-1][:2] == ["/usr/bin/test", "-w"]
     assert not any(
         row.get("operation") == "manual_trim"
         for row in app.state.runner.store.all("job")

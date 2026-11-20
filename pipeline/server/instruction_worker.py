@@ -351,12 +351,15 @@ class InstructionApplyRunner:
         try:
             with self.runner.bind_record_session(row):
                 self.run(row)
-        except DomainError as exc:
+        except DomainError:
             row.update(
                 state="INTERRUPTED",
                 stage="等待提交人重新登录",
                 progress="执行会话已失效，尚未继续恢复或写入",
-                error=exc.message,
+                error=(
+                    "H800 登录会话已失效；请重新登录后重新提交。"
+                    "重新提交会先执行事务恢复，再开始新的写入。"
+                ),
                 finished_at=now(),
             )
             self.store.put("instruction_apply", row["id"], row)

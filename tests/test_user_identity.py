@@ -1,5 +1,6 @@
 import json
 import stat
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -81,6 +82,18 @@ def test_viewer_execution_identity_configuration_is_strict(
             "server",
             viewer_execution_identity={"unknown": True},
         )
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        Path("configs/server.json"),
+        Path("configs/server.deployed.example.json"),
+    ],
+)
+def test_server_configs_default_viewer_execution_identity_off(path):
+    config = json.loads(path.read_text(encoding="utf-8"))
+    assert config["viewer_execution_identity"] == {"enabled": False}
 
 
 def test_disabled_identity_gate_attributes_new_task_to_service(
@@ -575,32 +588,31 @@ def test_instruction_worker_uses_bound_remote_command(
     assert result == {"operation_id": "apply-a"}
 
 
-def test_instruction_worker_interrupts_when_bound_session_expired(
+def test_expired_instruction_session_never_runs_locally(
     settings_factory, monkeypatch
 ):
-    settings = settings_factory("server")
-    store = Store(settings.root / "state")
-
-    class ExpiredBroker:
-        def session_for_execution(self, execution_id):
-            assert execution_id == "expired"
-            return None
-
-    execution = JobRunner(
-        settings,
-        SimpleNamespace(store=store),
-        user_sessions=ExpiredBroker(),
+    settings = settings_factory(
+        "server",
+        viewer_execution_identity={"enabled": True},
     )
-    worker = InstructionApplyRunner(
-        settings, store, SimpleNamespace(), runner=execution
-    )
-    store.put(
+    app = create_app(settings, background=False)
+    app.state.runner.store.put(
         "instruction_apply",
         "apply-expired",
         {
             "id": "apply-expired",
             "dataset_id": "source",
+            "dataset_key": "key",
+            "dataset_path": str(settings.root / "source"),
+            "source_signature": {},
+            "revision": 0,
+            "episode_indices": None,
+            "fingerprint": "fingerprint-a",
+            "spec_path": str(settings.root / "spec.json"),
             "state": "QUEUED",
+            "stage": "等待应用",
+            "progress": "",
+            "created_at": 1,
             "owner_user_id": "alice",
             "owner_uid": 1001,
             "submitted_as": "alice",
@@ -609,9 +621,10 @@ def test_instruction_worker_interrupts_when_bound_session_expired(
             "submission_auth": "h800-ssh",
         },
     )
-    worker_calls = []
     monkeypatch.setattr(
-        worker, "run", lambda row: worker_calls.append(row)
+        app.state.user_sessions,
+        "session_for_execution",
+        lambda execution_id: None,
     )
     local_calls = []
     monkeypatch.setattr(
@@ -619,12 +632,74 @@ def test_instruction_worker_interrupts_when_bound_session_expired(
         lambda *args, **kwargs: local_calls.append((args, kwargs)),
     )
 
-    assert worker.tick() is True
-    row = store.get("instruction_apply", "apply-expired")
+    assert app.state.instruction_apply.tick() is True
+    row = app.state.runner.store.get("instruction_apply", "apply-expired")
     assert row["state"] == "INTERRUPTED"
-    assert "重新登录" in row["error"]
-    assert worker_calls == []
+    assert row["stage"] == "等待提交人重新登录"
+    assert row["progress"] == "执行会话已失效，尚未继续恢复或写入"
+    assert row["error"] == (
+        "H800 登录会话已失效；请重新登录后重新提交。"
+        "重新提交会先执行事务恢复，再开始新的写入。"
+    )
     assert local_calls == []
+
+
+def test_expired_queued_manual_trim_fails_closed(settings_factory):
+    settings = settings_factory("server", letools_bin=sys.executable)
+    app = create_app(settings, background=False)
+    runner = app.state.runner
+    runner.store.put(
+        "job",
+        "trim-a",
+        {
+            "id": "trim-a",
+            "state": "QUEUED",
+            "operation": "manual_trim",
+            "created_at": 1,
+            "owner_user_id": "alice",
+            "owner_uid": 1001,
+            "submitted_as": "alice",
+            "slurm_user": "alice",
+            "slurm_execution_id": "expired",
+            "submission_auth": "h800-ssh",
+        },
+    )
+
+    runner.recover()
+
+    row = runner.store.get("job", "trim-a")
+    assert row["state"] == "INTERRUPTED"
+    assert "用户会话失效" in row["error"]
+
+
+def test_legacy_queued_job_without_execution_handle_uses_service_account(
+    settings_factory,
+):
+    settings = settings_factory("server")
+    store = Store(settings.root / "state")
+    runner = JobRunner(settings, SimpleNamespace(store=store))
+    store.put(
+        "job",
+        "legacy-a",
+        {
+            "id": "legacy-a",
+            "state": "QUEUED",
+            "operation": "manual_trim",
+        },
+    )
+
+    runner.recover()
+    recovered = store.get("job", "legacy-a")
+
+    assert recovered["state"] == "QUEUED"
+    assert "slurm_execution_id" not in recovered
+    with runner.bind_record_session(recovered):
+        result = runner.run_captured(
+            [sys.executable, "-c", "print('legacy-service-account')"],
+            timeout=5,
+        )
+    assert result.returncode == 0
+    assert result.stdout.strip() == "legacy-service-account"
 
 
 def test_instruction_startup_recovery_defers_personal_receipt_until_bound(

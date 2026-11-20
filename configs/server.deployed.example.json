@@ -11,6 +11,9 @@
   "viewer_gateway": {
     "embedded": false
   },
+  "viewer_execution_identity": {
+    "enabled": false
+  },
   "viewer_ui_port": 13100,
   "viewer_data_port": 18765,
   "letools_bin": "letools",
