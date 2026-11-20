@@ -11,6 +11,7 @@ from pipeline.server.viewer_bootstrap import UPSTREAM, patch_cache
 from pipeline.server.viewer_data import PreviewRegistry, repo_id_for
 from pipeline.server.viewer_gateway import ViewerTransport
 from pipeline.shared.core import DomainError, Store
+from pipeline.shared.identity import Principal
 
 
 def make_dataset(root, name="ds"):
@@ -105,6 +106,326 @@ def test_server_embeds_only_allowlisted_viewer_routes(
         assert client.get("/not-owned-by-viewer").status_code == 404
 
     assert seen == [f"http://127.0.0.1:{settings.viewer_ui_port}/bp/job-a/episode_0"]
+
+
+def test_embedded_viewer_uses_server_cookie_and_never_forwards_it(
+    settings_factory, tmp_path, monkeypatch
+):
+    import httpx
+
+    settings = settings_factory(
+        "server",
+        import_roots=[tmp_path],
+        viewer_gateway={"embedded": True},
+        viewer_origin="http://testserver",
+        user_sessions={
+            "enabled": True,
+            "login_nodes": ["H800-node11"],
+        },
+    )
+    app = create_app(settings, background=False)
+    app.state.viewer.registry.register(
+        "job-a", make_recycle_dataset(tmp_path, "viewer")
+    )
+    monkeypatch.setattr(
+        app.state.user_sessions,
+        "principal",
+        lambda cookie: Principal(username="alice", uid=1001)
+        if cookie == "opaque-user-cookie"
+        else None,
+    )
+    seen = []
+
+    async def upstream(request):
+        seen.append(request)
+        return httpx.Response(200, stream=httpx.ByteStream(b"ok"))
+
+    real_client = httpx.AsyncClient
+    monkeypatch.setattr(
+        "pipeline.server.viewer_gateway.httpx.AsyncClient",
+        lambda **kwargs: real_client(
+            transport=httpx.MockTransport(upstream), **kwargs
+        ),
+    )
+    with TestClient(app) as client:
+        app.state.ingest.store.put("viewer", "service", {"state": "READY"})
+        client.cookies.set("pipeline_server", "opaque-user-cookie")
+        response = client.get("/bp/job-a/episode_0")
+
+    assert response.status_code == 200
+    assert (
+        str(seen[0].url)
+        == f"http://127.0.0.1:{settings.viewer_ui_port}/bp/job-a/episode_0"
+    )
+    assert "cookie" not in seen[0].headers
+    assert "authorization" not in seen[0].headers
+
+
+def test_embedded_viewer_write_requires_same_origin(
+    settings_factory, tmp_path, monkeypatch
+):
+    settings = settings_factory(
+        "server",
+        viewer_gateway={"embedded": True},
+        user_sessions={"enabled": True, "login_nodes": ["H800-node11"]},
+    )
+    app = create_app(settings, background=False)
+    app.state.viewer.registry.register("job-a", make_dataset(tmp_path, "viewer"))
+    monkeypatch.setattr(
+        app.state.user_sessions,
+        "principal",
+        lambda cookie: Principal(username="alice", uid=1001)
+        if cookie == "opaque-user-cookie"
+        else None,
+    )
+    with TestClient(app) as client:
+        client.cookies.set("pipeline_server", "opaque-user-cookie")
+        response = client.post(
+            "/api/episode-scores/job-a",
+            headers={"Origin": "https://untrusted.example"},
+        )
+    assert response.status_code == 403
+
+
+def test_embedded_viewer_proxy_forwards_exact_range_and_head_requests(
+    settings_factory, tmp_path, monkeypatch
+):
+    import httpx
+
+    settings = settings_factory(
+        "server",
+        import_roots=[tmp_path],
+        viewer_gateway={"embedded": True},
+        user_sessions={"enabled": True, "login_nodes": ["H800-node11"]},
+    )
+    app = create_app(settings, background=False)
+    app.state.viewer.registry.register(
+        "job-a", make_recycle_dataset(tmp_path, "viewer")
+    )
+    seen = []
+
+    async def upstream(request):
+        seen.append(request)
+        content = b"2345" if request.method == "GET" else b"ignored"
+        return httpx.Response(
+            206,
+            stream=httpx.ByteStream(content),
+            headers={
+                "Content-Range": "bytes 2-5/10"
+                if request.method == "GET"
+                else "bytes 0-3/4",
+                "Content-Length": "4",
+                "Accept-Ranges": "bytes",
+            },
+        )
+
+    real_client = httpx.AsyncClient
+    monkeypatch.setattr(
+        "pipeline.server.viewer_gateway.httpx.AsyncClient",
+        lambda **kwargs: real_client(
+            transport=httpx.MockTransport(upstream), **kwargs
+        ),
+    )
+    auth = {"Authorization": "Bearer " + settings.token}
+
+    with TestClient(app) as client:
+        app.state.ingest.store.put("viewer", "service", {"state": "READY"})
+        ranged = client.get(
+            "/bp/job-a/video.mp4?download=1",
+            headers={
+                **auth,
+                "Range": "bytes=2-5",
+                "If-Range": '"v1"',
+                "Accept": "video/mp4",
+                "X-Not-Forwarded": "secret",
+            },
+        )
+        headed = client.head(
+            "/_next/static/chunk.js?build=1",
+            headers={
+                **auth,
+                "Range": "bytes=0-3",
+                "Accept": "text/javascript",
+            },
+        )
+
+    assert ranged.status_code == 206
+    assert ranged.content == b"2345"
+    assert ranged.headers["content-range"] == "bytes 2-5/10"
+    assert headed.status_code == 206
+    assert headed.content == b""
+    assert headed.headers["content-range"] == "bytes 0-3/4"
+    assert [(request.method, str(request.url)) for request in seen] == [
+        (
+            "GET",
+            f"http://127.0.0.1:{settings.viewer_ui_port}"
+            "/bp/job-a/video.mp4?download=1",
+        ),
+        (
+            "HEAD",
+            f"http://127.0.0.1:{settings.viewer_ui_port}"
+            "/_next/static/chunk.js?build=1",
+        ),
+    ]
+    assert seen[0].headers["range"] == "bytes=2-5"
+    assert seen[0].headers["if-range"] == '"v1"'
+    assert seen[0].headers["accept"] == "video/mp4"
+    assert seen[1].headers["range"] == "bytes=0-3"
+    assert seen[1].headers["accept"] == "text/javascript"
+    for request in seen:
+        assert "authorization" not in request.headers
+        assert "cookie" not in request.headers
+        assert "x-not-forwarded" not in request.headers
+
+
+def test_embedded_data_routes_keep_ranges_and_server_ownership(
+    settings_factory, tmp_path, monkeypatch
+):
+    import httpx
+
+    settings = settings_factory(
+        "server",
+        viewer_gateway={"embedded": True},
+        user_sessions={"enabled": True, "login_nodes": ["H800-node11"]},
+    )
+    app = create_app(settings, background=False)
+    app.state.viewer.registry.register("job-a", make_dataset(tmp_path, "viewer"))
+    monkeypatch.setattr(
+        app.state.user_sessions,
+        "principal",
+        lambda cookie: Principal(username="alice", uid=1001)
+        if cookie == "opaque-user-cookie"
+        else None,
+    )
+    upstream_calls = []
+
+    async def upstream(request):
+        upstream_calls.append(request)
+        return httpx.Response(200, stream=httpx.ByteStream(b"unexpected"))
+
+    real_client = httpx.AsyncClient
+    monkeypatch.setattr(
+        "pipeline.server.viewer_gateway.httpx.AsyncClient",
+        lambda **kwargs: real_client(
+            transport=httpx.MockTransport(upstream), **kwargs
+        ),
+    )
+
+    media = "/_data/bp/job-a/resolve/main/videos/a.mp4"
+    with TestClient(app) as client:
+        client.cookies.set("pipeline_server", "opaque-user-cookie")
+        full = client.get(media)
+        ranged = client.get(media, headers={"Range": "bytes=2-5"})
+        headed = client.head(media, headers={"Range": "bytes=2-5"})
+        multi = client.get(media, headers={"Range": "bytes=0-1,3-4"})
+        config = client.get("/api/config")
+        asset = client.get("/assets/app.js")
+        root = client.get("/")
+        uploads = client.get("/api/uploads")
+        assert client.get("/unknown-root-path").status_code == 404
+        missing_origin = client.post(media)
+        same_origin = client.post(
+            media, headers={"Origin": "http://testserver"}
+        )
+
+    assert full.status_code == 200
+    assert full.content == b"0123456789"
+    assert ranged.status_code == 206
+    assert ranged.content == b"2345"
+    assert ranged.headers["content-range"] == "bytes 2-5/10"
+    assert headed.status_code == 206
+    assert headed.content == b""
+    assert headed.headers["content-range"] == "bytes 2-5/10"
+    assert multi.status_code == 416
+    assert multi.headers["content-range"] == "bytes */10"
+    assert config.status_code == 200
+    assert config.json()["role"] == "server"
+    assert config.json()["current_user"]["username"] == "alice"
+    assert asset.status_code == 200
+    assert "text/javascript" in asset.headers["content-type"]
+    assert root.status_code == 200
+    assert "text/html" in root.headers["content-type"]
+    assert uploads.status_code == 200
+    assert missing_origin.status_code == 403
+    assert same_origin.status_code == 405
+    assert upstream_calls == []
+
+
+def test_embedded_data_rejects_unknown_and_cross_dataset_escapes(
+    settings_factory, tmp_path
+):
+    settings = settings_factory(
+        "server",
+        viewer_gateway={"embedded": True},
+    )
+    app = create_app(settings, background=False)
+    data = make_dataset(tmp_path, "viewer")
+    other = make_dataset(tmp_path, "other")
+    (tmp_path / "secret.txt").write_text("secret")
+    (data / "link").symlink_to(tmp_path / "secret.txt")
+    (other / "videos/cross.mp4").symlink_to(data / "videos/a.mp4")
+    app.state.viewer.registry.register("job-a", data)
+    app.state.viewer.registry.register("job-b", other)
+    auth = {"Authorization": "Bearer " + settings.token}
+
+    with TestClient(app, headers=auth) as client:
+        paths = (
+            "/_data/bp/job-a/resolve/main/../secret.txt",
+            "/_data/bp/job-a/resolve/main/%2e%2e/secret.txt",
+            "/_data/bp/job-a/resolve/main/link",
+            "/_data/bp/job-b/resolve/main/videos/cross.mp4",
+            "/_data/bp/job-b/resolve/main/%2e%2e/job-a/videos/a.mp4",
+            "/_data/bp/missing/resolve/main/meta/info.json",
+        )
+        responses = {path: client.get(path) for path in paths}
+
+    for path, response in responses.items():
+        assert response.status_code == 404, path
+
+
+def test_embedded_viewer_serves_startup_page_without_proxy(
+    settings_factory, tmp_path, monkeypatch
+):
+    import httpx
+
+    settings = settings_factory(
+        "server",
+        viewer_gateway={"embedded": True},
+        user_sessions={"enabled": True, "login_nodes": ["H800-node11"]},
+    )
+    app = create_app(settings, background=False)
+    app.state.viewer.registry.register("job-a", make_dataset(tmp_path, "viewer"))
+    monkeypatch.setattr(
+        app.state.user_sessions,
+        "principal",
+        lambda cookie: Principal(username="alice", uid=1001)
+        if cookie == "opaque-user-cookie"
+        else None,
+    )
+    upstream_calls = []
+
+    async def upstream(request):
+        upstream_calls.append(request)
+        return httpx.Response(200, stream=httpx.ByteStream(b"unexpected"))
+
+    real_client = httpx.AsyncClient
+    monkeypatch.setattr(
+        "pipeline.server.viewer_gateway.httpx.AsyncClient",
+        lambda **kwargs: real_client(
+            transport=httpx.MockTransport(upstream), **kwargs
+        ),
+    )
+    with TestClient(app) as client:
+        client.cookies.set("pipeline_server", "opaque-user-cookie")
+        page = client.get(
+            "/bp/job-a/episode_0", headers={"Accept": "text/html"}
+        )
+        data = client.get("/bp/job-a/episode_0")
+
+    assert page.status_code == 200
+    assert "正在启动 LeRobot Visualizer" in page.text
+    assert data.status_code == 503
+    assert upstream_calls == []
 
 
 def test_server_viewer_transport_is_opt_in(settings_factory):

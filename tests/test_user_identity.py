@@ -222,6 +222,7 @@ def test_bearer_identity_takes_precedence_over_user_cookie(
 ):
     settings = settings_factory(
         "server",
+        viewer_gateway={"embedded": True},
         user_sessions={
             "enabled": True,
             "login_nodes": ["H800-node11"],
@@ -254,6 +255,16 @@ def test_bearer_identity_takes_precedence_over_user_cookie(
             },
         )
         assert login.status_code == 200
+
+        cookie_config = http.get("/api/config")
+        assert cookie_config.status_code == 200
+        assert cookie_config.json()["current_user"]["username"] == "alice"
+        assert "execution_id" not in cookie_config.json()["current_user"]
+        assert "user-execution" not in cookie_config.text
+        assert (
+            cookie_config.json()["current_user"]["auth_method"]
+            == "h800-ssh"
+        )
 
         config = http.get(
             "/api/config",
