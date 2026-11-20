@@ -759,7 +759,9 @@ def create_app(settings, background=True):
             )
 
         @app.post("/api/manual-trims/{dataset_id}", status_code=202)
-        def embedded_manual_trim_start(dataset_id: str, body: ManualTrimRequest):
+        def embedded_manual_trim_start(
+            dataset_id: str, body: ManualTrimRequest, request: Request
+        ):
             row = registered_preview(viewer_transport, dataset_id)
             job = trims.enqueue_manual(
                 row["job_id"],
@@ -768,6 +770,7 @@ def create_app(settings, background=True):
                 name=body.name,
                 run_doctor=body.run_doctor,
                 in_place=body.in_place,
+                principal=principal(request),
             )
             return embedded_json(job_response(job), status_code=202)
 
@@ -893,7 +896,10 @@ def create_app(settings, background=True):
         )
 
     @app.post("/api/jobs/{jid}/manual-trims", status_code=202)
-    def manual_trim_start(jid: str, body: ManualTrimRequest):
+    def manual_trim_start(
+        jid: str, body: ManualTrimRequest, request: Request
+    ):
+        accessible_job(jid, request, action="裁剪")
         return job_response(
             trims.enqueue_manual(
                 jid,
@@ -902,6 +908,7 @@ def create_app(settings, background=True):
                 name=body.name,
                 run_doctor=body.run_doctor,
                 in_place=body.in_place,
+                principal=principal(request),
             )
         )
 

@@ -512,3 +512,4 @@ def test_active_instruction_apply_blocks_manual_trim_enqueue(instruction_app):
     )
     assert response.status_code == 202, response.text
     assert response.json()["operation"] == "manual_trim"
+    assert response.json()["submitted_as"] == "service-account"

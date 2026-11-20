@@ -24,6 +24,7 @@ from pipeline.server.stationary_trim import (
     summarize,
 )
 from pipeline.shared.core import DomainError, digest
+from pipeline.shared.identity import Principal
 
 SCENARIO = Path(__file__).parent / "fixtures/trim_scenario.py"
 
@@ -85,6 +86,199 @@ def seed(app, jid="source", *, path=None, **updates):
     }
     app.state.ingest.store.put("job", jid, job)
     return job, path
+
+
+def test_manual_trim_persists_submitting_user_and_redacts_handle(
+    settings_factory, monkeypatch
+):
+    settings = settings_factory("server", letools_bin=sys.executable)
+    app = create_app(settings, background=False)
+    seed(app)
+    captured = []
+
+    monkeypatch.setattr(
+        app.state.runner,
+        "require_principal_path_access",
+        lambda principal, path, writable: captured.append(
+            (principal.username, path, writable)
+        ),
+    )
+    principal = Principal(
+        username="alice",
+        uid=1001,
+        login_node="H800-node11",
+        execution_id="execution-a",
+        auth_method="h800-ssh",
+    )
+    job = app.state.trims.enqueue_manual(
+        "source",
+        0,
+        [[1, 2]],
+        principal=principal,
+    )
+    stored = app.state.runner.store.get("job", job["id"])
+
+    assert captured[0][0] == "alice"
+    assert str(captured[0][1]) == stored["source_path"]
+    assert captured[0][2] is True
+    assert stored["owner_user_id"] == "alice"
+    assert stored["owner_uid"] == 1001
+    assert stored["submitted_as"] == "alice"
+    assert stored["slurm_user"] == "alice"
+    assert stored["slurm_execution_id"] == "execution-a"
+    assert stored["submission_auth"] == "h800-ssh"
+
+
+def test_manual_trim_preflight_rejection_does_not_enqueue(
+    settings_factory, monkeypatch
+):
+    settings = settings_factory("server", letools_bin=sys.executable)
+    app = create_app(settings, background=False)
+    seed(app)
+    principal = Principal(
+        username="alice",
+        uid=1001,
+        login_node="H800-node11",
+        execution_id="execution-a",
+        auth_method="h800-ssh",
+    )
+
+    def deny(_principal, _path, writable):
+        assert writable is True
+        raise DomainError("H800 用户 alice 无权访问数据集路径", 403)
+
+    monkeypatch.setattr(app.state.runner, "require_principal_path_access", deny)
+    with pytest.raises(DomainError, match="无权访问"):
+        app.state.trims.enqueue_manual(
+            "source",
+            0,
+            [[1, 2]],
+            principal=principal,
+        )
+
+    assert not any(
+        row.get("operation") == "manual_trim"
+        for row in app.state.runner.store.all("job")
+    )
+
+
+def test_manual_trim_dedup_is_per_submitter(settings_factory, monkeypatch):
+    settings = settings_factory("server", letools_bin=sys.executable)
+    app = create_app(settings, background=False)
+    seed(app)
+    monkeypatch.setattr(
+        app.state.runner,
+        "require_principal_path_access",
+        lambda principal, path, writable: None,
+    )
+    alice = Principal(
+        username="alice",
+        uid=1001,
+        login_node="H800-node11",
+        execution_id="execution-a",
+        auth_method="h800-ssh",
+    )
+    bob = Principal(
+        username="bob",
+        uid=1002,
+        login_node="H800-node11",
+        execution_id="execution-b",
+        auth_method="h800-ssh",
+    )
+
+    first = app.state.trims.enqueue_manual(
+        "source", 0, [[1, 2]], principal=alice
+    )
+    same = app.state.trims.enqueue_manual(
+        "source", 0, [[1, 2]], principal=alice
+    )
+    other = app.state.trims.enqueue_manual(
+        "source", 0, [[1, 2]], principal=bob
+    )
+    service = app.state.trims.enqueue_manual(
+        "source",
+        0,
+        [[1, 2]],
+        principal=Principal(
+            username="admin-a",
+            auth_method="service-token",
+            is_admin=True,
+        ),
+    )
+    same_service = app.state.trims.enqueue_manual(
+        "source",
+        0,
+        [[1, 2]],
+        principal=Principal(
+            username="admin-b",
+            auth_method="service-token",
+            is_admin=True,
+        ),
+    )
+
+    assert same["id"] == first["id"]
+    assert other["id"] != first["id"]
+    assert same_service["id"] == service["id"]
+    assert service["submitted_as"] == "service-account"
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "/api/jobs/source/manual-trims",
+        "/api/manual-trims/source",
+    ],
+)
+def test_manual_trim_routes_queue_as_authenticated_principal(
+    settings_factory, monkeypatch, path
+):
+    settings = settings_factory(
+        "server",
+        letools_bin=sys.executable,
+        viewer_gateway={"embedded": True},
+        viewer_origin="http://testserver",
+        user_sessions={
+            "enabled": True,
+            "login_nodes": ["H800-node11"],
+        },
+    )
+    app = create_app(settings, background=False)
+    _, source_path = seed(app)
+    app.state.viewer.registry.register("source", source_path)
+    principal = Principal(
+        username="alice",
+        uid=1001,
+        login_node="H800-node11",
+        execution_id="execution-a",
+        auth_method="h800-ssh",
+    )
+    monkeypatch.setattr(
+        app.state.user_sessions,
+        "principal",
+        lambda cookie: principal
+        if cookie == "opaque-user-cookie"
+        else None,
+    )
+    monkeypatch.setattr(
+        app.state.runner,
+        "require_principal_path_access",
+        lambda principal, path, writable: None,
+    )
+
+    with TestClient(app) as client:
+        client.cookies.set("pipeline_server", "opaque-user-cookie")
+        response = client.post(
+            path,
+            headers={"Origin": "http://testserver"},
+            json={"episode_index": 0, "remove_ranges": [[1, 2]]},
+        )
+
+    assert response.status_code == 202, response.text
+    body = response.json()
+    stored = app.state.runner.store.get("job", body["id"])
+    assert body["submitted_as"] == "alice"
+    assert "slurm_execution_id" not in body
+    assert stored["slurm_execution_id"] == "execution-a"
 
 
 def completed_preview(app, preview_id, episodes=None):
@@ -363,6 +557,8 @@ def test_embedded_server_owns_gateway_only_apis(settings_factory, monkeypatch):
         assert trim.status_code == 202, trim.text
         job = trim.json()
         assert job["operation"] == "manual_trim"
+        assert job["submitted_as"] == "service-account"
+        assert "slurm_execution_id" not in job
         assert job["manual_episode"] == 0
         assert job["manual_removed_ranges"] == [[1, 2]]
         assert job["run_doctor"] is False

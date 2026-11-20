@@ -855,6 +855,8 @@ class TrimRunner:
         name: str | None = None,
         run_doctor: bool = False,
         in_place: bool = True,
+        *,
+        principal: Principal | None = None,
     ) -> dict:
         """Create a manual range-trim job for one episode of a ready dataset.
 
@@ -874,6 +876,8 @@ class TrimRunner:
         ):
             raise DomainError("episode_index 必须是非负整数", 400)
         ranges = self._manual_ranges(remove_ranges)
+        metadata = self.runner.submission_metadata(principal)
+        submitter = metadata["submitted_as"]
         initial_job = self.store.get("job", source_job_id)
         initial_path = dataset_for_job(self.settings, initial_job).resolve()
         with self.lock, dataset_lock(self.store, self._key(initial_path)):
@@ -907,6 +911,11 @@ class TrimRunner:
                 output_name = dataset_name(source_name)
             else:
                 output_name = dataset_name(f"{str(source_name)[:1980]}{MANUAL_SUFFIX}")
+            self.runner.require_principal_path_access(
+                principal,
+                source_path,
+                writable=in_place,
+            )
             key = "manual-trim:" + digest(
                 {
                     "source_job_id": source_job_id,
@@ -917,6 +926,7 @@ class TrimRunner:
                     "run_doctor": run_doctor,
                     "in_place": in_place,
                     "letools": self.settings.letools_bin,
+                    "submitted_by": submitter,
                 }
             )
             for row in self.store.all("job"):
@@ -956,6 +966,7 @@ class TrimRunner:
                 "source_count": described["episode_count"],
                 "episode_count": described["episode_count"],
                 "frame_count": max(0, int(described["frame_count"]) - removed),
+                **metadata,
             }
             for field in ("runtime_id", "provider", "profile", "profile_hash"):
                 if source_job.get(field) is not None:
