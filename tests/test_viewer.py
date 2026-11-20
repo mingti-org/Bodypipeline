@@ -157,7 +157,7 @@ def test_gateway_proxies_ui_when_service_ready(settings_factory, monkeypatch):
 
     real_client = httpx.AsyncClient
     monkeypatch.setattr(
-        "pipeline.server.viewer.httpx.AsyncClient",
+        "pipeline.server.viewer_gateway.httpx.AsyncClient",
         lambda **kwargs: real_client(transport=httpx.MockTransport(upstream), **kwargs),
     )
     with TestClient(create_gateway(s)) as browser:
@@ -180,6 +180,43 @@ def test_gateway_proxies_ui_when_service_ready(settings_factory, monkeypatch):
         )
         assert "cookie" not in seen[-1].headers
         assert "authorization" not in seen[-1].headers
+        asset = browser.get("/_next/static/chunk.js")
+        assert asset.status_code == 200 and asset.content == b"<html>ui</html>"
+        assert (
+            str(seen[-1].url)
+            == f"http://127.0.0.1:{s.viewer_ui_port}/_next/static/chunk.js"
+        )
+        assert "cookie" not in seen[-1].headers
+        assert "authorization" not in seen[-1].headers
+
+
+def test_standalone_gateway_does_not_proxy_unowned_paths(
+    settings_factory, monkeypatch
+):
+    import httpx
+
+    settings = settings_factory("viewer")
+    store = Store(settings.root / "state")
+    store.put("viewer", "service", {"state": "READY"})
+    calls = []
+
+    async def upstream(request):
+        calls.append(request.url.path)
+        return httpx.Response(200, text="must not be called")
+
+    real_client = httpx.AsyncClient
+    monkeypatch.setattr(
+        "pipeline.server.viewer_gateway.httpx.AsyncClient",
+        lambda **kwargs: real_client(
+            transport=httpx.MockTransport(upstream), **kwargs
+        ),
+    )
+    with TestClient(create_gateway(settings)) as client:
+        client.post("/api/login", json={"token": settings.token})
+        response = client.get("/not-a-viewer-route")
+
+    assert response.status_code == 404
+    assert calls == []
 
 
 def test_root_redirects_to_latest_preview(settings_factory, tmp_path):
@@ -240,9 +277,9 @@ def test_doctor_is_computed_per_dataset_and_rendered_light(
         calls.append(command)
         return Result(command[3])
 
-    monkeypatch.setattr("pipeline.server.viewer.subprocess.run", fake_run)
+    monkeypatch.setattr("pipeline.server.viewer_gateway.subprocess.run", fake_run)
     monkeypatch.setattr(
-        "pipeline.server.viewer.executable_path", lambda value: "/bin/letools"
+        "pipeline.server.viewer_gateway.executable_path", lambda value: "/bin/letools"
     )
     with TestClient(create_gateway(s)) as browser:
         browser.post("/api/login", json={"token": s.token})
