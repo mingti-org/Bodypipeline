@@ -28,13 +28,16 @@ class VariableDefinition(BaseModel):
     model_config = ConfigDict(extra="forbid")
     label: str = Field(min_length=1, max_length=80)
     options: list[str] = Field(min_length=1, max_length=5000)
-    default: str | None = Field(default=None, max_length=200)
+    default: str | None = Field(default=None, max_length=MAX_RENDERED_LENGTH)
 
     @model_validator(mode="after")
     def validate_options(self):
         self.options = [option.strip() for option in self.options]
-        if any(not option or len(option) > 200 for option in self.options):
-            raise ValueError("候选值必须为 1–200 个字符")
+        if any(
+            not option or len(option) > MAX_RENDERED_LENGTH
+            for option in self.options
+        ):
+            raise ValueError(f"候选值必须为 1–{MAX_RENDERED_LENGTH} 个字符")
         if len(set(self.options)) != len(self.options):
             raise ValueError("同一变量的候选值不能重复")
         if self.default is not None:

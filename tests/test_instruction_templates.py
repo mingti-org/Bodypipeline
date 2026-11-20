@@ -43,6 +43,22 @@ def test_template_is_normalized_and_rendered_from_selected_options():
     assert render_instruction(normalized, {}) == "请将红色方块放入左侧盒子中"
 
 
+def test_instruction_option_can_use_the_rendered_length_limit():
+    instruction = "a" * 2000
+    value = {
+        "parts": [{"type": "variable", "key": "instruction"}],
+        "variables": {
+            "instruction": {
+                "label": "指令",
+                "options": [instruction],
+                "default": instruction,
+            }
+        },
+    }
+
+    assert render_instruction(normalize_template(value), {}) == instruction
+
+
 def test_source_syntax_round_trips_into_structured_parts():
     parsed = parse_template_source(
         "请将{{object}}放入{{target}}中",
