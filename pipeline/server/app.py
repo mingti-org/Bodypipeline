@@ -48,6 +48,7 @@ from .subtask_review import DraftRequest, RevisionExportRequest, SubtaskReview
 from .task_annotations import TemplateLibrary, TemplateRequest
 from .user_sessions import SlurmIdentityBroker
 from .viewer import ViewerManager
+from .viewer_gateway import ManualTrimRequest
 
 # Fields only the per-job detail view needs. They are the bulk of the listing
 # response and are re-fetched from /api/jobs/{id} when a job is opened.
@@ -191,17 +192,6 @@ class TrimRequest(BaseModel):
     preview_id: str = Field(min_length=1, max_length=128)
     name: str | None = Field(default=None, min_length=1, max_length=2000)
     run_doctor: StrictBool = True
-
-
-class ManualTrimRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-    episode_index: StrictInt = Field(ge=0)
-    remove_ranges: list[tuple[StrictInt, StrictInt]] = Field(
-        min_length=1, max_length=100
-    )
-    name: str | None = Field(default=None, min_length=1, max_length=2000)
-    run_doctor: StrictBool = False
-    in_place: StrictBool = True
 
 
 class DatasetDeletionRequest(BaseModel):

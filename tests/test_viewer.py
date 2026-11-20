@@ -2,12 +2,14 @@ import json
 import time
 
 import pytest
+from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from pipeline.server.app import create_app
 from pipeline.server.viewer import ViewerManager, create_gateway
 from pipeline.server.viewer_bootstrap import UPSTREAM, patch_cache
 from pipeline.server.viewer_data import PreviewRegistry, repo_id_for
+from pipeline.server.viewer_gateway import ViewerTransport
 from pipeline.shared.core import DomainError, Store
 
 
@@ -17,6 +19,21 @@ def make_dataset(root, name="ds"):
     (data / "meta/info.json").write_text(json.dumps({"fps": 30}))
     (data / "videos").mkdir()
     (data / "videos/a.mp4").write_bytes(b"0123456789")
+    return data
+
+
+def make_recycle_dataset(root, name="recycle"):
+    data = make_dataset(root, name)
+    (data / "meta/info.json").write_text(
+        json.dumps(
+            {
+                "codebase_version": "v3.0",
+                "total_episodes": 3,
+                "total_frames": 30,
+                "fps": 30,
+            }
+        )
+    )
     return data
 
 
@@ -238,6 +255,52 @@ def test_root_redirects_to_latest_preview(settings_factory, tmp_path):
         root = browser.get("/", follow_redirects=False)
         assert root.status_code == 307
         assert root.headers["location"] == "/bp/job-b/episode_0"
+
+
+def test_transport_registers_root_only_when_standalone(
+    settings_factory, tmp_path
+):
+    settings = settings_factory("viewer")
+    store = Store(settings.root / "state")
+    registry = PreviewRegistry(store, ttl=300)
+    registry.register("job-a", make_dataset(tmp_path))
+    embedded_app = FastAPI()
+    standalone_app = FastAPI()
+    transport = ViewerTransport(settings, store, registry)
+    try:
+        transport.register(embedded_app, embedded=True)
+        transport.register(standalone_app, embedded=False)
+        with TestClient(embedded_app) as browser:
+            assert browser.get("/").status_code == 404
+        with TestClient(standalone_app) as browser:
+            root = browser.get("/", follow_redirects=False)
+            assert root.status_code == 307
+            assert root.headers["location"] == "/bp/job-a/episode_0"
+    finally:
+        transport.close()
+
+
+def test_gateway_recycle_routes_redirect_and_render_page(
+    settings_factory, tmp_path
+):
+    settings = settings_factory("viewer", import_roots=[tmp_path])
+    store = Store(settings.root / "state")
+    registry = PreviewRegistry(store, ttl=300)
+    registry.register("job-a", make_recycle_dataset(tmp_path))
+    store.put("viewer", "service", {"state": "READY"})
+    app = create_gateway(settings)
+    app.state.viewer_transport.recycle.change("bp/job-a", "trash", [1], 0)
+    with TestClient(app) as client:
+        client.post("/api/login", json={"token": settings.token})
+        redirect = client.get(
+            "/bp/job-a/episode_1", follow_redirects=False
+        )
+        assert redirect.status_code == 303
+        assert redirect.headers["location"] == "/bp/job-a/trash"
+        page = client.get("/bp/job-a/trash")
+        assert page.status_code == 200
+        assert "Episode 回收站" in page.text
+        assert "永久清理所选" in page.text
 
 
 def test_doctor_is_computed_per_dataset_and_rendered_light(
