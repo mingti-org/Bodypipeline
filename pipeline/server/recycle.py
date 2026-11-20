@@ -162,9 +162,7 @@ class RecycleBin:
                     and op["id"].encode() in command
                 ):
                     return row
-            except ProcessLookupError:
-                pass
-            except FileNotFoundError:
+            except (ProcessLookupError, PermissionError, FileNotFoundError):
                 pass
         # The worker journal and the marker inside the published dataset resolve
         # a crash on either side of the atomic directory exchange.

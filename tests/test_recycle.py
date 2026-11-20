@@ -199,6 +199,49 @@ def test_cleanup_recovery_records_each_mapping_once(settings_factory, tmp_path):
     assert [item["id"] for item in row["cleanup_history"]] == ["first", "second"]
 
 
+def test_cleanup_status_recovers_when_worker_pid_belongs_to_another_user(
+    settings_factory, tmp_path, monkeypatch
+):
+    from pipeline.server.recycle_worker import MARKER
+
+    _, store, _, recycle = setup_bin(settings_factory, tmp_path)
+    key, path = recycle.resolve("bp/example")
+    row = recycle._load(key, path)
+    row["entries"] = {
+        "1": {"episode": 1, "deleted_at": 1},
+    }
+    row["revision"] = 2
+    row["operation"] = {
+        "id": "published",
+        "state": "running",
+        "pid": 4242,
+        "entries_before": row["entries"].copy(),
+    }
+    store.put("recycle", key, row)
+    (path / MARKER).write_text(
+        json.dumps(
+            {
+                "operation": "published",
+                "mapping": {"0": 0, "2": 1},
+                "total_episodes": 2,
+                "deleted_frames": 6,
+            }
+        )
+    )
+
+    def inaccessible_pid(_pid, _signal):
+        raise PermissionError(1, "Operation not permitted")
+
+    monkeypatch.setattr("pipeline.server.recycle.os.kill", inaccessible_pid)
+
+    result = recycle.status("bp/example")
+
+    assert result["entries"] == []
+    assert result["operation"]["state"] == "completed"
+    assert result["operation"]["mapping"] == {"0": 0, "2": 1}
+    assert result["cleanup_generation"] == 1
+
+
 def test_legacy_replaced_dataset_without_completed_operation_is_not_original(
     settings_factory, tmp_path
 ):
