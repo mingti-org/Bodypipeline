@@ -161,18 +161,18 @@ class InstructionApplyRunner:
                 continue
             if job.get("state") not in {"QUEUED", "RUNNING"}:
                 continue
-            raw = job.get("dataset_path")
-            if not raw:
-                continue
-            try:
-                candidate = Path(raw).resolve()
-            except OSError:
-                continue
-            if candidate == target:
-                raise DomainError(
-                    "该数据集仍有运行中的工作台任务，请等待任务完成后再应用语言指令",
-                    409,
-                )
+            for raw in (job.get("dataset_path"), job.get("source_path")):
+                if not raw:
+                    continue
+                try:
+                    candidate = Path(raw).resolve()
+                except OSError:
+                    continue
+                if candidate == target:
+                    raise DomainError(
+                        "该数据集仍有运行中的工作台任务，请等待任务完成后再应用语言指令",
+                        409,
+                    )
 
     def enqueue(self, dataset_id, body, episode_indices: set[int] | None = None):
         key, path, _ = self.review.resolve(dataset_id)

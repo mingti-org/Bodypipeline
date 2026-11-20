@@ -872,9 +872,13 @@ class TrimRunner:
         ):
             raise DomainError("episode_index 必须是非负整数", 400)
         ranges = self._manual_ranges(remove_ranges)
-        self._tool()
-        with self.lock:
+        initial_job = self.store.get("job", source_job_id)
+        initial_path = dataset_for_job(self.settings, initial_job).resolve()
+        with self.lock, dataset_lock(self.store, self._key(initial_path)):
             source_job = self.store.get("job", source_job_id)
+            source_path = dataset_for_job(self.settings, source_job).resolve()
+            self._instruction_apply_blocker(source_path)
+            self._tool()
             described = self._describe(source_job)
             if episode_index >= int(described["episode_count"]):
                 raise DomainError("Episode 序号超出来源数据集范围", 400)
@@ -961,6 +965,24 @@ class TrimRunner:
                 raise DomainError("裁剪输出不能位于来源数据集内", 400)
             self.store.put("job", job["id"], job)
             return job
+
+    def _instruction_apply_blocker(self, source_path: Path) -> None:
+        target = source_path.resolve()
+        for row in self.store.all("instruction_apply"):
+            if row.get("state") not in ACTIVE:
+                continue
+            raw = row.get("dataset_path")
+            if not raw:
+                continue
+            try:
+                candidate = Path(raw).resolve()
+            except OSError:
+                continue
+            if candidate == target:
+                raise DomainError(
+                    "该数据集正在应用语言指令，请等待任务完成后再裁剪",
+                    409,
+                )
 
     # ------------------------------------------------------------------ enqueue
     def enqueue(

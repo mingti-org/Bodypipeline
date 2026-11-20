@@ -1,6 +1,7 @@
 """Server drafts for structured per-Episode language instructions."""
 
 import json
+import sys
 import threading
 from concurrent.futures import ThreadPoolExecutor
 
@@ -9,6 +10,7 @@ from fastapi.testclient import TestClient
 
 from pipeline.server.app import create_app
 from pipeline.server.instruction_review import InstructionReview
+from pipeline.server.merges import source_snapshot
 from pipeline.server.recycle import dataset_lock
 from pipeline.server.viewer_data import PreviewRegistry
 
@@ -51,6 +53,14 @@ def instruction_app(settings_factory, monkeypatch):
                 "total_episodes": 2,
                 "total_frames": 11,
                 "robot_type": "test_arm",
+                "features": {
+                    "observation.state": {
+                        "dtype": "float32",
+                        "shape": [2],
+                        "names": ["joint0", "joint1"],
+                        "units": ["rad", "normalized"],
+                    }
+                },
             }
         )
     )
@@ -178,6 +188,120 @@ def test_template_changes_report_removed_values_without_destroying_assignments(i
     assert episode["selections"]["object"] == "蓝色圆柱"
     assert episode["valid"] is False
     assert "已移除选项" in episode["error"]
+
+
+def test_in_place_manual_trim_rebases_saved_instruction_draft(instruction_app):
+    runner = instruction_app.state.runner
+    client = client_for(instruction_app)
+    path = runner.settings.root / "source"
+    head = client.get("/api/instructions/source").json()
+    head = client.put(
+        "/api/instructions/source/template",
+        json={**versioned(head), "template": instruction_template()},
+    ).json()
+    head = client.put(
+        "/api/instructions/source/episodes/0",
+        json={
+            **versioned(head),
+            "selections": {
+                "object": "蓝色圆柱",
+                "target": "右侧盒子",
+            },
+        },
+    ).json()
+
+    trim_id = "trim-in-place"
+    (path / "meta/bodypipeline-manual-trim.json").write_text(
+        json.dumps({"job_id": trim_id})
+    )
+    published = source_snapshot(path)
+    source = runner.store.get("job", "source")
+    source.update(
+        published_dataset_snapshot=published,
+        manual_trim_history=[
+            {
+                "job_id": trim_id,
+                "episode_index": 0,
+                "frames_kept": 5,
+                "at": 2,
+            }
+        ],
+    )
+    runner.store.put("job", "source", source)
+
+    loaded = client.get("/api/instructions/source")
+    assert loaded.status_code == 200, loaded.text
+    loaded = loaded.json()
+    assert loaded["revision"] == head["revision"] + 1
+    assert loaded["source_signature"] == published["signature"]
+    assert loaded["template"] == instruction_template()
+    episode = client.get("/api/instructions/source/episodes/0").json()
+    assert episode["selections"] == {
+        "object": "蓝色圆柱",
+        "target": "右侧盒子",
+    }
+    revisions = runner.store.all("instruction_revision")
+    assert any(
+        row["revision"] == head["revision"]
+        and row["source_signature"] == head["source_signature"]
+        for row in revisions
+    )
+    assert any(
+        row["revision"] == loaded["revision"]
+        and row["source_signature"] == published["signature"]
+        for row in revisions
+    )
+
+
+def test_chained_manual_trims_rebase_the_latest_instruction_revision(instruction_app):
+    runner = instruction_app.state.runner
+    client = client_for(instruction_app)
+    path = runner.settings.root / "source"
+    head = client.get("/api/instructions/source").json()
+    head = client.put(
+        "/api/instructions/source/template",
+        json={**versioned(head), "template": instruction_template()},
+    ).json()
+    head = client.put(
+        "/api/instructions/source/episodes/1",
+        json={
+            **versioned(head),
+            "selections": {
+                "object": "红色方块",
+                "target": "左侧盒子",
+            },
+        },
+    ).json()
+
+    source = runner.store.get("job", "source")
+    history = []
+    for index in range(2):
+        (path / f"meta/manual-trim-{index}.json").write_text("{}")
+        published = source_snapshot(path)
+        history.append(
+            {
+                "job_id": f"trim-{index}",
+                "episode_index": index,
+                "frames_kept": 5 - index,
+                "at": index + 2,
+            }
+        )
+        source.update(
+            published_dataset_snapshot=published,
+            manual_trim_history=history,
+        )
+        runner.store.put("job", "source", source)
+        loaded = client.get("/api/instructions/source")
+        assert loaded.status_code == 200, loaded.text
+        head = loaded.json()
+        assert head["source_signature"] == published["signature"]
+
+    episode = client.get("/api/instructions/source/episodes/1").json()
+    assert episode["selections"] == {
+        "object": "红色方块",
+        "target": "左侧盒子",
+    }
+    assert head["revision"] == 4
 
 
 def test_stale_drafts_source_changes_and_locks_are_rejected(instruction_app):
@@ -319,6 +443,23 @@ def test_active_dataset_job_blocks_apply_and_restart_requeues_running_apply(
     assert "运行中的工作台任务" in blocked.json()["detail"]
     runner.store.delete("job", "busy-work")
 
+    runner.store.put(
+        "job",
+        "busy-trim",
+        {
+            "id": "busy-trim",
+            "state": "RUNNING",
+            "operation": "manual_trim",
+            "in_place": True,
+            "source_path": str(runner.settings.root / "source"),
+            "created_at": 2,
+        },
+    )
+    blocked = client.post("/api/instructions/source/apply", json=request)
+    assert blocked.status_code == 409
+    assert "运行中的工作台任务" in blocked.json()["detail"]
+    runner.store.delete("job", "busy-trim")
+
     queued = client.post("/api/instructions/source/apply", json=request).json()
     running = runner.store.get("instruction_apply", queued["id"])
     running.update(state="RUNNING", stage="写入中")
@@ -327,3 +468,47 @@ def test_active_dataset_job_blocks_apply_and_restart_requeues_running_apply(
     recovered = runner.store.get("instruction_apply", queued["id"])
     assert recovered["state"] == "QUEUED"
     assert "恢复中断任务" in recovered["stage"]
+
+
+def test_active_instruction_apply_blocks_manual_trim_enqueue(instruction_app):
+    runner = instruction_app.state.runner
+    client = client_for(instruction_app)
+    head = client.get("/api/instructions/source").json()
+    head = client.put(
+        "/api/instructions/source/template",
+        json={**versioned(head), "template": instruction_template()},
+    ).json()
+    head = client.put(
+        "/api/instructions/source/episodes/0",
+        json={
+            **versioned(head),
+            "selections": {
+                "object": "红色方块",
+                "target": "左侧盒子",
+            },
+        },
+    ).json()
+    queued = client.post("/api/instructions/source/apply", json=versioned(head))
+    assert queued.status_code == 202, queued.text
+
+    response = client.post(
+        "/api/jobs/source/manual-trims",
+        json={"episode_index": 0, "remove_ranges": [[1, 2]]},
+    )
+    assert response.status_code == 409
+    assert "语言指令" in response.json()["detail"]
+    assert not any(
+        row.get("operation") == "manual_trim"
+        for row in runner.store.all("job")
+    )
+
+    apply_row = runner.store.get("instruction_apply", queued.json()["id"])
+    apply_row.update(state="CONVERTED")
+    runner.store.put("instruction_apply", apply_row["id"], apply_row)
+    runner.settings.letools_bin = sys.executable
+    response = client.post(
+        "/api/jobs/source/manual-trims",
+        json={"episode_index": 0, "remove_ranges": [[1, 2]]},
+    )
+    assert response.status_code == 202, response.text
+    assert response.json()["operation"] == "manual_trim"

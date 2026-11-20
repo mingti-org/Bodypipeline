@@ -115,7 +115,44 @@ class InstructionReview:
             }
         )
 
-    def _draft(self, key, path, snapshot, data):
+    @staticmethod
+    def _snapshot_matches(left, right):
+        return (
+            left.get("signature") == right.get("signature")
+            and left.get("bytes") == right.get("bytes")
+        )
+
+    def _rebase_manual_trim(self, row, path, job, snapshot):
+        """Carry a saved draft across a BodyPipeline-owned in-place publication."""
+
+        published = job.get("published_dataset_snapshot") or {}
+        history = job.get("manual_trim_history")
+        if (
+            not isinstance(history, list)
+            or not history
+            or not self._snapshot_matches(snapshot, published)
+        ):
+            return None
+        latest = history[-1]
+        if not isinstance(latest, dict) or not latest.get("job_id"):
+            return None
+        old_signature = row["source_signature"]
+        row.update(
+            dataset_path=str(path),
+            source_signature=snapshot["signature"],
+            revision=row["revision"] + 1,
+            updated_at=now(),
+            last_manual_trim_rebase={
+                "job_id": latest["job_id"],
+                "old_source_signature": old_signature,
+                "source_signature": snapshot["signature"],
+                "at": now(),
+            },
+        )
+        self._publish(row)
+        return row
+
+    def _draft(self, key, path, snapshot, data, job=None):
         try:
             row = self.store.get("instruction_draft", key)
         except DomainError as exc:
@@ -130,6 +167,10 @@ class InstructionReview:
                 "episodes": {},
             }
         if row.get("source_signature") != snapshot["signature"]:
+            if job is not None:
+                rebased = self._rebase_manual_trim(row, path, job, snapshot)
+                if rebased is not None:
+                    return rebased
             raise DomainError(
                 "来源数据已变化，指令草稿不能自动套用；请先核对来源与历史草稿",
                 409,
@@ -187,22 +228,22 @@ class InstructionReview:
         }
 
     def dataset(self, dataset_id):
-        key, path, _ = self.resolve(dataset_id)
+        key, path, job = self.resolve(dataset_id)
         with dataset_read_lock(self.store, key):
-            self.resolve(dataset_id)
+            key, path, job = self.resolve(dataset_id)
             snapshot = source_snapshot(path)
             data = self._source(path, snapshot)
-            row = self._draft(key, path, snapshot, data)
+            row = self._draft(key, path, snapshot, data, job)
             return self._summary(dataset_id, key, path, snapshot, data, row)
 
     def episode(self, dataset_id, episode):
-        key, path, _ = self.resolve(dataset_id)
+        key, path, job = self.resolve(dataset_id)
         with dataset_read_lock(self.store, key):
-            self.resolve(dataset_id)
+            key, path, job = self.resolve(dataset_id)
             snapshot = source_snapshot(path)
             data = self._source(path, snapshot)
             source_episode = self._episode(data, episode)
-            row = self._draft(key, path, snapshot, data)
+            row = self._draft(key, path, snapshot, data, job)
             has_draft = str(episode) in row["episodes"]
             selections = row["episodes"].get(str(episode))
             if selections is None:
@@ -231,16 +272,16 @@ class InstructionReview:
             }
 
     def save_template(self, dataset_id, body: TemplateSaveRequest):
-        key, path, _ = self.resolve(dataset_id)
+        key, path, job = self.resolve(dataset_id)
         try:
             template = normalize_template(body.template)
         except ValueError as exc:
             raise DomainError(str(exc), 422) from exc
         with dataset_lock(self.store, key):
-            self.resolve(dataset_id)
+            key, path, job = self.resolve(dataset_id)
             snapshot = source_snapshot(path)
             data = self._source(path, snapshot)
-            row = self._draft(key, path, snapshot, data)
+            row = self._draft(key, path, snapshot, data, job)
             self._check(row, body)
             row["template"] = template
             row.update(revision=row["revision"] + 1, updated_at=now())
@@ -254,13 +295,13 @@ class InstructionReview:
             }
 
     def save_episode(self, dataset_id, episode, body: EpisodeSaveRequest):
-        key, path, _ = self.resolve(dataset_id)
+        key, path, job = self.resolve(dataset_id)
         with dataset_lock(self.store, key):
-            self.resolve(dataset_id)
+            key, path, job = self.resolve(dataset_id)
             snapshot = source_snapshot(path)
             data = self._source(path, snapshot)
             self._episode(data, episode)
-            row = self._draft(key, path, snapshot, data)
+            row = self._draft(key, path, snapshot, data, job)
             self._check(row, body)
             try:
                 rendered = render_instruction(row["template"], body.selections)
@@ -306,7 +347,7 @@ class InstructionReview:
         key, path, job = self.resolve(dataset_id)
         snapshot = source_snapshot(path)
         data = self._source(path, snapshot)
-        row = self._draft(key, path, snapshot, data)
+        row = self._draft(key, path, snapshot, data, job)
         if frozen_assignments is None:
             self._check(row, body)
         else:
