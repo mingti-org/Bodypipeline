@@ -161,6 +161,47 @@ def test_embedded_viewer_uses_server_cookie_and_never_forwards_it(
     assert "authorization" not in seen[0].headers
 
 
+def test_embedded_viewer_requires_server_resolved_identity(
+    settings_factory, tmp_path, monkeypatch
+):
+    import httpx
+
+    settings = settings_factory(
+        "server",
+        import_roots=[tmp_path],
+        viewer_gateway={"embedded": True},
+        user_sessions={"enabled": True, "login_nodes": ["H800-node11"]},
+    )
+    app = create_app(settings, background=False)
+    app.state.viewer.registry.register(
+        "job-a", make_recycle_dataset(tmp_path, "viewer")
+    )
+    monkeypatch.setattr(app.state.user_sessions, "principal", lambda cookie: None)
+    upstream_calls = []
+
+    async def upstream(request):
+        upstream_calls.append(request)
+        return httpx.Response(200, stream=httpx.ByteStream(b"unexpected"))
+
+    real_client = httpx.AsyncClient
+    monkeypatch.setattr(
+        "pipeline.server.viewer_gateway.httpx.AsyncClient",
+        lambda **kwargs: real_client(
+            transport=httpx.MockTransport(upstream), **kwargs
+        ),
+    )
+    with TestClient(app) as client:
+        app.state.ingest.store.put("viewer", "service", {"state": "READY"})
+        client.cookies.set("pipeline_server", "opaque-user-cookie")
+        response = client.get("/bp/job-a/episode_0")
+
+    assert response.status_code == 401
+    assert response.json() == {"detail": "请先登录或提供有效凭据"}
+    assert "opaque-user-cookie" not in response.text
+    assert "alice" not in response.text
+    assert upstream_calls == []
+
+
 def test_embedded_viewer_write_requires_same_origin(
     settings_factory, tmp_path, monkeypatch
 ):
@@ -185,6 +226,96 @@ def test_embedded_viewer_write_requires_same_origin(
             headers={"Origin": "https://untrusted.example"},
         )
     assert response.status_code == 403
+
+
+def test_embedded_viewer_transport_rejects_cookie_authenticated_posts(
+    settings_factory, tmp_path, monkeypatch
+):
+    import httpx
+
+    settings = settings_factory(
+        "server",
+        viewer_gateway={"embedded": True},
+        user_sessions={"enabled": True, "login_nodes": ["H800-node11"]},
+    )
+    app = create_app(settings, background=False)
+    app.state.viewer.registry.register("job-a", make_dataset(tmp_path, "viewer"))
+    monkeypatch.setattr(
+        app.state.user_sessions,
+        "principal",
+        lambda cookie: Principal(username="alice", uid=1001)
+        if cookie == "opaque-user-cookie"
+        else None,
+    )
+    upstream_calls = []
+
+    async def upstream(request):
+        upstream_calls.append(request)
+        return httpx.Response(200, stream=httpx.ByteStream(b"unexpected"))
+
+    real_client = httpx.AsyncClient
+    monkeypatch.setattr(
+        "pipeline.server.viewer_gateway.httpx.AsyncClient",
+        lambda **kwargs: real_client(
+            transport=httpx.MockTransport(upstream), **kwargs
+        ),
+    )
+    origin = {"Origin": "http://testserver"}
+    with TestClient(app) as client:
+        client.cookies.set("pipeline_server", "opaque-user-cookie")
+        app.state.ingest.store.put("viewer", "service", {"state": "READY"})
+        page_write = client.post(
+            "/bp/job-a/episode_0",
+            headers=origin,
+        )
+        next_write = client.post(
+            "/_next/static/chunk.js",
+            headers=origin,
+        )
+
+    assert page_write.status_code == 405
+    assert next_write.status_code == 405
+    assert upstream_calls == []
+
+
+def test_embedded_viewer_does_not_proxy_unknown_api_path(
+    settings_factory, tmp_path, monkeypatch
+):
+    import httpx
+
+    settings = settings_factory(
+        "server",
+        viewer_gateway={"embedded": True},
+        user_sessions={"enabled": True, "login_nodes": ["H800-node11"]},
+    )
+    app = create_app(settings, background=False)
+    app.state.viewer.registry.register("job-a", make_dataset(tmp_path, "viewer"))
+    monkeypatch.setattr(
+        app.state.user_sessions,
+        "principal",
+        lambda cookie: Principal(username="alice", uid=1001)
+        if cookie == "opaque-user-cookie"
+        else None,
+    )
+    upstream_calls = []
+
+    async def upstream(request):
+        upstream_calls.append(request)
+        return httpx.Response(200, stream=httpx.ByteStream(b"unexpected"))
+
+    real_client = httpx.AsyncClient
+    monkeypatch.setattr(
+        "pipeline.server.viewer_gateway.httpx.AsyncClient",
+        lambda **kwargs: real_client(
+            transport=httpx.MockTransport(upstream), **kwargs
+        ),
+    )
+    with TestClient(app) as client:
+        client.cookies.set("pipeline_server", "opaque-user-cookie")
+        response = client.get("/api/not-owned")
+
+    assert response.status_code == 404
+    assert upstream_calls == []
 
 
 def test_embedded_viewer_proxy_forwards_exact_range_and_head_requests(
