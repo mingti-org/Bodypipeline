@@ -1162,6 +1162,22 @@ class AnnotationRunner:
                     ffmpeg=str(self.settings.flora.get("ffmpeg") or "ffmpeg"),
                     ffprobe=str(self.settings.flora.get("ffprobe") or "ffprobe"),
                 )
+                try:
+                    flora_media_worker.prepare_episode_previews(
+                        episode,
+                        slices,
+                        work / "flora/clips",
+                        ffmpeg=str(self.settings.flora.get("ffmpeg") or "ffmpeg"),
+                        ffprobe=str(self.settings.flora.get("ffprobe") or "ffprobe"),
+                    )
+                except (DomainError, OSError, subprocess.SubprocessError) as exc:
+                    with log.open("ab") as out:
+                        out.write(
+                            (
+                                f"Preview generation failed for {episode.episode_id}: "
+                                f"{exc}\n"
+                            ).encode()
+                        )
                 share_data_tree(work)
                 segments = []
                 revisions = {}
@@ -1376,11 +1392,20 @@ class AnnotationRunner:
 
     def clips(self, aid: str, episode_id: str) -> list[dict]:
         row = self.store.get("annotation", aid)
-        return backend_for(row).clips(self.work(row), episode_id)
+        return backend_for(row).clips(
+            self.work(row),
+            episode_id,
+            self.settings,
+        )
 
     def clip(self, aid: str, episode_id: str, camera: str) -> Path | None:
         row = self.store.get("annotation", aid)
-        return backend_for(row).clip(self.work(row), episode_id, camera)
+        return backend_for(row).clip(
+            self.work(row),
+            episode_id,
+            camera,
+            self.settings,
+        )
 
     def log_names(self, aid: str) -> list[str]:
         row = self.store.get("annotation", aid)

@@ -284,3 +284,43 @@ def test_copy_failure_retries_with_an_explicit_reencode(tmp_path):
     assert len(rows) == 1
     assert any("libx264" in call for call in calls)
     assert any("-crf" in call for call in calls)
+
+
+def test_episode_previews_concatenate_all_slices_for_each_camera(tmp_path):
+    root = tmp_path / "dataset"
+    make_v21_fixture(root, frames=120)
+    episode = flora_media_worker.load_episode_manifest(root)[0]
+    slices = []
+    for index in range(2):
+        folder = tmp_path / f"media/episode_000000/slice_{index:03d}"
+        folder.mkdir(parents=True)
+        row = {"offset_s": index * 2.0}
+        for role in ("main", "left_wrist", "right_wrist"):
+            path = folder / f"{role}.mp4"
+            path.write_bytes(f"{role}-{index}".encode())
+            row[role] = str(path)
+        slices.append(row)
+
+    calls = []
+    concat_contents = []
+
+    def run(argv):
+        calls.append(list(argv))
+        concat_file = Path(argv[argv.index("-i") + 1])
+        concat_contents.append(concat_file.read_text())
+        Path(argv[-1]).write_bytes(b"combined")
+
+    previews = flora_media_worker.prepare_episode_previews(
+        episode,
+        slices,
+        tmp_path / "previews",
+        ffmpeg="ffmpeg",
+        ffprobe="ffprobe",
+        probe=lambda _path: {"duration_s": 4, "fps": 30, "frames": 120},
+        run=run,
+    )
+
+    assert list(previews) == ["main", "left_wrist", "right_wrist"]
+    assert all(path.read_bytes() == b"combined" for path in previews.values())
+    assert len(calls) == 3
+    assert all(contents.count("file '") == 2 for contents in concat_contents)

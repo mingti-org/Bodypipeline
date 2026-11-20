@@ -3,6 +3,7 @@
 import json
 import shutil
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -319,3 +320,90 @@ def test_outputs_are_read_from_episode_sidecars(tmp_path):
     assert [row["episode_id"] for row in rows] == ["episode_000000"]
     detail = flora_annotation.episode(work, "episode_000000")
     assert detail["segments"][0]["caption"] == "Move left."
+
+
+def test_clips_expose_full_episode_previews_in_camera_order(tmp_path):
+    work = tmp_path / "annotation"
+    clips = work / "flora/clips/episode_000004"
+    clips.mkdir(parents=True)
+    for name, content in (
+        ("main.mp4", b"main"),
+        ("left_wrist.mp4", b"left"),
+        ("right_wrist.mp4", b"right"),
+    ):
+        (clips / name).write_bytes(content)
+
+    assert flora_annotation.clips(work, "episode_000004") == [
+        {"camera": "main", "label": "主相机", "size": 4},
+        {"camera": "left_wrist", "label": "左腕", "size": 4},
+        {"camera": "right_wrist", "label": "右腕", "size": 5},
+    ]
+    assert (
+        flora_annotation.clip(work, "episode_000004", "left_wrist")
+        == clips / "left_wrist.mp4"
+    )
+
+
+def test_clip_lookup_rejects_unknown_episode_or_camera(tmp_path):
+    work = tmp_path / "annotation"
+    clips = work / "flora/clips/episode_000004"
+    clips.mkdir(parents=True)
+    (clips / "main.mp4").write_bytes(b"video")
+
+    assert flora_annotation.clips(work, "../../secret") == []
+    assert flora_annotation.clip(work, "../../secret", "main") is None
+    assert flora_annotation.clip(work, "episode_000004", "../../secret") is None
+
+
+def test_historical_annotation_builds_previews_from_existing_slices(
+    tmp_path, monkeypatch
+):
+    work = tmp_path / "annotation"
+    slices = work / "flora/media/episode_000004"
+    rows = []
+    for index in range(2):
+        folder = slices / f"slice_{index:03d}"
+        folder.mkdir(parents=True)
+        row = {}
+        for camera in ("main", "left_wrist", "right_wrist"):
+            path = folder / f"{camera}.mp4"
+            path.write_bytes(camera.encode())
+            row[camera] = str(path)
+        rows.append(row)
+
+    calls = []
+
+    def prepare(episode, source_rows, destination, **kwargs):
+        calls.append((episode.episode_id, source_rows, destination, kwargs))
+        previews = destination / episode.episode_id
+        previews.mkdir(parents=True)
+        result = {}
+        for camera in ("main", "left_wrist", "right_wrist"):
+            path = previews / f"{camera}.mp4"
+            path.write_bytes(b"preview")
+            result[camera] = path
+        return result
+
+    monkeypatch.setattr(
+        flora_annotation.flora_media_worker,
+        "prepare_episode_previews",
+        prepare,
+    )
+    monkeypatch.setattr(flora_annotation, "share_data_tree", lambda _path: None)
+
+    settings = SimpleNamespace(
+        flora={"ffmpeg": "/tools/ffmpeg", "ffprobe": "/tools/ffprobe"}
+    )
+    assert [
+        row["camera"]
+        for row in flora_annotation.clips(work, "episode_000004", settings)
+    ] == ["main", "left_wrist", "right_wrist"]
+    assert len(calls) == 1
+    assert [Path(row["main"]).parent.name for row in calls[0][1]] == [
+        "slice_000",
+        "slice_001",
+    ]
+    assert calls[0][3] == {
+        "ffmpeg": "/tools/ffmpeg",
+        "ffprobe": "/tools/ffprobe",
+    }

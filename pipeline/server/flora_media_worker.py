@@ -5,7 +5,9 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
 import subprocess
+import uuid
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -450,6 +452,76 @@ def prepare_episode_slices(
             row[role] = str(output)
         rows.append(row)
     return rows
+
+
+def prepare_episode_previews(
+    episode: EpisodeMedia,
+    slices: list[dict],
+    destination: Path,
+    *,
+    ffmpeg: str = "ffmpeg",
+    ffprobe: str = "ffprobe",
+    probe: Callable[[Path], dict] | None = None,
+    run: Callable[[list[str]], None] | None = None,
+) -> dict[str, Path]:
+    """Combine ordered episode slices into one seekable preview per camera."""
+
+    probe = probe or (lambda path: probe_video(path, ffprobe))
+    run = run or (
+        lambda argv: subprocess.run(argv, check=True, stdout=subprocess.DEVNULL)
+    )
+    folder = Path(destination) / episode.episode_id
+    folder.mkdir(parents=True, exist_ok=True)
+    previews: dict[str, Path] = {}
+    for role, label in (
+        ("main", "main"),
+        ("left_wrist", "left_wrist"),
+        ("right_wrist", "right_wrist"),
+    ):
+        parts = [Path(row[role]) for row in slices if row.get(role)]
+        if not parts or any(not path.is_file() for path in parts):
+            continue
+        output = folder / f"{role}.mp4"
+        temporary = folder / f".{role}.{uuid.uuid4().hex}.tmp.mp4"
+        concat_file = folder / f".{role}.concat.txt"
+        lines = []
+        for path in parts:
+            escaped = str(path).replace("'", "'\\''")
+            lines.append(f"file '{escaped}'")
+        concat_file.write_text("\n".join(lines) + "\n")
+        argv = [
+            ffmpeg,
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-f",
+            "concat",
+            "-safe",
+            "0",
+            "-i",
+            str(concat_file),
+            "-c",
+            "copy",
+            "-movflags",
+            "+faststart",
+            "-y",
+            str(temporary),
+        ]
+        try:
+            run(argv)
+            if not temporary.is_file() or temporary.stat().st_size <= 0:
+                raise DomainError(
+                    f"FFmpeg 未生成 {label}相机预览视频：{output}",
+                    500,
+                )
+            probed = probe(temporary)
+            _validate_probe(temporary, probed)
+            os.replace(temporary, output)
+        finally:
+            temporary.unlink(missing_ok=True)
+            concat_file.unlink(missing_ok=True)
+        previews[role] = output
+    return previews
 
 
 def main(argv=None):

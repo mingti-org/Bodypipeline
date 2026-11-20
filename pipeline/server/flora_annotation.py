@@ -13,15 +13,24 @@ import math
 import os
 import re
 import shutil
+import subprocess
 from pathlib import Path
 
 from pipeline.shared.core import DomainError
+
+from . import flora_media_worker
+from .storage import share_data_tree
 
 ENGINE_ID = "flora"
 MODEL_LABEL = "Flora-TempSeg + Flora-Captioner"
 DEFAULT_STAGE = "准备 Flora 标注"
 MAX_EPISODES = 100000
 _EPISODE_ID = re.compile(r"^episode_(\d{1,6})$")
+PREVIEW_CAMERAS = (
+    ("main", "主相机"),
+    ("left_wrist", "左腕"),
+    ("right_wrist", "右腕"),
+)
 
 
 def _config(settings) -> dict:
@@ -327,11 +336,101 @@ def progress(work: Path) -> dict:
     return {"units": count, "labelled": completed, "episodes": completed}
 
 
-def clips(_work: Path, _episode_id: str) -> list[dict]:
-    return []
+def _slice_rows(work: Path, episode_id: str) -> list[dict]:
+    source = Path(work) / "flora/media" / episode_id
+    if source.is_symlink() or not source.is_dir():
+        return []
+    slices = []
+    for folder in sorted(source.glob("slice_*")):
+        if folder.is_symlink() or not folder.is_dir():
+            continue
+        row = {}
+        for role, _label in PREVIEW_CAMERAS:
+            path = folder / f"{role}.mp4"
+            if path.is_file() and not path.is_symlink():
+                row[role] = str(path)
+        if row:
+            slices.append(row)
+    return slices
 
 
-def clip(_work: Path, _episode_id: str, _camera: str) -> Path | None:
+def _clip_rows(
+    work: Path,
+    episode_id: str,
+    settings=None,
+) -> list[tuple[str, str, Path]]:
+    try:
+        _episode_index(episode_id)
+    except DomainError:
+        return []
+    root = Path(work) / "flora/clips" / episode_id
+    source_rows = _slice_rows(work, episode_id)
+    source_roles = {
+        role for row in source_rows for role, _label in PREVIEW_CAMERAS if row.get(role)
+    }
+    current_roles = {
+        role
+        for role, _label in PREVIEW_CAMERAS
+        if (root / f"{role}.mp4").is_file()
+        and not (root / f"{role}.mp4").is_symlink()
+        and (root / f"{role}.mp4").stat().st_size > 0
+    }
+    if source_roles - current_roles:
+        _build_previews_from_slices(work, episode_id, source_rows, settings)
+    rows = []
+    for role, label in PREVIEW_CAMERAS:
+        path = root / f"{role}.mp4"
+        if path.is_file() and not path.is_symlink():
+            rows.append((role, label, path))
+    return rows
+
+
+def _build_previews_from_slices(
+    work: Path,
+    episode_id: str,
+    slices: list[dict],
+    settings=None,
+) -> None:
+    if not slices:
+        return
+    episode = flora_media_worker.EpisodeMedia(
+        episode_id=episode_id,
+        episode_index=_episode_index(episode_id),
+        duration_s=0,
+        cameras={},
+    )
+    destination = Path(work) / "flora/clips"
+    try:
+        flora_media_worker.prepare_episode_previews(
+            episode,
+            slices,
+            destination,
+            ffmpeg=str(_config(settings).get("ffmpeg") or "ffmpeg"),
+            ffprobe=str(_config(settings).get("ffprobe") or "ffprobe"),
+        )
+        share_data_tree(destination)
+    except (DomainError, OSError, subprocess.SubprocessError):
+        # Preview generation is helpful for review but must not make historical
+        # annotation results unreadable when a media file has been removed.
+        return
+
+
+def clips(work: Path, episode_id: str, settings=None) -> list[dict]:
+    rows = []
+    for camera, label, path in _clip_rows(work, episode_id, settings):
+        try:
+            size = path.stat().st_size
+        except OSError:
+            continue
+        if size > 0:
+            rows.append({"camera": camera, "label": label, "size": size})
+    return rows
+
+
+def clip(work: Path, episode_id: str, camera: str, settings=None) -> Path | None:
+    for name, _label, path in _clip_rows(work, episode_id, settings):
+        if name == camera:
+            return path
     return None
 
 

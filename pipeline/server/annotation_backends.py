@@ -20,6 +20,10 @@ class AnnotationBackend(Protocol):
 
     def results(self, work) -> dict[str, dict]: ...
 
+    def clips(self, work, episode_id, settings): ...
+
+    def clip(self, work, episode_id, camera, settings): ...
+
 
 class ArgusBackend:
     id = "argus"
@@ -31,8 +35,13 @@ class ArgusBackend:
     outputs = staticmethod(argus_annotation.outputs)
     results = staticmethod(argus_annotation.episode_results)
     episode = staticmethod(argus_annotation.episode)
-    clips = staticmethod(argus_annotation.clips)
-    clip = staticmethod(argus_annotation.clip)
+    @staticmethod
+    def clips(work, episode_id, _settings=None):
+        return argus_annotation.clips(work, episode_id)
+
+    @staticmethod
+    def clip(work, episode_id, camera, _settings=None):
+        return argus_annotation.clip(work, episode_id, camera)
     log_names = staticmethod(argus_annotation.log_names)
     read_log = staticmethod(argus_annotation.read_log)
     progress = staticmethod(argus_annotation.progress)
@@ -50,8 +59,13 @@ class FloraBackend:
     outputs = staticmethod(flora_annotation.outputs)
     results = staticmethod(flora_annotation.results)
     episode = staticmethod(flora_annotation.episode)
-    clips = staticmethod(flora_annotation.clips)
-    clip = staticmethod(flora_annotation.clip)
+    @staticmethod
+    def clips(work, episode_id, settings=None):
+        return flora_annotation.clips(work, episode_id, settings)
+
+    @staticmethod
+    def clip(work, episode_id, camera, settings=None):
+        return flora_annotation.clip(work, episode_id, camera, settings)
     log_names = staticmethod(flora_annotation.log_names)
     read_log = staticmethod(flora_annotation.read_log)
     progress = staticmethod(flora_annotation.progress)
