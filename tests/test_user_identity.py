@@ -1,5 +1,6 @@
 import json
 import stat
+import subprocess
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -12,7 +13,11 @@ from pipeline.server.instruction_worker import InstructionApplyRunner
 from pipeline.server.jobs import JobRunner
 from pipeline.server.user_sessions import SlurmIdentityBroker, UserSession
 from pipeline.shared.core import DomainError, Store, now
-from pipeline.shared.identity import Principal, require_task_access
+from pipeline.shared.identity import (
+    Principal,
+    public_execution_record,
+    require_task_access,
+)
 
 
 def executable(path: Path, source: str) -> Path:
@@ -60,6 +65,78 @@ for value in sys.argv:
 """,
     )
     return ssh, sshpass, password_probe, argv_probe, env_probe
+
+
+def seed_personal_parent(app):
+    settings = app.state.runner.settings
+    dataset = settings.root / "work" / "parent" / "dataset"
+    (dataset / "meta").mkdir(parents=True)
+    (dataset / "meta/info.json").write_text(
+        json.dumps(
+            {
+                "codebase_version": "v3.0",
+                "robot_type": "test_arm",
+                "fps": 10,
+                "total_episodes": 2,
+                "total_frames": 11,
+                "features": {
+                    "observation.state": {
+                        "dtype": "float32",
+                        "shape": [2],
+                        "names": ["left", "right"],
+                    }
+                },
+            }
+        )
+    )
+    parent = {
+        "id": "parent",
+        "state": "CONVERTED",
+        "dataset_ready": True,
+        "dataset_path": str(dataset),
+        "dataset_name": "parent dataset",
+        "robot_type": "test_arm",
+        "provider": "agilex",
+        "target_format": "v3.0",
+        "episode_count": 2,
+        "frame_count": 11,
+        "created_at": 1,
+        "owner_user_id": "alice",
+        "owner_uid": 1001,
+        "submitted_as": "alice",
+        "slurm_user": "alice",
+        "slurm_execution_id": "execution-a",
+        "submission_auth": "h800-ssh",
+    }
+    app.state.runner.store.put("job", parent["id"], parent)
+    return parent, dataset
+
+
+def register_user_session(app, tmp_path):
+    session = UserSession(
+        session_id="opaque-cookie",
+        execution_id="execution-a",
+        username="alice",
+        uid=1001,
+        login_node="H800-node11",
+        control_path=Path(tmp_path) / "private-control.sock",
+        expires_at=now() + 3600,
+    )
+    with app.state.user_sessions._lock:
+        app.state.user_sessions._by_token[session.session_id] = session
+        app.state.user_sessions._by_execution[session.execution_id] = session
+    return session
+
+
+def personal_record(execution_id="execution-a"):
+    return {
+        "owner_user_id": "alice",
+        "owner_uid": 1001,
+        "submitted_as": "alice",
+        "slurm_user": "alice",
+        "slurm_execution_id": execution_id,
+        "submission_auth": "h800-ssh",
+    }
 
 
 def test_viewer_execution_identity_configuration_is_strict(
@@ -478,15 +555,96 @@ def test_permission_probe_uses_remote_test_argv(
     writable = settings.root / "dataset"
     (writable / "meta").mkdir(parents=True)
     (writable / "meta/info.json").write_text("{}")
+    for name in ("data", "videos"):
+        (writable / name).mkdir()
+    work_root = settings.root / "work-cache/work"
+    cache_root = settings.root / "work-cache/cache"
+    work_root.mkdir(parents=True)
+    cache_root.mkdir()
     principal = session.principal()
 
     runner.require_principal_path_access(
-        principal, writable, writable=True
+        principal,
+        writable,
+        writable=True,
+        work_root=work_root,
+        cache_root=cache_root,
     )
 
     assert all(active is session for active, _ in calls)
-    assert calls[-1][1][:2] == ["/usr/bin/test", "-w"]
-    assert str(writable) == calls[-1][1][-1]
+    probes = [argv for _active, argv in calls]
+    for expected in (
+        ["/usr/bin/test", "-r", str(writable)],
+        ["/usr/bin/test", "-r", str(writable / "meta/info.json")],
+        ["/usr/bin/test", "-w", str(writable)],
+        ["/usr/bin/test", "-w", str(writable / "meta")],
+        ["/usr/bin/test", "-w", str(writable / "data")],
+        ["/usr/bin/test", "-w", str(writable / "videos")],
+        ["/usr/bin/test", "-x", str(work_root)],
+        ["/usr/bin/test", "-w", str(work_root)],
+        ["/usr/bin/test", "-x", str(cache_root)],
+        ["/usr/bin/test", "-w", str(cache_root)],
+    ):
+        assert expected in probes
+    assert all(len(argv) == 3 for argv in probes)
+
+
+@pytest.mark.parametrize("root_name", ["work_root", "cache_root"])
+def test_permission_probe_denies_unwritable_work_or_cache_root(
+    settings_factory, tmp_path, monkeypatch, root_name
+):
+    settings = settings_factory(
+        "server",
+        user_sessions={"enabled": True, "login_nodes": ["H800-node11"]},
+    )
+    store = Store(settings.root / "state")
+    broker = SlurmIdentityBroker(settings)
+    session = UserSession(
+        session_id="opaque",
+        execution_id="execution-a",
+        username="alice",
+        uid=1001,
+        login_node="H800-node11",
+        control_path=tmp_path / "control",
+        expires_at=now() + 60,
+    )
+    with broker._lock:
+        broker._by_token[session.session_id] = session
+        broker._by_execution[session.execution_id] = session
+    runner = JobRunner(
+        settings,
+        SimpleNamespace(store=store),
+        user_sessions=broker,
+    )
+    dataset = settings.root / "dataset"
+    (dataset / "meta").mkdir(parents=True)
+    (dataset / "meta/info.json").write_text("{}")
+    work_root = settings.root / "work-cache/work"
+    cache_root = settings.root / "work-cache/cache"
+    work_root.mkdir(parents=True)
+    cache_root.mkdir()
+
+    denied_root = work_root if root_name == "work_root" else cache_root
+
+    def run(_active, argv, **_kwargs):
+        denied = argv[-1] == str(denied_root) and argv[1] == "-w"
+        return SimpleNamespace(
+            returncode=1 if denied else 0,
+            stdout="",
+            stderr="",
+        )
+
+    monkeypatch.setattr(broker, "run", run)
+
+    with pytest.raises(DomainError, match="无权访问") as rejected:
+        runner.require_principal_path_access(
+            session.principal(),
+            dataset,
+            work_root=work_root,
+            cache_root=cache_root,
+        )
+
+    assert rejected.value.code == 403
 
 
 def test_personal_metadata_requires_execution_handle():
@@ -552,6 +710,400 @@ def test_captured_command_requires_explicit_binding(settings_factory):
     )
     with pytest.raises(DomainError, match="必须绑定提交人身份"):
         runner.run_captured(["true"], timeout=1)
+
+
+def test_remote_stream_stderr_is_sanitized_before_it_reaches_the_log(
+    settings_factory, tmp_path
+):
+    settings = settings_factory("server")
+    store = Store(settings.root / "state")
+    control_path = "/tmp/bodypipeline-501/ssh/alice-secret.sock"
+    session_id = "SSH_SESSION_TOKEN_8f93c"
+    diagnostic = (
+        f"ssh: ControlPath={control_path} session={session_id} "
+        "connection failed"
+    )
+    active = SimpleNamespace(username="alice", uid=1001)
+
+    class Broker:
+        @staticmethod
+        def session_for_execution(execution_id):
+            assert execution_id == "execution-a"
+            return active
+
+        @staticmethod
+        def popen(_session, _argv, **kwargs):
+            kwargs["stderr"].write(diagnostic.encode())
+            kwargs["stderr"].flush()
+            return SimpleNamespace(poll=lambda: 1, returncode=1)
+
+        @staticmethod
+        def run(_session, _argv, **_kwargs):
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    runner = JobRunner(
+        settings,
+        SimpleNamespace(store=store),
+        user_sessions=Broker(),
+    )
+    work = settings.root / "work"
+    work.mkdir()
+
+    with runner.bind_record_session(personal_record()):
+        code, _report, error_log = runner.command(
+            ["remote-worker"], work, "trim"
+        )
+
+    assert code == 1
+    persisted = error_log.read_text()
+    assert persisted
+    assert control_path not in persisted
+    assert session_id not in persisted
+
+
+def test_captured_failure_diagnostic_is_sanitized(
+    settings_factory,
+):
+    settings = settings_factory("server")
+    store = Store(settings.root / "state")
+    control_path = "/tmp/bodypipeline-501/ssh/alice-secret.sock"
+    session_id = "SSH_SESSION_TOKEN_8f93c"
+    diagnostic = (
+        f"ssh: ControlPath={control_path} session={session_id} "
+        "authentication failed"
+    )
+    active = SimpleNamespace(username="alice", uid=1001)
+
+    class Broker:
+        @staticmethod
+        def session_for_execution(execution_id):
+            assert execution_id == "execution-a"
+            return active
+
+        @staticmethod
+        def run(_session, _argv, **_kwargs):
+            return SimpleNamespace(
+                returncode=255,
+                stdout="",
+                stderr=diagnostic,
+            )
+
+    runner = JobRunner(
+        settings,
+        SimpleNamespace(store=store),
+        user_sessions=Broker(),
+    )
+
+    with runner.bind_record_session(personal_record()):
+        result = runner.run_captured(["remote-worker"], timeout=5)
+
+    assert result.returncode == 255
+    assert result.stderr
+    assert control_path not in result.stderr
+    assert session_id not in result.stderr
+
+
+def test_captured_timeout_does_not_expose_the_ssh_command(
+    settings_factory,
+):
+    settings = settings_factory("server")
+    store = Store(settings.root / "state")
+    control_path = "/tmp/bodypipeline-501/ssh/alice-secret.sock"
+    session_id = "SSH_SESSION_TOKEN_8f93c"
+    active = SimpleNamespace(username="alice", uid=1001)
+
+    class Broker:
+        @staticmethod
+        def session_for_execution(execution_id):
+            assert execution_id == "execution-a"
+            return active
+
+        @staticmethod
+        def run(_session, _argv, **_kwargs):
+            raise subprocess.TimeoutExpired(
+                ["ssh", "-S", control_path],
+                1,
+                stderr=f"session={session_id}",
+            )
+
+    runner = JobRunner(
+        settings,
+        SimpleNamespace(store=store),
+        user_sessions=Broker(),
+    )
+
+    with runner.bind_record_session(personal_record()):
+        with pytest.raises(DomainError, match="超时") as raised:
+            runner.run_captured(["remote-worker"], timeout=1)
+
+    message = str(raised.value)
+    assert control_path not in message
+    assert session_id not in message
+
+
+def test_slurm_allocation_stderr_is_sanitized(
+    settings_factory, tmp_path, monkeypatch
+):
+    settings = settings_factory(
+        "server",
+        slurm={"enabled": True, "partition": "dev"},
+    )
+    store = Store(settings.root / "state")
+    control_path = "/tmp/bodypipeline-501/ssh/alice-secret.sock"
+    session_id = "SSH_SESSION_TOKEN_8f93c"
+    diagnostic = (
+        f"ssh: ControlPath={control_path} session={session_id} "
+        "connection failed"
+    )
+    active = SimpleNamespace(username="alice", uid=1001)
+
+    class Broker:
+        @staticmethod
+        def session_for_execution(execution_id):
+            assert execution_id == "execution-a"
+            return active
+
+        @staticmethod
+        def popen(_session, _argv, **kwargs):
+            kwargs["stderr"].write(diagnostic.encode())
+            kwargs["stderr"].flush()
+            return SimpleNamespace(poll=lambda: 1, returncode=1)
+
+    runner = JobRunner(
+        settings,
+        SimpleNamespace(store=store),
+        user_sessions=Broker(),
+    )
+    monkeypatch.setattr(
+        "pipeline.server.jobs.executable_path",
+        lambda name: f"/usr/bin/{name}",
+    )
+    monkeypatch.setattr(runner, "_cancel_allocation", lambda *_args: None)
+    work = settings.root / "work"
+    work.mkdir()
+
+    with runner.bind_record_session(personal_record()):
+        with pytest.raises(DomainError, match="Slurm 分配失败") as raised:
+            runner._open_allocation(work)
+
+    error_log = work / "slurm-allocation.stderr.log"
+    for text in (str(raised.value), error_log.read_text()):
+        assert control_path not in text
+        assert session_id not in text
+
+
+def test_output_permission_failure_stderr_is_sanitized(
+    settings_factory,
+):
+    settings = settings_factory("server")
+    store = Store(settings.root / "state")
+    control_path = "/tmp/bodypipeline-501/ssh/alice-secret.sock"
+    session_id = "SSH_SESSION_TOKEN_8f93c"
+    diagnostic = (
+        f"ssh: ControlPath={control_path} session={session_id} "
+        "chmod failed"
+    )
+    active = SimpleNamespace(username="alice", uid=1001)
+
+    class Broker:
+        @staticmethod
+        def session_for_execution(execution_id):
+            assert execution_id == "execution-a"
+            return active
+
+        @staticmethod
+        def run(_session, _argv, **_kwargs):
+            return SimpleNamespace(
+                returncode=1,
+                stdout="",
+                stderr=diagnostic,
+            )
+
+    runner = JobRunner(
+        settings,
+        SimpleNamespace(store=store),
+        user_sessions=Broker(),
+    )
+    work = settings.root / "work"
+    work.mkdir()
+
+    with runner.bind_record_session(personal_record()):
+        with pytest.raises(DomainError, match="输出权限") as raised:
+            runner._share_user_work(work)
+
+    message = str(raised.value)
+    assert control_path not in message
+    assert session_id not in message
+
+
+@pytest.mark.parametrize("kind", ["check", "analysis", "trim_preview"])
+def test_personal_child_worker_binds_the_parent_session(
+    settings_factory, tmp_path, kind
+):
+    argus = tmp_path / "argus"
+    (argus / "label").mkdir(parents=True)
+    python = argus / ".venv/bin/python"
+    python.parent.mkdir(parents=True)
+    python.write_text("#!/bin/sh\nexit 0\n")
+    python.chmod(0o755)
+    settings = settings_factory(
+        "server",
+        letools_bin=sys.executable,
+        argus_src=str(argus),
+    )
+    app = create_app(settings, background=False)
+    runner = app.state.runner
+    parent, dataset = seed_personal_parent(app)
+    session = register_user_session(app, dataset)
+    principal = session.principal()
+
+    if kind == "check":
+        child = app.state.checks.enqueue(parent["id"], principal=principal)
+        worker = app.state.checks
+    elif kind == "analysis":
+        child = app.state.analyses.enqueue(
+            parent["id"], mode="local", principal=principal
+        )
+        worker = app.state.analyses
+    else:
+        child = app.state.trims.enqueue_preview(
+            parent["id"], principal=principal
+        )
+        worker = app.state.trims
+
+    def tick(run):
+        if kind == "trim_preview":
+            return runner.dataset_tick(
+                worker,
+                kind,
+                save=app.state.trims._save_preview,
+                run=run,
+            )
+        return runner.dataset_tick(worker, kind, run=run)
+
+    observed = []
+    assert tick(lambda row: observed.append(runner.execution_session)) is True
+    stored = runner.store.get(
+        "trim_preview" if kind == "trim_preview" else kind,
+        child["id"],
+    )
+
+    assert stored["submission_auth"] == "h800-ssh"
+    assert "slurm_execution_id" not in stored
+    assert observed == [session]
+    assert runner.execution_session is None
+    assert "slurm_execution_id" not in json.dumps(
+        public_execution_record(stored), ensure_ascii=False
+    )
+
+
+def test_active_flora_annotation_child_binds_the_parent_session(
+    settings_factory, tmp_path, monkeypatch
+):
+    flora = tmp_path / "flora"
+    (flora / "captioner").mkdir(parents=True)
+    (flora / "captioner/infer.py").write_text("print('flora')\n")
+    python = tmp_path / "flora-python"
+    python.write_text("#!/bin/sh\nexit 0\n")
+    python.chmod(0o755)
+    tools = {}
+    for name in ("srun", "ffmpeg", "ffprobe"):
+        path = tmp_path / f"flora-{name}"
+        path.write_text("#!/bin/sh\nexit 0\n")
+        path.chmod(0o755)
+        tools[name] = path
+    models = tmp_path / "flora-models"
+    for kind in ("tempseg", "captioner", "tempseg_base"):
+        directory = models / kind
+        directory.mkdir(parents=True)
+        (directory / "config.json").write_text("{}")
+        (directory / "model.safetensors").write_bytes(b"weights")
+    settings = settings_factory(
+        "server",
+        flora={
+            "enabled": True,
+            "src": str(flora),
+            "python": str(python),
+            "srun": str(tools["srun"]),
+            "ffmpeg": str(tools["ffmpeg"]),
+            "ffprobe": str(tools["ffprobe"]),
+            "model_cache": str(models),
+            "profiles": {"agilex": {"profile": "yam"}},
+        },
+    )
+    app = create_app(settings, background=False)
+    runner = app.state.runner
+    parent, dataset = seed_personal_parent(app)
+    session = register_user_session(app, dataset)
+    child = app.state.annotations.enqueue(
+        parent["id"],
+        engine="flora",
+        principal=session.principal(),
+    )
+    observed = []
+
+    def run_flora(row, _cancel_event):
+        observed.append(runner.execution_session)
+        return row
+
+    monkeypatch.setattr(app.state.annotations, "_run_flora", run_flora)
+
+    assert app.state.annotations.tick() is True
+    stored = runner.store.get("annotation", child["id"])
+    assert stored["submission_auth"] == "h800-ssh"
+    assert "slurm_execution_id" not in stored
+    assert observed == [session]
+    assert runner.execution_session is None
+    assert "slurm_execution_id" not in json.dumps(
+        public_execution_record(stored), ensure_ascii=False
+    )
+
+
+def test_personal_child_parent_ownership_mismatch_fails_closed(
+    settings_factory, tmp_path
+):
+    settings = settings_factory("server")
+    store = Store(settings.root / "state")
+
+    class Broker:
+        def session_for_execution(self, execution_id):
+            assert execution_id == "execution-a"
+            return SimpleNamespace(username="alice", uid=1001)
+
+    runner = JobRunner(
+        settings,
+        SimpleNamespace(store=store),
+        user_sessions=Broker(),
+    )
+    store.put(
+        "job",
+        "parent",
+        {
+            "id": "parent",
+            "owner_user_id": "alice",
+            "owner_uid": 1001,
+            "submitted_as": "alice",
+            "slurm_user": "alice",
+            "slurm_execution_id": "execution-a",
+            "submission_auth": "h800-ssh",
+        },
+    )
+    child = {
+        "id": "child",
+        "job_id": "parent",
+        "owner_user_id": "bob",
+        "owner_uid": 1002,
+        "submitted_as": "bob",
+        "slurm_user": "bob",
+        "submission_auth": "h800-ssh",
+    }
+
+    with pytest.raises(DomainError, match="提交人不匹配") as rejected:
+        with runner.bind_record_session(child):
+            pytest.fail("mismatched child row must not enter execution")
+
+    assert rejected.value.code == 403
+    assert runner.execution_session is None
 
 
 def test_instruction_worker_uses_bound_remote_command(
@@ -998,6 +1550,86 @@ def test_instruction_worker_redacts_private_ssh_diagnostics(
     for private in (control_path, execution_handle):
         assert private not in stored["error"]
         assert private not in json.dumps(public, ensure_ascii=False)
+
+
+def test_instruction_non_auth_domain_error_does_not_show_relogin_guidance(
+    settings_factory, monkeypatch
+):
+    settings = settings_factory("server")
+    store = Store(settings.root / "state")
+
+    class ActiveBroker:
+        @staticmethod
+        def session_for_execution(execution_id):
+            assert execution_id == "execution-a"
+            return SimpleNamespace(username="alice", uid=1001)
+
+    execution = JobRunner(
+        settings,
+        SimpleNamespace(store=store),
+        user_sessions=ActiveBroker(),
+    )
+    worker = InstructionApplyRunner(
+        settings,
+        store,
+        SimpleNamespace(resolve=lambda dataset_id: None),
+        runner=execution,
+    )
+    row = {
+        "id": "apply-validation-error",
+        "dataset_id": "source",
+        "dataset_key": "dataset-key",
+        "dataset_path": str(settings.root / "dataset"),
+        "state": "QUEUED",
+        **personal_record(),
+    }
+    store.put("instruction_apply", row["id"], row)
+    monkeypatch.setattr(
+        worker,
+        "run",
+        lambda _row: (_ for _ in ()).throw(
+            DomainError("排队期间来源数据已变化", 409)
+        ),
+    )
+
+    assert worker.tick() is True
+
+    persisted = store.get("instruction_apply", row["id"])
+    assert persisted["state"] == "FAILED"
+    assert persisted["error"] == "排队期间来源数据已变化"
+    assert "重新登录" not in persisted["error"]
+
+
+def test_instruction_public_record_preserves_non_private_attribution():
+    public = InstructionApplyRunner._public(
+        {
+            "id": "apply-a",
+            "dataset_id": "source",
+            "state": "QUEUED",
+            "created_at": 1,
+            **personal_record("private-execution-token"),
+        }
+    )
+
+    assert public == {
+        "id": "apply-a",
+        "dataset_id": "source",
+        "state": "QUEUED",
+        "stage": None,
+        "progress": None,
+        "created_at": 1,
+        "started_at": None,
+        "finished_at": None,
+        "report": None,
+        "error": None,
+        "owner_user_id": "alice",
+        "owner_uid": 1001,
+        "submitted_as": "alice",
+        "slurm_user": "alice",
+        "submission_auth": "h800-ssh",
+    }
+    assert "slurm_execution_id" not in public
+    assert "private-execution-token" not in json.dumps(public)
 
 
 def test_task_apis_never_return_private_execution_handle(settings_factory):

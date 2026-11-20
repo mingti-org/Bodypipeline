@@ -5,7 +5,7 @@ import sys
 import time
 from contextlib import contextmanager
 from pathlib import Path
-from threading import Event, get_ident
+from threading import Event, Thread, get_ident
 from types import SimpleNamespace
 
 import pytest
@@ -387,6 +387,130 @@ def test_score_cache_claim_blocks_duplicate_worker_across_caches(
         first.close()
 
     assert len(calls) == 1
+
+
+@pytest.mark.parametrize("failure", ["nonzero", "timeout"])
+def test_score_cache_releases_claim_after_failure_and_reacquires(
+    settings_factory, tmp_path, failure
+):
+    settings = settings_factory("server", letools_bin=sys.executable)
+    store = Store(settings.root / "state")
+    root = dataset(tmp_path / "dataset")
+    preview = {"dataset_path": str(root)}
+    principal = Principal(
+        username="alice",
+        uid=1001,
+        login_node="H800-node11",
+        execution_id="execution-a",
+        auth_method="h800-ssh",
+    )
+    report = {
+        "episodes": [{"episode_index": 0, "overall_score": 100}],
+        "total_episodes": 1,
+    }
+    calls = []
+
+    class Runner:
+        def require_principal_path_access(
+            self, active_principal, path, **_kwargs
+        ):
+            assert active_principal is principal
+            assert Path(path) == root
+
+        @staticmethod
+        def submission_metadata(active_principal):
+            return active_principal.job_metadata()
+
+        @staticmethod
+        @contextmanager
+        def bind_record_session(_row):
+            yield object()
+
+        def run_captured(self, _argv, *, timeout, remote_env=None):
+            assert timeout == settings.command_timeout
+            calls.append((timeout, remote_env))
+            if len(calls) == 1:
+                if failure == "timeout":
+                    from pipeline.shared.core import DomainError
+
+                    raise DomainError("远端命令执行超时", 504)
+                return SimpleNamespace(
+                    returncode=255,
+                    stdout="",
+                    stderr="private diagnostic",
+                )
+            return SimpleNamespace(
+                returncode=0,
+                stdout=json.dumps(report),
+                stderr="",
+            )
+
+    cache = EpisodeScoreCache(settings, store, runner=Runner())
+    try:
+        assert cache.start(preview, principal=principal)["state"] == "QUEUED"
+        failed = wait_for_score(cache, preview, principal=principal)
+        assert failed["state"] == "FAILED"
+        assert "private diagnostic" not in json.dumps(failed)
+
+        assert cache.start(preview, principal=principal)["state"] == "QUEUED"
+        completed = wait_for_score(cache, preview, principal=principal)
+    finally:
+        cache.close()
+
+    assert completed["state"] == "COMPLETED"
+    assert len(calls) == 2
+
+
+def test_score_cache_releases_claim_when_closed(
+    settings_factory, tmp_path, monkeypatch
+):
+    settings = settings_factory("viewer", letools_bin=sys.executable)
+    store = Store(settings.root / "state")
+    root = dataset(tmp_path / "dataset")
+    preview = {"dataset_path": str(root)}
+    first = EpisodeScoreCache(settings, store)
+    second = EpisodeScoreCache(settings, store)
+    _, key, _ = first._identity(preview)
+    entered = Event()
+    gate = Event()
+    calls = []
+
+    def run(_root, key, signature, _python, _metadata):
+        calls.append(key)
+        entered.set()
+        gate.wait(5)
+        store.put(
+            "episode-score",
+            key,
+            {
+                "state": "COMPLETED",
+                "signature": signature,
+                "report": {"episodes": []},
+            },
+        )
+
+    monkeypatch.setattr(first, "_run", run)
+    monkeypatch.setattr(second, "_run", run)
+    closed = Thread(target=first.close)
+    try:
+        assert first.start(preview)["state"] == "QUEUED"
+        assert entered.wait(2)
+        closed.start()
+        assert closed.is_alive()
+        gate.set()
+        closed.join(5)
+        assert not closed.is_alive()
+
+        store.delete("episode-score", key)
+        assert second.start(preview)["state"] == "QUEUED"
+        assert wait_for_score(second, preview)["state"] == "COMPLETED"
+    finally:
+        gate.set()
+        if closed.is_alive():
+            closed.join(5)
+        second.close()
+
+    assert len(calls) >= 1
 
 
 def test_score_cache_reclaims_stale_persisted_job(

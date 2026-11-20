@@ -5,6 +5,7 @@ import json
 import subprocess
 from copy import deepcopy
 from pathlib import Path
+from types import SimpleNamespace
 
 import httpx
 import pytest
@@ -14,9 +15,11 @@ from pipeline.server.app import create_app
 from pipeline.server.merges import source_snapshot
 from pipeline.server.recycle import dataset_lock
 from pipeline.server.subtask_review import RevisionExportRequest, SubtaskReview
+from pipeline.server.user_sessions import UserSession
 from pipeline.server.viewer import create_gateway
 from pipeline.server.viewer_bootstrap import patch_subtask_review
 from pipeline.server.viewer_data import PreviewRegistry
+from pipeline.shared.core import DomainError, now
 from pipeline.shared.identity import Principal
 
 SCENARIO = Path(__file__).parent / "fixtures/merge_scenario.py"
@@ -28,7 +31,10 @@ def segment(start=0, end=2, text="grasp"):
 
 @pytest.fixture
 def review_app(settings_factory, monkeypatch):
-    settings = settings_factory("server")
+    settings = settings_factory(
+        "server",
+        user_sessions={"enabled": True, "login_nodes": ["H800-node11"]},
+    )
     app = create_app(settings, background=False)
     store = app.state.runner.store
     path = settings.root / "source"
@@ -314,6 +320,239 @@ def test_revision_export_freezes_full_task_document(review_app, monkeypatch, tmp
         ]
         == document
     )
+
+
+def test_personal_review_export_sanitizes_remote_worker_diagnostics(
+    review_app, monkeypatch, tmp_path
+):
+    runner = review_app.state.runner
+    tool = tmp_path / "letools"
+    tool.write_text("#!/bin/sh\n")
+    tool.chmod(0o755)
+    tool.with_name("python").write_text("placeholder")
+    monkeypatch.setattr(runner.settings, "letools_bin", str(tool))
+    client = client_for(review_app)
+    initial = client.get(URL).json()
+    assert (
+        client.post(URL, json=body(initial, initial["segments"])).status_code
+        == 200
+    )
+    head = client.get(URL).json()
+    principal = Principal(
+        username="alice",
+        uid=1001,
+        login_node="H800-node11",
+        execution_id="execution-a",
+        auth_method="h800-ssh",
+    )
+    session = UserSession(
+        session_id="opaque-cookie",
+        execution_id=principal.execution_id,
+        username=principal.username,
+        uid=principal.uid,
+        login_node=principal.login_node,
+        control_path=tmp_path / "private-control.sock",
+        expires_at=now() + 3600,
+    )
+    with review_app.state.user_sessions._lock:
+        review_app.state.user_sessions._by_token[
+            session.session_id
+        ] = session
+        review_app.state.user_sessions._by_execution[
+            session.execution_id
+        ] = session
+    monkeypatch.setattr(
+        runner,
+        "require_principal_path_access",
+        lambda *_args, **_kwargs: None,
+    )
+    job = runner.subtask_exports.enqueue_review(
+        "source",
+        RevisionExportRequest(
+            revision=head["revision"],
+            source_signature=head["source_signature"],
+        ),
+        principal=principal,
+    )
+    control_path = "/tmp/bodypipeline-501/ssh/alice-secret.sock"
+    session_token = "SSH_SESSION_TOKEN_8f93c"
+    diagnostic = (
+        f"ssh: ControlPath={control_path} session={session_token} "
+        "connection failed"
+    )
+
+    def popen(_session, _argv, **kwargs):
+        kwargs["stderr"].write(diagnostic.encode())
+        kwargs["stderr"].flush()
+        return SimpleNamespace(poll=lambda: 1, returncode=1)
+
+    def run(_session, _argv, **_kwargs):
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(review_app.state.user_sessions, "popen", popen)
+    monkeypatch.setattr(review_app.state.user_sessions, "run", run)
+
+    assert runner.tick() is True
+
+    stored = runner.store.get("job", job["id"])
+    error_log = Path(stored["work_path"]) / "subtask-export.stderr.log"
+    public = client.get(f"/api/subtask-review/source/exports/{job['id']}")
+
+    assert stored["state"] == "FAILED"
+    assert "Subtask 数据集生成失败" in stored["error"]
+    assert error_log.is_file()
+    for text in (stored["error"], error_log.read_text(), public.text):
+        assert control_path not in text
+        assert session_token not in text
+        assert "execution-a" not in text
+
+
+@pytest.mark.parametrize("boundary", ["manager", "http"])
+def test_review_export_permission_denial_returns_403_without_a_queued_row(
+    review_app, monkeypatch, tmp_path, boundary
+):
+    runner = review_app.state.runner
+    tool = tmp_path / "letools"
+    tool.write_text("#!/bin/sh\n")
+    tool.chmod(0o755)
+    tool.with_name("python").write_text("placeholder")
+    monkeypatch.setattr(runner.settings, "letools_bin", str(tool))
+    client = client_for(review_app)
+    initial = client.get(URL).json()
+    assert (
+        client.post(URL, json=body(initial, initial["segments"])).status_code
+        == 200
+    )
+    head = client.get(URL).json()
+    request = RevisionExportRequest(
+        revision=head["revision"],
+        source_signature=head["source_signature"],
+    )
+    principal = Principal(
+        username="alice",
+        uid=1001,
+        login_node="H800-node11",
+        execution_id="execution-a",
+        auth_method="h800-ssh",
+    )
+    active = SimpleNamespace(username="alice", uid=1001)
+    cache_root = runner.settings.root / "viewer-cache"
+    cache_root.mkdir(exist_ok=True)
+    monkeypatch.setattr(
+        review_app.state.user_sessions,
+        "principal",
+        lambda cookie: principal if cookie == "opaque-cookie" else None,
+    )
+    monkeypatch.setattr(
+        review_app.state.user_sessions,
+        "session_for_execution",
+        lambda execution_id: active,
+    )
+
+    def run(_session, argv, **_kwargs):
+        denied = (
+            argv[:2] == ["/usr/bin/test", "-w"]
+            and argv[-1] == str(cache_root)
+        )
+        return SimpleNamespace(returncode=1 if denied else 0)
+
+    monkeypatch.setattr(review_app.state.user_sessions, "run", run)
+    if boundary == "manager":
+        with pytest.raises(DomainError, match="无权访问") as rejected:
+            runner.subtask_exports.enqueue_review(
+                "source", request, principal=principal
+            )
+        assert rejected.value.code == 403
+    else:
+        runner.settings.viewer_execution_identity = {"enabled": True}
+        with TestClient(review_app) as cookie_client:
+            response = cookie_client.post(
+                "/api/subtask-review/source/exports",
+                json={
+                    "revision": request.revision,
+                    "source_signature": request.source_signature,
+                },
+                headers={
+                    "Cookie": "pipeline_server=opaque-cookie",
+                    "Origin": "http://testserver",
+                },
+            )
+        assert response.status_code == 403
+
+    assert not any(
+        row.get("operation") == "subtask_export"
+        and row.get("source_kind") == "lerobot_subtask_revision"
+        for row in runner.store.all("job")
+    )
+
+
+def test_personal_review_export_worker_binds_and_redacts_handle(
+    review_app, monkeypatch, tmp_path
+):
+    runner = review_app.state.runner
+    tool = tmp_path / "letools"
+    tool.write_text("#!/bin/sh\n")
+    tool.chmod(0o755)
+    tool.with_name("python").write_text("placeholder")
+    monkeypatch.setattr(runner.settings, "letools_bin", str(tool))
+    client = client_for(review_app)
+    initial = client.get(URL).json()
+    assert (
+        client.post(URL, json=body(initial, initial["segments"])).status_code
+        == 200
+    )
+    head = client.get(URL).json()
+    principal = Principal(
+        username="alice",
+        uid=1001,
+        login_node="H800-node11",
+        execution_id="execution-a",
+        auth_method="h800-ssh",
+    )
+    session = UserSession(
+        session_id="opaque-cookie",
+        execution_id=principal.execution_id,
+        username=principal.username,
+        uid=principal.uid,
+        login_node=principal.login_node,
+        control_path=tmp_path / "private-control.sock",
+        expires_at=now() + 3600,
+    )
+    with review_app.state.user_sessions._lock:
+        review_app.state.user_sessions._by_token[
+            session.session_id
+        ] = session
+        review_app.state.user_sessions._by_execution[
+            session.execution_id
+        ] = session
+    monkeypatch.setattr(
+        runner,
+        "require_principal_path_access",
+        lambda *_args, **_kwargs: None,
+    )
+    job = runner.subtask_exports.enqueue_review(
+        "source",
+        RevisionExportRequest(
+            revision=head["revision"],
+            source_signature=head["source_signature"],
+        ),
+        principal=principal,
+    )
+    observed = []
+
+    def run(active_job):
+        observed.append((active_job["id"], runner.execution_session))
+
+    monkeypatch.setattr(runner, "run", run)
+
+    assert runner.tick() is True
+
+    stored = runner.store.get("job", job["id"])
+    public = client.get(f"/api/subtask-review/source/exports/{job['id']}")
+    assert observed == [(job["id"], session)]
+    assert stored["slurm_execution_id"] == "execution-a"
+    assert "slurm_execution_id" not in public.text
+    assert "execution-a" not in public.text
 
 
 def test_two_windows_cannot_overwrite_a_draft(review_app):

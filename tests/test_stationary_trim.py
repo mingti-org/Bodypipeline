@@ -24,7 +24,8 @@ from pipeline.server.stationary_trim import (
     resolve_policy,
     summarize,
 )
-from pipeline.shared.core import DomainError, digest
+from pipeline.server.user_sessions import UserSession
+from pipeline.shared.core import DomainError, digest, now
 from pipeline.shared.identity import Principal
 
 SCENARIO = Path(__file__).parent / "fixtures/trim_scenario.py"
@@ -180,6 +181,78 @@ def test_manual_trim_permission_denial_does_not_enqueue(
         row.get("operation") == "manual_trim"
         for row in app.state.runner.store.all("job")
     )
+
+
+def test_personal_manual_trim_sanitizes_remote_worker_diagnostics(
+    settings_factory, tmp_path, monkeypatch
+):
+    settings = settings_factory(
+        "server",
+        letools_bin=sys.executable,
+        user_sessions={
+            "enabled": True,
+            "login_nodes": ["H800-node11"],
+        },
+    )
+    app = create_app(settings, background=False)
+    seed(app)
+    session = UserSession(
+        session_id="opaque-cookie",
+        execution_id="execution-a",
+        username="alice",
+        uid=1001,
+        login_node="H800-node11",
+        control_path=tmp_path / "private-control.sock",
+        expires_at=now() + 3600,
+    )
+    with app.state.user_sessions._lock:
+        app.state.user_sessions._by_token[session.session_id] = session
+        app.state.user_sessions._by_execution[session.execution_id] = session
+    principal = session.principal()
+    control_path = "/tmp/bodypipeline-501/ssh/alice-secret.sock"
+    session_token = "SSH_SESSION_TOKEN_8f93c"
+    diagnostic = (
+        f"ssh: ControlPath={control_path} session={session_token} "
+        "connection failed"
+    )
+    monkeypatch.setattr(
+        app.state.runner,
+        "require_principal_path_access",
+        lambda *_args, **_kwargs: None,
+    )
+    job = app.state.trims.enqueue_manual(
+        "source",
+        0,
+        [[1, 2]],
+        principal=principal,
+        in_place=False,
+    )
+
+    def popen(_session, _argv, **kwargs):
+        kwargs["stderr"].write(diagnostic.encode())
+        kwargs["stderr"].flush()
+        return SimpleNamespace(poll=lambda: 1, returncode=1)
+
+    def run(_session, _argv, **_kwargs):
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(app.state.user_sessions, "popen", popen)
+    monkeypatch.setattr(app.state.user_sessions, "run", run)
+
+    assert app.state.runner.tick() is True
+
+    stored = app.state.runner.store.get("job", job["id"])
+    error_log = Path(stored["work_path"]) / "trim.stderr.log"
+    with TestClient(app, headers=admin(settings)) as client:
+        public = client.get(f"/api/jobs/{job['id']}")
+
+    assert stored["state"] == "FAILED"
+    assert "手动裁剪失败" in stored["error"]
+    assert error_log.is_file()
+    for text in (stored["error"], error_log.read_text(), public.text):
+        assert control_path not in text
+        assert session_token not in text
+        assert "execution-a" not in text
 
 
 def test_manual_trim_dedup_is_per_submitter(settings_factory, monkeypatch):

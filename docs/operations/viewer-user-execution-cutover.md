@@ -253,6 +253,11 @@ new assignment.
 Legacy and internal rows without `slurm_execution_id` continue through the
 existing service-account execution and recovery path.
 
+The episode-score cache currently shuts down synchronously. `close()` waits for
+an active captured worker, so a Server shutdown can take up to the configured
+worker command timeout. Schedule maintenance accordingly and observe shutdown
+completion; a cancellable captured-command API is a later scoped change.
+
 Record the rollback time, release identifier, config digest, rollback owner,
 affected task IDs, final task states, and sanitized evidence that new
 machine-token and browser submissions use service-account metadata again.

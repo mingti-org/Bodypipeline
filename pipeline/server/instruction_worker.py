@@ -54,6 +54,11 @@ class InstructionApplyRunner:
                     "finished_at",
                     "report",
                     "error",
+                    "owner_user_id",
+                    "owner_uid",
+                    "submitted_as",
+                    "slurm_user",
+                    "submission_auth",
                 )
             }
         )
@@ -351,17 +356,25 @@ class InstructionApplyRunner:
         try:
             with self.runner.bind_record_session(row):
                 self.run(row)
-        except DomainError:
-            row.update(
-                state="INTERRUPTED",
-                stage="等待提交人重新登录",
-                progress="执行会话已失效，尚未继续恢复或写入",
-                error=(
-                    "H800 登录会话已失效；请重新登录后重新提交。"
-                    "重新提交会先执行事务恢复，再开始新的写入。"
-                ),
-                finished_at=now(),
-            )
+        except DomainError as exc:
+            if exc.code == 401:
+                row.update(
+                    state="INTERRUPTED",
+                    stage="等待提交人重新登录",
+                    progress="执行会话已失效，尚未继续恢复或写入",
+                    error=(
+                        "H800 登录会话已失效；请重新登录后重新提交。"
+                        "重新提交会先执行事务恢复，再开始新的写入。"
+                    ),
+                )
+            else:
+                row.update(
+                    state="FAILED",
+                    stage="应用失败",
+                    progress="任务未继续执行；数据集保持当前已提交状态",
+                    error=exc.message,
+                )
+            row["finished_at"] = now()
             self.store.put("instruction_apply", row["id"], row)
         return True
 

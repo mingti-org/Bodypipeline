@@ -643,6 +643,7 @@ class SubtaskExportRunner:
                 source_name = source_job.get("dataset_name") or dataset_id
                 output_name = dataset_name(body.name or f"{str(source_name)[:1970]}-revised")
                 metadata = self.runner.submission_metadata(principal)
+                self.runner.require_principal_path_access(principal, source)
                 key = "subtask-review:" + digest(
                     {
                         "source": str(source),

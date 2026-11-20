@@ -4,6 +4,7 @@ import json
 import os
 import signal
 import subprocess
+import tempfile
 import threading
 import time
 import uuid
@@ -72,8 +73,27 @@ class JobRunner:
 
     @contextmanager
     def bind_record_session(self, row):
-        execution_id = row.get("slurm_execution_id")
         personal = row.get("submission_auth") == "h800-ssh"
+        execution_row = row
+        if personal and not row.get("slurm_execution_id") and row.get("job_id"):
+            parent = self.store.get("job", row["job_id"])
+            ownership_fields = (
+                "owner_user_id",
+                "owner_uid",
+                "submitted_as",
+                "slurm_user",
+                "submission_auth",
+            )
+            if (
+                parent.get("submission_auth") != "h800-ssh"
+                or any(row.get(field) != parent.get(field) for field in ownership_fields)
+            ):
+                raise DomainError(
+                    "任务执行父记录与子任务提交人不匹配；已拒绝执行",
+                    403,
+                )
+            execution_row = parent
+        execution_id = execution_row.get("slurm_execution_id")
         session = None
         if execution_id:
             if self.user_sessions is None:
@@ -85,16 +105,16 @@ class JobRunner:
                     401,
                 )
             expected = {
-                "username": row.get("slurm_user"),
-                "uid": row.get("owner_uid"),
+                "username": execution_row.get("slurm_user"),
+                "uid": execution_row.get("owner_uid"),
             }
             actual = {
                 "username": session.username,
                 "uid": session.uid,
             }
             if (
-                row.get("owner_user_id") != session.username
-                or row.get("submitted_as") != session.username
+                execution_row.get("owner_user_id") != session.username
+                or execution_row.get("submitted_as") != session.username
                 or expected != actual
             ):
                 raise DomainError(
@@ -150,18 +170,102 @@ class JobRunner:
                 timeout=timeout,
                 env=environment,
             )
-        return self.user_sessions.run(
-            session,
-            command,
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-            env=environment,
-            remote_env=remote_env,
+        try:
+            result = self.user_sessions.run(
+                session,
+                command,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+                env=environment,
+                remote_env=remote_env,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise DomainError("远端命令执行超时；诊断已隐藏", 504) from exc
+        except OSError as exc:
+            raise DomainError("无法启动远端命令；请重新登录后重试", 503) from exc
+        result.stderr = self._remote_diagnostic(
+            result.stderr,
+            operation="远端命令",
+            failed=result.returncode != 0,
         )
+        return result
+
+    @staticmethod
+    def _remote_diagnostic(stderr, *, operation, failed):
+        """Reduce personal-user stderr to a useful, non-sensitive category."""
+
+        if not failed:
+            return ""
+        if isinstance(stderr, bytes):
+            text = stderr.decode("utf-8", errors="replace")
+        else:
+            text = str(stderr or "")
+        lowered = text.casefold()
+        if any(
+            marker in lowered
+            for marker in (
+                "controlpath",
+                "control socket",
+                "session=",
+                "session id",
+                "authentication failed",
+                "permission denied (publickey",
+                "host key verification failed",
+                "unauthorized",
+            )
+        ):
+            reason = "用户会话不可用；请重新登录"
+        elif "timed out" in lowered or "timeout" in lowered:
+            reason = "执行超时"
+        elif any(
+            marker in lowered
+            for marker in (
+                "permission denied",
+                "operation not permitted",
+                "access denied",
+                "read-only file system",
+            )
+        ):
+            reason = "权限不足"
+        elif any(
+            marker in lowered
+            for marker in (
+                "could not resolve hostname",
+                "connection refused",
+                "connection timed out",
+                "no route to host",
+                "network is unreachable",
+                "connection reset",
+                "broken pipe",
+                "connection failed",
+            )
+        ):
+            reason = "无法连接提交人的登录节点"
+        else:
+            reason = "远端诊断已隐藏"
+        return f"{operation}失败：{reason}"
+
+    @staticmethod
+    def _path_probe_checks(path, *, writable=False):
+        path = Path(path).resolve()
+        checks = []
+        for candidate in (path, *path.parents):
+            check = ("-x", str(candidate))
+            if check not in checks:
+                checks.append(check)
+        if writable:
+            checks.append(("-w", str(path)))
+        return checks
 
     def require_principal_path_access(
-        self, principal, dataset, *, writable=False
+        self,
+        principal,
+        dataset,
+        *,
+        writable=False,
+        work_root=None,
+        cache_root=None,
     ):
         if (
             principal is None
@@ -170,24 +274,34 @@ class JobRunner:
         ):
             return
         dataset = Path(dataset).resolve()
-        checks = [
-            ["-x", str(dataset)],
-            ["-r", str(dataset)],
-            ["-r", str(dataset / "meta/info.json")],
-        ]
+        if work_root is None:
+            work_root = self.settings.data_root or self.settings.root
+        if cache_root is None:
+            cache_root = self.settings.root / "viewer-cache"
+        checks = self._path_probe_checks(dataset)
+        checks.extend(
+            [
+                ("-r", str(dataset)),
+                ("-r", str(dataset / "meta/info.json")),
+            ]
+        )
         if writable:
             for relative in ("meta", "data", "videos"):
                 path = dataset / relative
                 if path.exists():
-                    checks.append(["-w", str(path)])
-            checks.append(["-w", str(dataset)])
+                    checks.append(("-w", str(path)))
+            checks.append(("-w", str(dataset)))
+        for root in (work_root, cache_root):
+            if root is not None:
+                checks.extend(self._path_probe_checks(root, writable=True))
+        checks = list(dict.fromkeys(checks))
         with self.bind_principal(principal) as session:
             if session is None:
                 raise DomainError("任务需要 H800 用户会话", 503)
-            for check in checks:
+            for operation, path in checks:
                 result = self.user_sessions.run(
                     session,
-                    ["/usr/bin/test", *check],
+                    ["/usr/bin/test", operation, path],
                     capture_output=True,
                     text=True,
                     timeout=15,
@@ -496,27 +610,88 @@ class JobRunner:
         # An allocation reused across one job's steps avoids paying the Slurm
         # queue latency three times for convert / validate / doctor.
         argv = self._scheduled(args, allocation=allocation)
-        with stdout.open("wb") as out, stderr.open("wb") as err:
-            share_data_path(stdout)
-            share_data_path(stderr)
-            env = self.settings.tool_environment()
-            process = self._popen(
-                argv,
-                stdout=out,
-                stderr=err,
-                start_new_session=True,
-                cwd=work,
-                env=env,
-                remote_env=remote_env,
-            )
-            code = self._wait_process(
-                process,
-                self.settings.command_timeout if timeout is None else timeout,
-                cancel_event=cancel_event,
-            )
+        code = self._run_logged_process(
+            argv,
+            stdout,
+            stderr,
+            operation=f"{name} 远端命令",
+            timeout=self.settings.command_timeout if timeout is None else timeout,
+            cancel_event=cancel_event,
+            start_new_session=True,
+            cwd=work,
+            env=self.settings.tool_environment(),
+            remote_env=remote_env,
+        )
         if name in {"convert", "merge", "trim", "subtask-export"}:
             self._share_user_work(work)
         return code, stdout, stderr
+
+    def _run_logged_process(
+        self,
+        argv,
+        stdout: Path,
+        stderr: Path,
+        *,
+        operation,
+        timeout,
+        cancel_event=None,
+        remote_env=None,
+        **popen_kwargs,
+    ):
+        """Stream stdout to disk while keeping personal stderr off shared logs."""
+
+        captured = (
+            tempfile.TemporaryFile()
+            if self.execution_session is not None
+            else None
+        )
+        code = None
+        try:
+            with stdout.open("wb") as out:
+                share_data_path(stdout)
+                if captured is None:
+                    with stderr.open("wb") as err:
+                        share_data_path(stderr)
+                        process = self._popen(
+                            argv,
+                            stdout=out,
+                            stderr=err,
+                            remote_env=remote_env,
+                            **popen_kwargs,
+                        )
+                        code = self._wait_process(
+                            process,
+                            timeout,
+                            cancel_event=cancel_event,
+                        )
+                else:
+                    process = self._popen(
+                        argv,
+                        stdout=out,
+                        stderr=captured,
+                        remote_env=remote_env,
+                        **popen_kwargs,
+                    )
+                    code = self._wait_process(
+                        process,
+                        timeout,
+                        cancel_event=cancel_event,
+                    )
+        finally:
+            if captured is not None:
+                captured.seek(0)
+                raw = captured.read()
+                captured.close()
+                stderr.write_text(
+                    self._remote_diagnostic(
+                        raw,
+                        operation=operation,
+                        failed=code != 0,
+                    ),
+                    encoding="utf-8",
+                )
+                share_data_path(stderr)
+        return code
 
     def _popen(self, argv, *, remote_env=None, **kwargs):
         session = self.execution_session
@@ -574,7 +749,11 @@ class JobRunner:
         if result.returncode:
             raise DomainError(
                 "无法发布 Slurm 用户的输出权限："
-                + (result.stderr or "chmod failed")[-1200:]
+                + self._remote_diagnostic(
+                    result.stderr,
+                    operation="输出权限发布",
+                    failed=True,
+                )
             )
 
     def _wait_process(self, process, timeout, *, cancel_event=None):
@@ -678,16 +857,16 @@ class JobRunner:
         stdout = work / "slurm-allocation.stdout.log"
         stderr = work / "slurm-allocation.stderr.log"
         try:
-            with stdout.open("wb") as out, stderr.open("wb") as err:
-                process = self._popen(
-                    argv,
-                    stdout=out,
-                    stderr=err,
-                    start_new_session=True,
-                    cwd=work,
-                    env=self.settings.tool_environment(),
-                )
-                code = self._wait_process(process, 900)
+            code = self._run_logged_process(
+                argv,
+                stdout,
+                stderr,
+                operation="Slurm 分配",
+                timeout=900,
+                start_new_session=True,
+                cwd=work,
+                env=self.settings.tool_environment(),
+            )
             if code:
                 raise DomainError(
                     "Slurm 分配失败：" + stderr.read_text(errors="replace")[-800:]
