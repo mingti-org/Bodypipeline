@@ -297,6 +297,20 @@ class InstructionApplyRunner:
             if row.get("state") == "CONVERTED":
                 self._remove_receipt(row)
                 continue
+            personal = bool(row.get("slurm_execution_id")) or (
+                row.get("submission_auth") == "h800-ssh"
+            )
+            if personal:
+                if row.get("state") == "RUNNING":
+                    row.update(
+                        state="QUEUED",
+                        stage="恢复中断任务",
+                        progress="进程重启，将在提交人会话绑定后检查事务凭据",
+                    )
+                    self.store.put(
+                        "instruction_apply", row["id"], row
+                    )
+                continue
             receipt = self._committed_receipt(row)
             if receipt is not None:
                 try:
@@ -367,7 +381,9 @@ class InstructionApplyRunner:
             raise DomainError("应用语言指令超时；事务将在下次启动时恢复", 504) from exc
         if result.returncode:
             raise DomainError(
-                "应用语言指令失败：" + result.stderr[-1600:], 409
+                "应用语言指令失败；无法安全展示远端诊断，"
+                "请检查数据集或重新登录后重试",
+                409,
             )
         try:
             return json.loads(result.stdout)

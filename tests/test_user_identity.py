@@ -1,3 +1,4 @@
+import json
 import stat
 from pathlib import Path
 from types import SimpleNamespace
@@ -558,6 +559,110 @@ def test_instruction_worker_interrupts_when_bound_session_expired(
     assert local_calls == []
 
 
+def test_instruction_startup_recovery_defers_personal_receipt_until_bound(
+    settings_factory,
+):
+    settings = settings_factory("server")
+    store = Store(settings.root / "state")
+    dataset = settings.root / "dataset"
+    meta = dataset / "meta"
+    meta.mkdir(parents=True)
+    apply_id = "apply-personal-receipt"
+    journal = (
+        meta / f".bodypipeline-instruction-journal-{apply_id}.json"
+    )
+    journal.write_text(
+        json.dumps(
+            {
+                "state": "committed",
+                "operation_id": apply_id,
+                "report": {"updated_episodes": [0]},
+            }
+        )
+    )
+    stage = (
+        meta / f".bodypipeline-instruction-stage-{apply_id}"
+    )
+    backup = (
+        meta / f".bodypipeline-instruction-backup-{apply_id}"
+    )
+    stage.mkdir()
+    backup.mkdir()
+    (stage / "private-evidence").write_text("stage")
+    (backup / "private-evidence").write_text("backup")
+    spec = settings.root / "reports" / f"instruction-apply-{apply_id}.json"
+    spec.parent.mkdir(parents=True)
+    spec.write_text(
+        json.dumps(
+            {
+                "operation_id": apply_id,
+                "dataset_path": str(dataset),
+                "assignments": [],
+            }
+        )
+    )
+
+    class ExpiredBroker:
+        def session_for_execution(self, execution_id):
+            assert execution_id == "expired-execution"
+            return None
+
+    execution = JobRunner(
+        settings,
+        SimpleNamespace(store=store),
+        user_sessions=ExpiredBroker(),
+    )
+    finalized = []
+    worker = InstructionApplyRunner(
+        settings,
+        store,
+        SimpleNamespace(
+            resolve=lambda dataset_id: None,
+            finalize_apply=lambda *args: finalized.append(args),
+        ),
+        runner=execution,
+    )
+    store.put(
+        "instruction_apply",
+        apply_id,
+        {
+            "id": apply_id,
+            "dataset_id": "source",
+            "dataset_key": "dataset-key",
+            "dataset_path": str(dataset),
+            "source_signature": "a" * 64,
+            "spec_path": str(spec),
+            "state": "RUNNING",
+            "owner_user_id": "alice",
+            "owner_uid": 1001,
+            "submitted_as": "alice",
+            "slurm_user": "alice",
+            "slurm_execution_id": "expired-execution",
+            "submission_auth": "h800-ssh",
+        },
+    )
+
+    worker.recover()
+
+    recovered = store.get("instruction_apply", apply_id)
+    assert recovered["state"] == "QUEUED"
+    assert journal.is_file()
+    assert stage.is_dir()
+    assert backup.is_dir()
+    assert "committed_report" not in json.loads(spec.read_text())
+    assert finalized == []
+
+    assert worker.tick() is True
+
+    interrupted = store.get("instruction_apply", apply_id)
+    assert interrupted["state"] == "INTERRUPTED"
+    assert "重新登录" in interrupted["error"]
+    assert journal.is_file()
+    assert stage.is_dir()
+    assert backup.is_dir()
+    assert finalized == []
+
+
 def test_instruction_worker_interrupts_when_session_expires_during_work(
     settings_factory, monkeypatch
 ):
@@ -677,6 +782,79 @@ def test_instruction_worker_interrupts_when_rollback_session_expires(
         ("recover", str(dataset)),
         ("recover", str(dataset)),
     ]
+
+
+def test_instruction_worker_redacts_private_ssh_diagnostics(
+    settings_factory, tmp_path, monkeypatch
+):
+    settings = settings_factory("server")
+    store = Store(settings.root / "state")
+    dataset = settings.root / "dataset"
+    dataset.mkdir()
+
+    class ActiveBroker:
+        def session_for_execution(self, execution_id):
+            return SimpleNamespace(username="alice", uid=1001)
+
+    execution = JobRunner(
+        settings,
+        SimpleNamespace(store=store),
+        user_sessions=ActiveBroker(),
+    )
+    control_path = (
+        "/tmp/bodypipeline-501/ssh/alice-0123456789abcdef.sock"
+    )
+    execution_handle = "private-execution-handle"
+    diagnostic = (
+        "ssh: connect to socket "
+        f"{control_path} failed; session={execution_handle}"
+    )
+
+    def run_captured(argv, *, timeout, remote_env=None):
+        return SimpleNamespace(
+            returncode=255,
+            stdout="",
+            stderr=diagnostic,
+        )
+
+    monkeypatch.setattr(execution, "run_captured", run_captured)
+    tool = executable(tmp_path / "letools", "")
+    executable(tool.with_name("python"), "")
+    worker = InstructionApplyRunner(
+        settings,
+        store,
+        SimpleNamespace(resolve=lambda dataset_id: None),
+        runner=execution,
+    )
+    monkeypatch.setattr(
+        "pipeline.server.instruction_worker.executable_path",
+        lambda value: str(tool),
+    )
+    row = {
+        "id": "apply-private-diagnostic",
+        "dataset_id": "source",
+        "dataset_key": "dataset-key",
+        "dataset_path": str(dataset),
+        "spec_path": str(settings.root / "missing-spec.json"),
+        "state": "QUEUED",
+        "owner_user_id": "alice",
+        "owner_uid": 1001,
+        "submitted_as": "alice",
+        "slurm_user": "alice",
+        "slurm_execution_id": "execution-a",
+        "submission_auth": "h800-ssh",
+    }
+    store.put("instruction_apply", row["id"], row)
+
+    assert worker.tick() is True
+
+    stored = store.get("instruction_apply", row["id"])
+    public = worker._public(stored)
+    assert "应用语言指令失败" in stored["error"]
+    assert "应用语言指令失败" in public["error"]
+    for private in (control_path, execution_handle):
+        assert private not in stored["error"]
+        assert private not in json.dumps(public, ensure_ascii=False)
 
 
 def test_task_apis_never_return_private_execution_handle(settings_factory):
