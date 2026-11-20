@@ -34,6 +34,7 @@ from .dataset_management import DELETION_STATES, DatasetManager
 from .datasets import TARGET_FORMATS, batch_name_for_job, dataset_for_job
 from .deliveries import DeliveryScanner
 from .episode_validation import InvalidEpisodePolicy
+from .execution_identity import execution_principal
 from .imports import ImportService
 from .ingest import IngestService
 from .instruction_review import (
@@ -729,7 +730,7 @@ def create_app(settings, background=True):
         def embedded_score_status(dataset_id: str, request: Request):
             row = registered_preview(viewer_transport, dataset_id)
             result = viewer_transport.scores.status(
-                row, principal=principal(request)
+                row, principal=execution_principal(settings, request)
             )
             return embedded_json(result)
 
@@ -737,7 +738,7 @@ def create_app(settings, background=True):
         def embedded_score_start(dataset_id: str, request: Request):
             row = registered_preview(viewer_transport, dataset_id)
             result = viewer_transport.scores.start(
-                row, principal=principal(request)
+                row, principal=execution_principal(settings, request)
             )
             return embedded_json(result, status_code=202)
 
@@ -776,7 +777,7 @@ def create_app(settings, background=True):
                 name=body.name,
                 run_doctor=body.run_doctor,
                 in_place=body.in_place,
-                principal=principal(request),
+                principal=execution_principal(settings, request),
             )
             return embedded_json(job_response(job), status_code=202)
 
@@ -914,7 +915,7 @@ def create_app(settings, background=True):
                 name=body.name,
                 run_doctor=body.run_doctor,
                 in_place=body.in_place,
-                principal=principal(request),
+                principal=execution_principal(settings, request),
             )
         )
 
@@ -1062,7 +1063,7 @@ def create_app(settings, background=True):
             dataset_id,
             body,
             episode_indices={episode},
-            principal=principal(request),
+            principal=execution_principal(settings, request),
         )
 
     @app.post("/api/instructions/{dataset_id}/apply", status_code=202)
@@ -1070,7 +1071,9 @@ def create_app(settings, background=True):
         dataset_id: str, body: ApplyInstructionsRequest, request: Request
     ):
         return instruction_apply.enqueue(
-            dataset_id, body, principal=principal(request)
+            dataset_id,
+            body,
+            principal=execution_principal(settings, request),
         )
 
     @app.get("/api/instructions/{dataset_id}/apply/{apply_id}")
@@ -1093,7 +1096,7 @@ def create_app(settings, background=True):
         job = runner.subtask_exports.enqueue_review(
             dataset_id,
             body,
-            principal=principal(request),
+            principal=execution_principal(settings, request),
         )
         return {
             k: job.get(k) for k in ("id", "state", "stage", "dataset_name", "error")

@@ -213,6 +213,7 @@ def test_embedded_score_endpoint_passes_principal(
     settings = settings_factory(
         "server",
         viewer_gateway={"embedded": True},
+        viewer_execution_identity={"enabled": True},
         user_sessions={
             "enabled": True,
             "login_nodes": ["H800-node11"],
@@ -260,6 +261,7 @@ def test_embedded_score_status_passes_principal(
     settings = settings_factory(
         "server",
         viewer_gateway={"embedded": True},
+        viewer_execution_identity={"enabled": True},
         user_sessions={
             "enabled": True,
             "login_nodes": ["H800-node11"],

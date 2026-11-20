@@ -223,19 +223,32 @@ def test_manual_trim_dedup_is_per_submitter(settings_factory, monkeypatch):
 
 
 @pytest.mark.parametrize(
+    ("identity_enabled", "submitted_as", "execution_id"),
+    [
+        (True, "alice", "execution-a"),
+        (False, "service-account", None),
+    ],
+)
+@pytest.mark.parametrize(
     "path",
     [
         "/api/jobs/source/manual-trims",
         "/api/manual-trims/source",
     ],
 )
-def test_manual_trim_routes_queue_as_authenticated_principal(
-    settings_factory, monkeypatch, path
+def test_manual_trim_routes_respect_identity_gate(
+    settings_factory,
+    monkeypatch,
+    path,
+    identity_enabled,
+    submitted_as,
+    execution_id,
 ):
     settings = settings_factory(
         "server",
         letools_bin=sys.executable,
         viewer_gateway={"embedded": True},
+        viewer_execution_identity={"enabled": identity_enabled},
         viewer_origin="http://testserver",
         user_sessions={
             "enabled": True,
@@ -276,9 +289,9 @@ def test_manual_trim_routes_queue_as_authenticated_principal(
     assert response.status_code == 202, response.text
     body = response.json()
     stored = app.state.runner.store.get("job", body["id"])
-    assert body["submitted_as"] == "alice"
+    assert body["submitted_as"] == submitted_as
     assert "slurm_execution_id" not in body
-    assert stored["slurm_execution_id"] == "execution-a"
+    assert stored["slurm_execution_id"] == execution_id
 
 
 def completed_preview(app, preview_id, episodes=None):

@@ -232,6 +232,9 @@ def test_instruction_apply_routes_pass_the_authenticated_principal(
     instruction_app, monkeypatch
 ):
     worker = instruction_app.state.instruction_apply
+    instruction_app.state.runner.settings.viewer_execution_identity = {
+        "enabled": True
+    }
     calls = []
 
     def enqueue(dataset_id, body, episode_indices=None, *, principal):
@@ -267,6 +270,7 @@ def test_embedded_instruction_apply_passes_browser_principal(
     settings = settings_factory(
         "server",
         viewer_gateway={"embedded": True},
+        viewer_execution_identity={"enabled": True},
         user_sessions={
             "enabled": True,
             "login_nodes": ["H800-node11"],
@@ -315,12 +319,14 @@ def test_embedded_instruction_apply_passes_browser_principal(
     assert captured[0]["principal"] is user
 
 
-def test_other_viewer_compute_routes_forward_principal(
-    settings_factory, tmp_path, monkeypatch
+@pytest.mark.parametrize("identity_enabled", [True, False])
+def test_other_viewer_compute_routes_respect_identity_gate(
+    settings_factory, tmp_path, monkeypatch, identity_enabled
 ):
     settings = settings_factory(
         "server",
         viewer_gateway={"embedded": True},
+        viewer_execution_identity={"enabled": identity_enabled},
         user_sessions={
             "enabled": True,
             "login_nodes": ["H800-node11"],
@@ -387,6 +393,10 @@ def test_other_viewer_compute_routes_forward_principal(
         seen["score"] = (preview["job_id"], principal)
         return {"state": "QUEUED"}
 
+    def score_status(preview, *, principal):
+        seen["score_status"] = (preview["job_id"], principal)
+        return {"state": "NONE"}
+
     monkeypatch.setattr(
         app.state.instruction_apply, "enqueue", episode_enqueue
     )
@@ -398,6 +408,9 @@ def test_other_viewer_compute_routes_forward_principal(
     )
     monkeypatch.setattr(
         app.state.viewer_transport.scores, "start", score_start
+    )
+    monkeypatch.setattr(
+        app.state.viewer_transport.scores, "status", score_status
     )
     origin = {"Origin": "http://testserver"}
 
@@ -427,6 +440,10 @@ def test_other_viewer_compute_routes_forward_principal(
             },
             headers=origin,
         )
+        score_status_response = client.get(
+            "/api/episode-scores/source",
+            headers=origin,
+        )
         client.cookies.clear()
         anonymous_score = client.post(
             "/api/episode-scores/source",
@@ -442,16 +459,20 @@ def test_other_viewer_compute_routes_forward_principal(
     assert manual.status_code == 202
     assert review.status_code == 202
     assert score.status_code == 202
+    assert score_status_response.status_code == 200
     assert anonymous_score.status_code == 401
     assert seen["episode"][0] == "source"
     assert seen["episode"][1] == {0}
     assert seen["manual"][0] == "source"
     assert seen["review"][0] == "source"
     assert seen["score"][0] == "source"
-    assert seen["episode"][2] is user
-    assert seen["manual"][1] is user
-    assert seen["review"][1] is user
-    assert seen["score"][1] is user
+    assert seen["score_status"][0] == "source"
+    expected = user if identity_enabled else None
+    assert seen["episode"][2] is expected
+    assert seen["manual"][1] is expected
+    assert seen["review"][1] is expected
+    assert seen["score"][1] is expected
+    assert seen["score_status"][1] is expected
 
 
 def test_embedded_compute_apis_keep_machine_token_as_service_account(
@@ -460,6 +481,7 @@ def test_embedded_compute_apis_keep_machine_token_as_service_account(
     settings = settings_factory(
         "server",
         viewer_gateway={"embedded": True},
+        viewer_execution_identity={"enabled": True},
     )
     app = create_app(settings, background=False)
     captured = []

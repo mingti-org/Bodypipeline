@@ -127,6 +127,7 @@ class Settings:
     trusted_network: bool = False
     viewer_origin: str = "http://127.0.0.1:8082"
     viewer_gateway: dict = field(default_factory=dict)
+    viewer_execution_identity: dict = field(default_factory=dict)
     viewer_ui_port: int = 3100
     viewer_data_port: int = 8765
     viewer_ttl: int = 1800
@@ -192,6 +193,7 @@ class Settings:
         if type(self.trusted_network) is not bool:
             raise ValueError("trusted_network 必须是布尔值")
         self._validate_viewer_gateway_configuration()
+        self._validate_viewer_execution_identity_configuration()
         from .execution_budget import ExecutionBudget
 
         ExecutionBudget.resolve(self.slurm)
@@ -211,6 +213,21 @@ class Settings:
             and type(self.viewer_gateway["embedded"]) is not bool
         ):
             raise ValueError("viewer_gateway.embedded 必须为布尔值")
+
+    def _validate_viewer_execution_identity_configuration(self):
+        if not isinstance(self.viewer_execution_identity, dict):
+            raise ValueError("viewer_execution_identity 必须是对象")
+        unknown = set(self.viewer_execution_identity) - {"enabled"}
+        if unknown:
+            raise ValueError(
+                "viewer_execution_identity 包含未知字段："
+                + ", ".join(sorted(unknown))
+            )
+        if (
+            "enabled" in self.viewer_execution_identity
+            and type(self.viewer_execution_identity["enabled"]) is not bool
+        ):
+            raise ValueError("viewer_execution_identity.enabled 必须为布尔值")
 
     @classmethod
     def load(cls, role: str, path: str | None = None):

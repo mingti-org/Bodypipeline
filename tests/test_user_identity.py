@@ -61,6 +61,74 @@ for value in sys.argv:
     return ssh, sshpass, password_probe, argv_probe, env_probe
 
 
+def test_viewer_execution_identity_configuration_is_strict(
+    settings_factory,
+):
+    assert settings_factory("server").viewer_execution_identity == {}
+    enabled = settings_factory(
+        "server",
+        viewer_execution_identity={"enabled": True},
+    )
+    assert enabled.viewer_execution_identity == {"enabled": True}
+
+    with pytest.raises(ValueError, match="viewer_execution_identity"):
+        settings_factory(
+            "server",
+            viewer_execution_identity={"enabled": "yes"},
+        )
+    with pytest.raises(ValueError, match="viewer_execution_identity"):
+        settings_factory(
+            "server",
+            viewer_execution_identity={"unknown": True},
+        )
+
+
+def test_disabled_identity_gate_attributes_new_task_to_service(
+    settings_factory, monkeypatch
+):
+    settings = settings_factory(
+        "server",
+        viewer_execution_identity={"enabled": False},
+        user_sessions={
+            "enabled": True,
+            "login_nodes": ["H800-node11"],
+        },
+    )
+    app = create_app(settings, background=False)
+    user = Principal(
+        username="alice",
+        uid=1001,
+        login_node="H800-node11",
+        execution_id="execution-a",
+        auth_method="h800-ssh",
+    )
+    monkeypatch.setattr(
+        app.state.user_sessions,
+        "principal",
+        lambda cookie: user if cookie == "opaque-user-cookie" else None,
+    )
+    captured = []
+
+    def enqueue(*args, principal, **kwargs):
+        captured.append(principal)
+        return {"id": "apply-a", "state": "QUEUED"}
+
+    monkeypatch.setattr(app.state.instruction_apply, "enqueue", enqueue)
+    with TestClient(app) as client:
+        client.cookies.set("pipeline_server", "opaque-user-cookie")
+        response = client.post(
+            "/api/instructions/source/apply",
+            json={
+                "revision": 0,
+                "source_signature": "a" * 64,
+            },
+            headers={"Origin": "http://testserver"},
+        )
+
+    assert response.status_code == 202
+    assert captured == [None]
+
+
 def test_h800_login_keeps_password_out_of_argv_and_session_state(
     settings_factory, tmp_path
 ):
