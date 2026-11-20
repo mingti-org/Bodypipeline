@@ -6,6 +6,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from pipeline.server.app import create_app
+from pipeline.server.instruction_worker import InstructionApplyRunner
 from pipeline.server.jobs import JobRunner
 from pipeline.server.user_sessions import SlurmIdentityBroker, UserSession
 from pipeline.shared.core import DomainError, Store, now
@@ -469,6 +470,213 @@ def test_captured_command_requires_explicit_binding(settings_factory):
     )
     with pytest.raises(DomainError, match="必须绑定提交人身份"):
         runner.run_captured(["true"], timeout=1)
+
+
+def test_instruction_worker_uses_bound_remote_command(
+    settings_factory, tmp_path, monkeypatch
+):
+    settings = settings_factory("server")
+    store = Store(settings.root / "state")
+    review = SimpleNamespace()
+    tool = executable(tmp_path / "letools", "")
+    executable(tool.with_name("python"), "")
+
+    class FakeRunner:
+        execution_session = object()
+
+        def run_captured(self, argv, *, timeout, remote_env=None):
+            assert argv[1].endswith("instruction_writer_worker.py")
+            assert argv[2] == "recover"
+            assert timeout == settings.command_timeout
+            return SimpleNamespace(
+                returncode=0,
+                stdout='{"operation_id": "apply-a"}',
+                stderr="",
+            )
+
+    worker = InstructionApplyRunner(
+        settings, store, review, runner=FakeRunner()
+    )
+    monkeypatch.setattr(
+        "pipeline.server.instruction_worker.executable_path",
+        lambda value: str(tool),
+    )
+
+    result = worker._worker("recover", "/workspace/dataset")
+    assert result == {"operation_id": "apply-a"}
+
+
+def test_instruction_worker_interrupts_when_bound_session_expired(
+    settings_factory, monkeypatch
+):
+    settings = settings_factory("server")
+    store = Store(settings.root / "state")
+
+    class ExpiredBroker:
+        def session_for_execution(self, execution_id):
+            assert execution_id == "expired"
+            return None
+
+    execution = JobRunner(
+        settings,
+        SimpleNamespace(store=store),
+        user_sessions=ExpiredBroker(),
+    )
+    worker = InstructionApplyRunner(
+        settings, store, SimpleNamespace(), runner=execution
+    )
+    store.put(
+        "instruction_apply",
+        "apply-expired",
+        {
+            "id": "apply-expired",
+            "dataset_id": "source",
+            "state": "QUEUED",
+            "owner_user_id": "alice",
+            "owner_uid": 1001,
+            "submitted_as": "alice",
+            "slurm_user": "alice",
+            "slurm_execution_id": "expired",
+            "submission_auth": "h800-ssh",
+        },
+    )
+    worker_calls = []
+    monkeypatch.setattr(
+        worker, "run", lambda row: worker_calls.append(row)
+    )
+    local_calls = []
+    monkeypatch.setattr(
+        "pipeline.server.instruction_worker.subprocess.run",
+        lambda *args, **kwargs: local_calls.append((args, kwargs)),
+    )
+
+    assert worker.tick() is True
+    row = store.get("instruction_apply", "apply-expired")
+    assert row["state"] == "INTERRUPTED"
+    assert "重新登录" in row["error"]
+    assert worker_calls == []
+    assert local_calls == []
+
+
+def test_instruction_worker_interrupts_when_session_expires_during_work(
+    settings_factory, monkeypatch
+):
+    settings = settings_factory("server")
+    store = Store(settings.root / "state")
+    dataset = settings.root / "dataset"
+    dataset.mkdir()
+
+    class ActiveBroker:
+        def session_for_execution(self, execution_id):
+            return SimpleNamespace(username="alice", uid=1001)
+
+    execution = JobRunner(
+        settings,
+        SimpleNamespace(store=store),
+        user_sessions=ActiveBroker(),
+    )
+    worker = InstructionApplyRunner(
+        settings,
+        store,
+        SimpleNamespace(resolve=lambda dataset_id: None),
+        runner=execution,
+    )
+    row = {
+        "id": "apply-expired-midflight",
+        "dataset_id": "source",
+        "dataset_key": "dataset-key",
+        "dataset_path": str(dataset),
+        "state": "QUEUED",
+        "owner_user_id": "alice",
+        "owner_uid": 1001,
+        "submitted_as": "alice",
+        "slurm_user": "alice",
+        "slurm_execution_id": "execution-a",
+        "submission_auth": "h800-ssh",
+    }
+    store.put("instruction_apply", row["id"], row)
+    monkeypatch.setattr(
+        worker, "_committed_receipt", lambda active: None
+    )
+    monkeypatch.setattr(
+        worker,
+        "_worker",
+        lambda *args: (_ for _ in ()).throw(
+            DomainError("任务发起者的 H800 登录会话已过期；请重新登录", 401)
+        ),
+    )
+
+    assert worker.tick() is True
+    persisted = store.get("instruction_apply", row["id"])
+    assert persisted["state"] == "INTERRUPTED"
+    assert "重新登录" in persisted["error"]
+
+
+def test_instruction_worker_interrupts_when_rollback_session_expires(
+    settings_factory, monkeypatch
+):
+    settings = settings_factory("server")
+    store = Store(settings.root / "state")
+    dataset = settings.root / "dataset"
+    dataset.mkdir()
+
+    class ActiveBroker:
+        def session_for_execution(self, execution_id):
+            return SimpleNamespace(username="alice", uid=1001)
+
+    execution = JobRunner(
+        settings,
+        SimpleNamespace(store=store),
+        user_sessions=ActiveBroker(),
+    )
+    worker = InstructionApplyRunner(
+        settings,
+        store,
+        SimpleNamespace(resolve=lambda dataset_id: None),
+        runner=execution,
+    )
+    row = {
+        "id": "apply-expired-during-rollback",
+        "dataset_id": "source",
+        "dataset_key": "dataset-key",
+        "dataset_path": str(dataset),
+        "state": "QUEUED",
+        "owner_user_id": "alice",
+        "owner_uid": 1001,
+        "submitted_as": "alice",
+        "slurm_user": "alice",
+        "slurm_execution_id": "execution-a",
+        "submission_auth": "h800-ssh",
+    }
+    store.put("instruction_apply", row["id"], row)
+    worker_calls = []
+
+    def run_worker(*args):
+        worker_calls.append(args)
+        if len(worker_calls) == 1:
+            return {}
+        raise DomainError(
+            "任务发起者的 H800 登录会话已过期；请重新登录", 401
+        )
+
+    monkeypatch.setattr(worker, "_committed_receipt", lambda active: None)
+    monkeypatch.setattr(worker, "_worker", run_worker)
+    monkeypatch.setattr(
+        worker,
+        "_frozen_assignments",
+        lambda active: (_ for _ in ()).throw(
+            DomainError("排队期间来源数据已变化", 409)
+        ),
+    )
+
+    assert worker.tick() is True
+    persisted = store.get("instruction_apply", row["id"])
+    assert persisted["state"] == "INTERRUPTED"
+    assert "重新登录" in persisted["error"]
+    assert worker_calls == [
+        ("recover", str(dataset)),
+        ("recover", str(dataset)),
+    ]
 
 
 def test_task_apis_never_return_private_execution_handle(settings_factory):

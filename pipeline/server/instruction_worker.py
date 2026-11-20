@@ -8,6 +8,7 @@ import subprocess
 import threading
 import uuid
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from pipeline.shared.core import (
     DomainError,
@@ -16,15 +17,25 @@ from pipeline.shared.core import (
     executable_path,
     now,
 )
-from pipeline.shared.identity import public_execution_record
+from pipeline.shared.identity import Principal, public_execution_record
 
 from .instruction_review import ApplyInstructionsRequest, InstructionReview
 from .recycle import dataset_lock
 
+if TYPE_CHECKING:
+    from .jobs import JobRunner
+
 
 class InstructionApplyRunner:
-    def __init__(self, settings, store, review: InstructionReview):
+    def __init__(
+        self,
+        settings,
+        store,
+        review: InstructionReview,
+        runner: JobRunner,
+    ):
         self.settings, self.store, self.review = settings, store, review
+        self.runner = runner
         self.lock = threading.RLock()
 
     @staticmethod
@@ -177,16 +188,22 @@ class InstructionApplyRunner:
                         409,
                     )
 
-    def enqueue(self, dataset_id, body, episode_indices: set[int] | None = None):
+    def enqueue(
+        self,
+        dataset_id,
+        body,
+        episode_indices: set[int] | None = None,
+        *,
+        principal: Principal | None = None,
+    ):
         key, path, _ = self.review.resolve(dataset_id)
         with self.lock, dataset_lock(self.store, key):
             key, path, _, snapshot, draft, assignments = self.review.apply_plan(
                 dataset_id, body, episode_indices
             )
             self._active_job_blocker(path)
-            episode_scope = (
-                self._episode_scope(episode_indices)
-            )
+            episode_scope = self._episode_scope(episode_indices)
+            metadata = self.runner.submission_metadata(principal)
             fingerprint = digest(
                 {
                     "dataset": key,
@@ -194,6 +211,7 @@ class InstructionApplyRunner:
                     "source_signature": snapshot["signature"],
                     "episode_indices": episode_scope,
                     "assignments": assignments,
+                    "submitted_by": metadata["submitted_as"],
                 }
             )
             for row in self.store.all("instruction_apply"):
@@ -218,6 +236,11 @@ class InstructionApplyRunner:
                     "该数据集已有另一批语言指令正在应用，请等待完成",
                     409,
                 )
+            self.runner.require_principal_path_access(
+                principal,
+                path,
+                writable=True,
+            )
             apply_id = uuid.uuid4().hex
             spec_path = (
                 self.settings.root
@@ -257,6 +280,7 @@ class InstructionApplyRunner:
                 "stage": "等待应用",
                 "progress": "已冻结 Episode 指令与来源版本",
                 "created_at": now(),
+                **metadata,
             }
             self.store.put("instruction_apply", apply_id, row)
             return self._public(row)
@@ -309,7 +333,19 @@ class InstructionApplyRunner:
         ]
         if not queued:
             return False
-        self.run(queued[-1])
+        row = queued[-1]
+        try:
+            with self.runner.bind_record_session(row):
+                self.run(row)
+        except DomainError as exc:
+            row.update(
+                state="INTERRUPTED",
+                stage="等待提交人重新登录",
+                progress="执行会话已失效，尚未继续恢复或写入",
+                error=exc.message,
+                finished_at=now(),
+            )
+            self.store.put("instruction_apply", row["id"], row)
         return True
 
     def _worker(self, *args):
@@ -318,16 +354,14 @@ class InstructionApplyRunner:
         if python is None or not python.is_file():
             raise DomainError("应用语言指令需要 LeTools Python 环境", 503)
         try:
-            result = subprocess.run(
+            result = self.runner.run_captured(
                 [
                     str(python),
                     str(Path(__file__).with_name("instruction_writer_worker.py")),
                     *args,
                 ],
-                capture_output=True,
-                text=True,
                 timeout=self.settings.command_timeout,
-                env=self.settings.tool_environment(),
+                remote_env=None,
             )
         except subprocess.TimeoutExpired as exc:
             raise DomainError("应用语言指令超时；事务将在下次启动时恢复", 504) from exc
@@ -388,6 +422,8 @@ class InstructionApplyRunner:
                     self._complete_committed(row, report)
                     return row
             except Exception as exc:
+                if isinstance(exc, DomainError) and exc.code == 401:
+                    raise
                 try:
                     with dataset_lock(self.store, row["dataset_key"]):
                         receipt = self._committed_receipt(row)
@@ -398,6 +434,11 @@ class InstructionApplyRunner:
                         self.review.resolve(row["dataset_id"])
                         self._worker("recover", str(path))
                 except Exception as recovery_exc:
+                    if (
+                        isinstance(recovery_exc, DomainError)
+                        and recovery_exc.code == 401
+                    ):
+                        raise
                     row.update(
                         state="RUNNING",
                         stage="自动回滚失败",

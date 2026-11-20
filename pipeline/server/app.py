@@ -232,7 +232,7 @@ def create_app(settings, background=True):
     subtask_review = SubtaskReview(settings, ingest.store)
     instruction_review = InstructionReview(settings, ingest.store)
     instruction_apply = InstructionApplyRunner(
-        settings, ingest.store, instruction_review
+        settings, ingest.store, instruction_review, runner=runner
     )
     checks = QualityRunner(
         settings,
@@ -1047,17 +1047,25 @@ def create_app(settings, background=True):
         status_code=202,
     )
     def instruction_episode_apply(
-        dataset_id: str, episode: int, body: ApplyInstructionsRequest
+        dataset_id: str,
+        episode: int,
+        body: ApplyInstructionsRequest,
+        request: Request,
     ):
         return instruction_apply.enqueue(
-            dataset_id, body, episode_indices={episode}
+            dataset_id,
+            body,
+            episode_indices={episode},
+            principal=principal(request),
         )
 
     @app.post("/api/instructions/{dataset_id}/apply", status_code=202)
     def instruction_apply_start(
-        dataset_id: str, body: ApplyInstructionsRequest
+        dataset_id: str, body: ApplyInstructionsRequest, request: Request
     ):
-        return instruction_apply.enqueue(dataset_id, body)
+        return instruction_apply.enqueue(
+            dataset_id, body, principal=principal(request)
+        )
 
     @app.get("/api/instructions/{dataset_id}/apply/{apply_id}")
     def instruction_apply_status(dataset_id: str, apply_id: str):
