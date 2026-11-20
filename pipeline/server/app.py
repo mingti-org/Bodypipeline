@@ -17,7 +17,7 @@ from pipeline.shared.collections import (
     visible_collection_uploads,
 )
 from pipeline.shared.core import DomainError, ProcessLock, executable_path
-from pipeline.shared.identity import Principal, require_owner
+from pipeline.shared.identity import Principal, require_task_access
 from pipeline.shared.security import install_security
 from pipeline.shared.web import ListCompressionMiddleware, mount_ui
 
@@ -252,9 +252,11 @@ def create_app(settings, background=True):
             raise DomainError("请先登录或提供有效凭据", 401)
         return value
 
-    def owned_job(identifier: str, request: Request, *, action: str = "操作") -> dict:
+    def accessible_job(
+        identifier: str, request: Request, *, action: str = "操作"
+    ) -> dict:
         row = ingest.store.get("job", identifier)
-        require_owner(row, principal(request), action=action)
+        require_task_access(row, principal(request), action=action)
         return row
 
     def check_tick():
@@ -477,7 +479,7 @@ def create_app(settings, background=True):
     @app.post("/api/dataset-deletions", status_code=202)
     def delete_dataset(body: DatasetDeletionRequest, request: Request):
         if body.kind == "result":
-            owned_job(body.id, request, action="删除")
+            accessible_job(body.id, request, action="删除")
         return datasets.enqueue(body.kind, body.id, body.confirmation)
 
     @app.post("/api/dataset-deletions/{identifier}/retry", status_code=202)
@@ -745,7 +747,7 @@ def create_app(settings, background=True):
     def trim_preview_start(
         jid: str, request: Request, body: TrimPreviewRequest | None = None
     ):
-        owned_job(jid, request, action="检测")
+        accessible_job(jid, request, action="检测")
         options = (body or TrimPreviewRequest()).options
         return trims.enqueue_preview(
             jid,
@@ -759,7 +761,7 @@ def create_app(settings, background=True):
 
     @app.post("/api/jobs/{jid}/trims", status_code=202)
     def trim_start(jid: str, body: TrimRequest, request: Request):
-        owned_job(jid, request, action="裁剪")
+        accessible_job(jid, request, action="裁剪")
         return job_response(
             trims.enqueue(
                 jid,
@@ -810,12 +812,12 @@ def create_app(settings, background=True):
     def save_dataset_description(
         jid: str, body: DatasetDescriptionRequest, request: Request
     ):
-        owned_job(jid, request, action="修改说明")
+        accessible_job(jid, request, action="修改说明")
         return descriptions.save(jid, body)
 
     @app.post("/api/jobs/{jid}/checks", status_code=202)
     def run_check(jid: str, request: Request):
-        owned_job(jid, request, action="质检")
+        accessible_job(jid, request, action="质检")
         # Doctor and the content analysis answer different questions about the
         # same dataset, so starting one starts both. Argus does not need letools,
         # so it is enqueued first: a broken Doctor install must not hide it.
@@ -841,7 +843,7 @@ def create_app(settings, background=True):
         request: Request,
         body: AnalysisRequest | None = Body(default=None),
     ):
-        owned_job(jid, request, action="分析")
+        accessible_job(jid, request, action="分析")
         options = body or AnalysisRequest()
         return analyses.enqueue(
             jid,
@@ -861,7 +863,7 @@ def create_app(settings, background=True):
 
     @app.post("/api/analyses/{aid}/cancel")
     def cancel_analysis(aid: str, request: Request):
-        require_owner(
+        require_task_access(
             ingest.store.get("analysis", aid),
             principal(request),
             action="取消",
@@ -934,7 +936,7 @@ def create_app(settings, background=True):
     def review_export(
         dataset_id: str, body: RevisionExportRequest, request: Request
     ):
-        owned_job(dataset_id, request, action="导出")
+        accessible_job(dataset_id, request, action="导出")
         job = runner.subtask_exports.enqueue_review(
             dataset_id,
             body,
@@ -975,7 +977,7 @@ def create_app(settings, background=True):
 
     @app.post("/api/annotations", status_code=202)
     def annotation_start(body: AnnotationRequest, request: Request):
-        owned_job(body.job_id, request, action="标注")
+        accessible_job(body.job_id, request, action="标注")
         return annotations.enqueue(
             body.job_id,
             note=body.note,
@@ -1008,7 +1010,7 @@ def create_app(settings, background=True):
 
     @app.post("/api/annotations/{aid}/cancel")
     def annotation_cancel(aid: str, request: Request):
-        require_owner(
+        require_task_access(
             ingest.store.get("annotation", aid),
             principal(request),
             action="取消",
@@ -1021,7 +1023,7 @@ def create_app(settings, background=True):
         request: Request,
         body: AnnotationResumeRequest | None = None,
     ):
-        require_owner(
+        require_task_access(
             ingest.store.get("annotation", aid),
             principal(request),
             action="续跑",
@@ -1099,7 +1101,7 @@ def create_app(settings, background=True):
         request: Request,
         body: SubtaskExportRequest | None = None,
     ):
-        require_owner(
+        require_task_access(
             ingest.store.get("annotation", aid),
             principal(request),
             action="导出",

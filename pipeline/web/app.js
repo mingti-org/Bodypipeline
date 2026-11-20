@@ -1682,12 +1682,8 @@ function renderDatasetManagement() {
   const rows = serverDatasets.filter((d) => rowRobotType(d) === type && (!kind || d.kind === kind) && (!search || `${datasetLabel(d)} ${d.id}`.toLocaleLowerCase().includes(search)));
   const paths = (d) => !d.paths.length ? '<span class="small muted">范围见删除记录</span>' : `<code>${esc(d.paths[0])}</code>${d.paths.length > 1 ? `<details><summary>共 ${d.paths.length} 个路径</summary>${d.paths.slice(1).map((p) => `<div><code>${esc(p)}</code></div>`).join("")}</details>` : ""}`;
   const html = rows.length ? rows.map((d) => {
-    const canDelete =
-      d.kind === "raw" ||
-      !config.current_user ||
-      config.current_user.is_admin ||
-      (d.owner_user_id && d.owner_user_id === config.current_user.username);
-    return `<tr><td><strong class="task-name">${esc(datasetLabel(d))}</strong><span class="sub">${d.kind === "raw" ? "原始数据" : "LeRobot " + esc(d.target_format || "数据集")} · ${esc(d.id.slice(0, 12))}${d.submitted_as ? " · " + esc(d.submitted_as) : ""}</span>${manualTrimSummary(d)}</td><td>${d.episode_count ?? "—"} episodes<span class="sub">${d.total_bytes == null ? "" : bytes(d.total_bytes)}</span></td><td class="dataset-paths">${paths(d)}</td><td>${badge(d.state)}${d.trimmed ? ' <span class="badge">已裁剪</span>' : ""}${d.reason ? `<span class="sub job-error">${esc(d.reason)}</span>` : ""}</td><td><button class="danger" data-delete-dataset="${esc(d.id)}" data-delete-kind="${d.kind}" ${busy || !d.deletable || !canDelete ? "disabled" : ""}>${canDelete ? `删除${d.kind === "raw" ? "原始数据" : "数据集"}` : "仅发起者可删除"}</button></td></tr>`;
+    const canDelete = Boolean(config.current_user);
+    return `<tr><td><strong class="task-name">${esc(datasetLabel(d))}</strong><span class="sub">${d.kind === "raw" ? "原始数据" : "LeRobot " + esc(d.target_format || "数据集")} · ${esc(d.id.slice(0, 12))}${d.submitted_as ? " · " + esc(d.submitted_as) : ""}</span>${manualTrimSummary(d)}</td><td>${d.episode_count ?? "—"} episodes<span class="sub">${d.total_bytes == null ? "" : bytes(d.total_bytes)}</span></td><td class="dataset-paths">${paths(d)}</td><td>${badge(d.state)}${d.trimmed ? ' <span class="badge">已裁剪</span>' : ""}${d.reason ? `<span class="sub job-error">${esc(d.reason)}</span>` : ""}</td><td><button class="danger" data-delete-dataset="${esc(d.id)}" data-delete-kind="${d.kind}" ${busy || !d.deletable || !canDelete ? "disabled" : ""}>删除${d.kind === "raw" ? "原始数据" : "数据集"}</button></td></tr>`;
   }).join("") : '<tr><td colspan="5" class="empty">请选择机器人类型；可管理的原始数据和 LeRobot 数据集将在此显示。</td></tr>';
   const list = $("dataset-list");
   if (list.dataset.content !== html) {
@@ -1961,10 +1957,7 @@ async function showJob() {
   const latest = selectedCheck === "automatic" ? null : checks.find((c) => c.id === selectedCheck) || checks[0];
   const report = latest ? latest.doctor_report : j.doctor_report;
   const gate = latest ? latest.quality_gate : j.quality_gate;
-  const canManage =
-    !config.current_user ||
-    config.current_user.is_admin ||
-    (j.owner_user_id && j.owner_user_id === config.current_user.username);
+  const canManage = Boolean(config.current_user);
   $("job-detail").innerHTML = `
     <p class="small"><strong>${esc(j.dataset_name || "历史数据集")}</strong> · ${esc(episodeSelectionSummary(j))}</p>
     <p class="small">Instruction：${esc(j.instruction || "—")}</p>

@@ -9,7 +9,7 @@ from pipeline.server.app import create_app
 from pipeline.server.jobs import JobRunner
 from pipeline.server.user_sessions import SlurmIdentityBroker, UserSession
 from pipeline.shared.core import DomainError, Store, now
-from pipeline.shared.identity import Principal
+from pipeline.shared.identity import Principal, require_task_access
 
 
 def executable(path: Path, source: str) -> Path:
@@ -269,57 +269,19 @@ def test_bearer_identity_takes_precedence_over_user_cookie(
         }
 
 
-def test_job_owner_guard_denies_other_browser_user(settings_factory, monkeypatch):
-    settings = settings_factory(
-        "server",
-        user_sessions={
-            "enabled": True,
-            "login_nodes": ["H800-node11"],
-        },
-    )
+def test_authenticated_users_share_task_access():
+    job = {
+        "id": "job-owned-by-alice",
+        "state": "COMPLETED",
+        "dataset_name": "dataset",
+        "owner_user_id": "alice",
+        "submitted_as": "alice",
+        "slurm_user": "alice",
+    }
 
-    def fake_login(self, username, password, login_node):
-        session = UserSession(
-            session_id=f"cookie-{username}",
-            execution_id=f"execution-{username}",
-            username=username,
-            uid=1001 if username == "alice" else 1002,
-            login_node=login_node,
-            control_path=Path(f"/tmp/{username}"),
-            expires_at=now() + 3600,
-        )
-        with self._lock:
-            self._by_token[session.session_id] = session
-            self._by_execution[session.execution_id] = session
-        return session
-
-    monkeypatch.setattr(SlurmIdentityBroker, "login", fake_login)
-    app = create_app(settings, background=False)
-    with TestClient(app) as http:
-        job = {
-            "id": "job-owned-by-alice",
-            "state": "COMPLETED",
-            "dataset_name": "dataset",
-            "owner_user_id": "alice",
-            "submitted_as": "alice",
-            "slurm_user": "alice",
-        }
-        app.state.ingest.store.put("job", job["id"], job)
-        login = http.post(
-            "/api/login",
-            json={
-                "username": "bob",
-                "password": "correct",
-                "login_node": "H800-node11",
-            },
-        )
-        assert login.status_code == 200
-        response = http.post(
-            f"/api/jobs/{job['id']}/checks",
-            headers={"Origin": "http://testserver"},
-        )
-        assert response.status_code == 403
-        assert "发起者" in response.json()["detail"]
+    require_task_access(job, Principal(username="bob", uid=1002))
+    with pytest.raises(DomainError, match="登录"):
+        require_task_access(job, None)
 
 
 def test_principal_metadata_contains_owner_but_never_password():

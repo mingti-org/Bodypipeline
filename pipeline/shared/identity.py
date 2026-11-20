@@ -50,17 +50,16 @@ class Principal:
         }
 
 
-def require_owner(row: dict, principal: Principal, *, action: str = "操作") -> None:
-    """Reject a non-admin caller who did not submit this task.
+def require_task_access(
+    row: dict, principal: Principal | None, *, action: str = "操作"
+) -> None:
+    """Authorize a shared-platform task action for any authenticated user.
 
-    Records created before identity support have no owner and remain readable,
-    but mutating them requires the service token so a shared login cannot grant
-    access to historical administrative actions.
+    BodyPipeline is deployed as a trusted internal workspace. Authenticated
+    users can inspect and operate every task, while owner metadata remains on
+    each record for attribution and for binding new Slurm work to its submitter.
     """
 
-    if principal.is_admin:
+    if principal is not None:
         return
-    owner = row.get("owner_user_id")
-    if owner and owner == principal.username:
-        return
-    raise DomainError(f"只有任务发起者或管理员可以{action}此任务", 403)
+    raise DomainError(f"请先登录再{action}任务", 401)
