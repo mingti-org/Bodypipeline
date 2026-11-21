@@ -131,9 +131,9 @@ class AnalysisRequest(BaseModel):
 
 class AnnotationRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    backend: Literal["argus", "codex"] = "argus"
+    backend: Literal["argus"] = "argus"
     job_id: str = Field(min_length=1, max_length=128)
-    engine: Literal["argus", "codex", "flora"] = "argus"
+    engine: Literal["argus", "flora"] = "argus"
     note: str | None = Field(default=None, max_length=4000)
     model: str | None = Field(default=None, min_length=1, max_length=200)
     cap_usd: float | None = Field(default=None, gt=0, le=1_000_000)

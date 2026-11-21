@@ -156,7 +156,7 @@ def test_cli_not_available_does_not_disable_api(service, monkeypatch):
     monkeypatch.setattr(backends, "_cli_status", lambda *a: (False, "未登录", ""))
     options = runner.options()
     assert options["available"]
-    assert not options["backends"]["codex"]["available"]
+    assert "codex" not in options["backends"]
     with pytest.raises(DomainError, match="未登录"):
         runner.enqueue("job-1", backend="codex", template_id="english")
 

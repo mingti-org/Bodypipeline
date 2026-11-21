@@ -483,20 +483,19 @@
             <div data-server-panel="annotations" hidden>
               <section class="panel">
                 <div class="panel-heading"><h2>创建自动标注任务</h2><span class="step">AUTOMATIC REVIEW</span></div>
-                <p class="panel-note small muted">选择 API / Argus、本机 Codex 或本地 Flora，对已登记的可读 LeRobot 数据集逐 Episode 生成标注。模板标注使用专用提示词和统一业务时间线，结果保存在独立目录，不修改来源数据或 Doctor 质检结果。</p>
+                <p class="panel-note small muted">选择 API / Argus 或本地 Flora，对已登记的可读 LeRobot 数据集逐 Episode 生成标注。模板标注使用专用提示词和统一业务时间线，结果保存在独立目录，不修改来源数据或 Doctor 质检结果。</p>
                 <div id="annotation-unavailable" class="warning" hidden></div>
                 <form id="annotation-form" class="conversion-form">
                   <div class="conversion-grid">
                     <div>
                       <label for="annotation-engine">标注引擎 / 执行方式 <span class="required">*</span></label>
-                      <select id="annotation-engine" required disabled><option value="argus">API / Argus</option><option value="codex">本机 Codex</option><option value="flora">Flora 本地</option></select>
+                      <select id="annotation-engine" required disabled><option value="argus">API / Argus</option><option value="flora">Flora 本地</option></select>
                       <p class="small muted" id="annotation-engine-summary">Argus 使用模型网关生成自由分析或模板初稿。</p>
                     </div>
                     <div>
                       <label>执行环境</label>
                       <p class="small" id="annotation-engine-status" aria-live="polite">正在读取引擎状态…</p>
                       <p class="small muted" id="annotation-backend-status" aria-live="polite"></p>
-                      <details id="annotation-backend-diagnostics" hidden><summary>运行配置与诊断</summary><p id="annotation-backend-diagnostic-text" class="small muted"></p></details>
                     </div>
                   </div>
                   <div class="conversion-grid">
@@ -546,7 +545,7 @@
                     <div>
                       <label for="annotation-concurrency">并发 Episode 数</label>
                       <input id="annotation-concurrency" type="number" min="1" max="64" step="1" required disabled />
-                      <p class="small muted">并发决定同时执行的 Episode 数；本机 Codex 默认一次一条，可调整。CLI 进程总量受此限制。</p>
+                      <p class="small muted">并发决定同时执行的 Episode 数，受部署资源配置限制。</p>
                     </div>
                   </div>
                   <div class="conversion-grid" data-annotation-argus-only>
@@ -575,12 +574,11 @@
                     <div>
                       <label for="annotation-sample-fps">采样帧率 Hz（每秒帧数）</label>
                       <input id="annotation-sample-fps" type="number" min="0.1" max="10" step="0.1" disabled />
-                      <p class="small muted">本机 Codex 默认 3 Hz，即每秒三帧；所有来源相机使用统一时间基准。</p>
+                      <p class="small muted">所有来源相机使用统一时间基准。</p>
                     </div>
                     <div>
                       <label for="annotation-max-tokens">单 Episode 输出 token 上限</label>
                       <input id="annotation-max-tokens" type="number" min="256" max="200000" step="1" required disabled />
-                      <p id="annotation-token-help" class="small muted" hidden>Codex CLI 自行管理输出 token 限制，本页不能设置；模型仍须通过模板业务校验。</p>
                     </div>
                   </div>
                   <div class="conversion-grid" data-annotation-argus-only>

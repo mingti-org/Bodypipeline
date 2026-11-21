@@ -148,14 +148,10 @@ class AnnotationRunner:
             else (candidates[0] if candidates else configured)
         )
         backend_options = {}
-        for candidate in BACKENDS.values():
+        for engine_id in annotation_backends.CREATE_BACKENDS:
+            candidate = BACKENDS[engine_id]
             available, reason = candidate.available(self.settings)
             backend_options[candidate.id] = {
-                **(
-                    annotation_backends.codex_options(self.settings)
-                    if candidate.id == "codex"
-                    else {}
-                ),
                 "id": candidate.id,
                 "available": available,
                 "reason": reason,

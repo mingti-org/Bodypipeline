@@ -151,6 +151,7 @@ def test_options_and_candidates_come_from_registered_datasets(service):
     assert options["available"] is True
     assert options["engines"]["argus"]["available"] is True
     assert options["engines"]["flora"]["available"] is False
+    assert "codex" not in options["engines"]
     assert options["models"]
     assert options["defaults"]["concurrency"] == 4
     candidates = runner.candidates()
@@ -210,6 +211,23 @@ def test_legacy_annotations_default_to_argus_and_unknown_engines_are_rejected(
     store.put("annotation", row["id"], dict(row, state="CANCELLED"))
     with pytest.raises(DomainError, match="标注引擎"):
         runner.enqueue("job-1", engine="unknown")
+
+
+def test_local_codex_is_not_a_new_annotation_api_engine(service):
+    runner, _store, _src, _data = service
+    app = create_app(runner.settings, background=False)
+    app.state.annotations = runner
+    headers = {"Authorization": "Bearer " + runner.settings.token}
+    with TestClient(app) as http:
+        options = http.get("/api/annotations/options", headers=headers)
+        assert options.status_code == 200
+        assert set(options.json()["engines"]) == {"argus", "flora"}
+        rejected = http.post(
+            "/api/annotations",
+            headers=headers,
+            json={"job_id": "job-1", "engine": "codex", "backend": "codex"},
+        )
+        assert rejected.status_code == 422
 
 
 def test_flora_enqueue_skips_argus_credentials_and_usd_budget(service, monkeypatch):
@@ -1556,12 +1574,14 @@ def test_api_model_list_returns_gateway_catalogue(service, monkeypatch):
         assert "api-secret" not in response.text
 
 
-def test_web_annotation_form_exposes_both_engines_and_sends_selection():
+def test_web_annotation_form_exposes_supported_engines_without_local_codex():
     root = Path(__file__).parents[1]
     html = (root / "pipeline/web/index.html").read_text()
     script = (root / "pipeline/web/annotations.js").read_text()
     assert 'id="annotation-engine"' in html
     assert 'value="argus"' in html and 'value="flora"' in html
+    assert 'value="codex"' not in html
+    assert "本机 Codex" not in html
     assert "data-annotation-argus-only" in html
     assert "const body = { job_id: jobId, engine };" in script
     assert "node.hidden = !argus;" in script

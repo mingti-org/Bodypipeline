@@ -107,7 +107,6 @@
   function anyEngineAvailable() {
     return Object.values(options?.engines || {}).some((item) => item?.available);
   }
-  const isCodex = () => selectedEngine() === "codex";
   const isFlora = () => selectedEngine() === "flora";
   const backendAvailable = () => Boolean(engineConfig().available);
   const backendLabel = (row) => engineLabel(row.engine || row.backend);
@@ -120,8 +119,6 @@
     select.innerHTML = '<option value="">自由分析（不使用模板）</option>' + templates.map(
       (t) => `<option value="${esc(t.id)}">${esc(t.name)}</option>`,
     ).join("");
-    select.options[0].disabled = isCodex();
-    if (isCodex()) select.options[0].textContent = "自由分析请使用 API / Argus";
     if (previous && !templates.some((t) => t.id === previous)) {
       select.insertAdjacentHTML("beforeend", `<option value="${esc(previous)}">原模板已删除，请重新选择</option>`);
     }
@@ -151,13 +148,12 @@
   }
 
   function modelSignature() {
-    if (isCodex()) return "codex";
     const { baseUrl, apiKey } = modelInputs();
     return baseUrl + "\n" + apiKey;
   }
 
   function canFetchModels() {
-    if (isCodex() || isFlora() || !engineConfig("argus").available) {
+    if (isFlora() || !engineConfig("argus").available) {
       return false;
     }
     const { baseUrl, apiKey } = modelInputs();
@@ -218,7 +214,6 @@
     const model = $("annotation-model").value;
     const status = $("annotation-model-price");
     if (!status) return;
-    if (isCodex()) { status.hidden = true; return; }
     if (!model || modelPriced(model)) {
       status.textContent = "";
       status.hidden = true;
@@ -281,7 +276,6 @@
   function scheduleModelFetch() {
     clearTimeout(modelFetchTimer);
     modelFetchTimer = null;
-    if (isCodex()) return;
     updateModelControls();
     if (selectedEngine() !== "argus" || !engineConfig("argus").available) return;
     const { baseUrl, apiKey } = modelInputs();
@@ -535,11 +529,9 @@
     const config = engineConfig(engine);
     const ready = Boolean(config.available);
     const api = engine === "argus";
-    const codex = engine === "codex";
     const flora = engine === "flora";
     // The existing data marker covers every engine that can author a template.
     const argus = !flora;
-    const cli = codex ? config : null;
     $("annotation-engine").disabled = !Object.keys(options.engines || {}).length;
     $("annotation-dataset").disabled = !ready;
     $("annotation-note").disabled = !ready;
@@ -573,40 +565,21 @@
     $("annotation-api-key").required = api && !options.api_key_configured;
     $("annotation-api-key-required").hidden =
       !api || Boolean(options.api_key_configured);
-    $("annotation-model-refresh").hidden = codex;
-    $("annotation-max-tokens").disabled = !argus || !ready || codex;
+    $("annotation-max-tokens").disabled = !argus || !ready;
     $("annotation-max-tokens").required = api;
-    $("annotation-token-help").hidden = !codex;
     $("annotation-boundary-options").hidden =
       flora || !$("annotation-template").value;
-    Array.from($("annotation-reasoning").options).forEach((option) => {
-      option.disabled =
-        codex && !(config.capabilities?.reasoning || []).includes(option.value);
-    });
     $("annotation-engine-summary").textContent = api
       ? "Argus 使用模型网关生成自由分析或固定模板初稿，费用受本次上限和每日预算约束。"
-      : codex
-        ? "本机 Codex 复用服务器 CLI 登录执行模板标注，不请求模型网关；金额未知但保留调用与 token 用量。"
-        : "Flora 在本机 Slurm GPU 上运行 TempSeg + Captioner；首期仅使用自由字幕 Segment，不使用共享模板。";
+      : "Flora 在本机 Slurm GPU 上运行 TempSeg + Captioner；首期仅使用自由字幕 Segment，不使用共享模板。";
     $("annotation-engine-status").textContent = ready
       ? (api
           ? "云端网关已配置；提交时再校验本次凭据和模型单价。"
-          : codex
-            ? "本机 Codex 登录与模板工具链已就绪；每次请求会记录 CLI 回执和 token 用量。"
-            : "本地执行环境已就绪；每个 Episode 使用独立的 Slurm GPU 分配。")
+          : "本地执行环境已就绪；每个 Episode 使用独立的 Slurm GPU 分配。")
       : (config.reason || "当前引擎未就绪");
-    $("annotation-backend-status").textContent = codex
-      ? "使用服务器用户的 Codex CLI 登录，仅支持模板标注，无需 baseURL 或 API Key。"
-      : api
+    $("annotation-backend-status").textContent = api
         ? "API / Argus 使用服务器或本次任务的模型网关。"
         : "Flora 使用本地推理，不产生模型 API 费用。";
-    $("annotation-backend-diagnostics").hidden = !codex;
-    $("annotation-backend-diagnostic-text").textContent = codex
-      ? `${config.version || "Codex CLI"} · ${config.reason || ""} · provider ${config.provider || "—"}${config.provider_url ? ` (${config.provider_url})` : ""}。${config.notice || ""} 每次请求最多 ${config.limits?.max_images || "—"} 张采样图像；分段最多 ${config.limits?.max_part_seconds || "—"} 秒。`
-      : "";
-    if (codex) {
-      setModelStatus("模型来自 CLI / 受信部署允许列表，不请求 API 网关。");
-    }
     $("annotation-execution-support").textContent = flora
       ? "Flora 当前只支持全量运行；取消或中断后可从已完成 Episode 继续。"
       : options.execution_contract_v2
@@ -625,9 +598,7 @@
         ? (options.api_key_configured
             ? "提交后在独立队列执行，不会阻塞转换或 Doctor；服务器已配置默认模型密钥，本次可留空。"
             : "提交后在独立队列执行，不会阻塞转换或 Doctor；请填写本次任务的模型 API Key。")
-        : codex
-          ? "使用服务器用户的 Codex CLI 登录执行模板批量任务；无需 baseURL 或 API Key。"
-          : "提交后在独立队列逐 Episode 运行本地 Flora；不消耗模型 API 费用，取消后可从已完成 Episode 继续。";
+        : "提交后在独立队列逐 Episode 运行本地 Flora；不消耗模型 API 费用，取消后可从已完成 Episode 继续。";
     renderBudget();
     updateModelControls();
     updateSubmit();
@@ -640,23 +611,21 @@
       "annotation-model", "annotation-reasoning", "annotation-concurrency",
       "annotation-sample-fps", "annotation-note", "annotation-base-url",
     ].map(id => [id, $(id).value])) : null;
-    const cli = isCodex() ? engineConfig("codex") : null;
     renderTemplates();
-    const defaults = { ...options.defaults, ...(cli?.defaults || {}) };
-    const models = cli?.models || options.models || [];
+    const defaults = options.defaults || {};
+    const models = options.models || [];
     $("annotation-model").innerHTML = models
       .map((model) => `<option value="${esc(model)}">${esc(model)}</option>`)
       .join("") || '<option value="">服务器未配置模型</option>';
-    $("annotation-model").value = cli?.default_model || options.default_model || models[0] || "";
+    $("annotation-model").value = options.default_model || models[0] || "";
     updateModelPricing();
     $("annotation-cap").value = Number(defaults.cap_usd || 0).toFixed(2);
     $("annotation-concurrency").value = String(defaults.concurrency || 8);
-    $("annotation-reasoning").value = cli?.default_reasoning || defaults.reasoning || "";
-    $("annotation-inspection").value = cli ? "off" : defaults.inspection || "auto";
+    $("annotation-reasoning").value = defaults.reasoning || "";
+    $("annotation-inspection").value = defaults.inspection || "auto";
     $("annotation-sample-fps").value = defaults.sample_fps ? String(defaults.sample_fps) : "";
-    $("annotation-max-tokens").value = cli ? "" : String(defaults.max_tokens || 12000);
-    $("annotation-max-tokens").placeholder = cli ? "CLI 自动管理" : "";
-    $("annotation-field-dictionary").checked = cli ? false : Boolean(defaults.field_dictionary);
+    $("annotation-max-tokens").value = String(defaults.max_tokens || 12000);
+    $("annotation-field-dictionary").checked = Boolean(defaults.field_dictionary);
     $("annotation-note").value = defaults.note || "";
     const defaultBaseUrl = String(options.default_base_url || "").trim();
     if (defaultBaseUrl) {
@@ -756,13 +725,6 @@
         "Flora 本地推理不产生模型 API 费用；每个 Episode 使用独立 Slurm GPU 分配，执行时长取决于模型和视频长度。";
       return;
     }
-    if (isCodex()) {
-      const cap = $("annotation-cap");
-      cap.required = false; cap.disabled = true; cap.value = ""; cap.placeholder = "不限额";
-      box.textContent = "不设任务、每日或 Episode 费用上限。保留 CLI 调用、状态与 token 用量；实际金额未知。";
-      $("annotation-boundary-cost").textContent = "复用粗定位与边界加密取证。同一请求最多首次加三次 CLI 调用；CLI 内部连接恢复由 Codex 管理。认证、额度不足及未知调用状态停止自动重发。";
-      return;
-    }
     $("annotation-boundary-cost").textContent = options.unlimited
       ? "粗定位后在窗口内加密采样，额外调用与重试的费用、用量及未结算状态继续记录；当前不限额。"
       : "粗定位后在窗口内加密采样，额外调用、重试和未结算预留均计入预算。";
@@ -814,18 +776,15 @@
       ($("annotation-scope").value === "full" ||
         options?.execution_contract_v2) &&
       Boolean(model) &&
-      (isCodex() || options?.unlimited || modelPriced(model)) &&
-      (!isCodex() || Boolean($("annotation-template").value)) &&
+      (options?.unlimited || modelPriced(model)) &&
       (!$("annotation-template").value || (options?.template_available && templateLibrary.templates.some((t) => t.id === $("annotation-template").value))) &&
       (!needsKey || Boolean($("annotation-api-key").value.trim())) &&
-      (!modelFetching || isCodex()) &&
+      !modelFetching &&
       !submitting;
     button.disabled = !usable;
     button.textContent = submitting
       ? "正在提交…"
-      : isCodex()
-        ? "提交本机 Codex 标注"
-        : "提交 Argus 云端标注";
+      : "提交 Argus 云端标注";
   }
 
   async function refresh() {
@@ -1624,7 +1583,7 @@
     const body = { job_id: jobId, engine };
     const note = $("annotation-note").value.trim();
     if (note) body.note = note;
-    body.backend = engine === "codex" ? "codex" : "argus";
+    body.backend = "argus";
     const scope = isFlora() ? "full" : $("annotation-scope").value;
     const selectedEpisodes = scope === "full" ? null : [...new Set($("annotation-selected-episodes").value.split(/[,，\s]+/).filter(Boolean).map(Number))];
     if (scope !== "full" && (!selectedEpisodes.length || selectedEpisodes.some(n => !Number.isInteger(n) || n < 0) || (scope === "trial" && selectedEpisodes.length > 5))) {
@@ -1673,8 +1632,6 @@
         `已提交「${row.dataset_name}」${engineLabel(row.engine)}标注：${row.model}` +
           (row.engine === "flora"
             ? "，本地推理无模型 API 费用。"
-            : row.backend === "codex"
-              ? "，复用本机 Codex 登录，实际金额未知。"
             : row.cap_usd == null
               ? "，费用不限额。"
               : `，费用上限 ${money(row.cap_usd)}。`),

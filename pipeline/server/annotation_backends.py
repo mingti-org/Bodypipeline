@@ -269,6 +269,9 @@ BACKENDS = {
     CodexBackend.id: CodexBackend(),
     FloraBackend.id: FloraBackend(),
 }
+# Local Codex remains readable for legacy records, but it is not exposed as a
+# new automatic-annotation engine.
+CREATE_BACKENDS = (ArgusBackend.id, FloraBackend.id)
 DEFAULT_ENGINE = ArgusBackend.id
 DEFAULT_BACKEND = ArgusBackend.id
 
