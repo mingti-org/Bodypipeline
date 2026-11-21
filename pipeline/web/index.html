@@ -90,6 +90,7 @@
           <button class="nav-item" type="button" data-server-tab="results" aria-pressed="false"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3 4 6v6c0 5 8 9 8 9s8-4 8-9V6l-8-3Z"/><path d="m8 12 3 3 5-6"/></svg><span>预览与质检</span><span class="nav-count" id="nav-result-count">0</span></button>
           <button class="nav-item" type="button" data-server-tab="merge" aria-pressed="false"><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M3 9h18M8 13h8M8 16h5"/></svg><span>数据集管理</span><span class="nav-count" id="nav-merge-count">0</span></button>
           <button class="nav-item" type="button" data-server-tab="annotations" aria-pressed="false"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 5h16M4 12h10M4 19h7"/><path d="m15 16 2 2 4-4"/></svg><span>自动标注</span><span class="nav-count" id="nav-annotation-count">0</span></button>
+          <a class="nav-item" href="#results">标注工作区（在数据预览中）</a>
         </nav>
         <div class="sidebar-bottom"><strong><span class="dot"></span> 文件目录存储</strong><p>原始数据保留<br />转换与质检记录可追溯</p><span class="version">imply / 0.1</span></div>
       </aside>
@@ -482,18 +483,20 @@
             <div data-server-panel="annotations" hidden>
               <section class="panel">
                 <div class="panel-heading"><h2>创建自动标注任务</h2><span class="step">AUTOMATIC REVIEW</span></div>
-                <p class="panel-note small muted">选择云端 Argus 或本地 Flora，对已登记的可读 LeRobot 数据集逐 Episode 生成标注。数据集只读，标注结果保存在独立的 annotations 目录，不修改 Doctor 质检结果。</p>
+                <p class="panel-note small muted">选择 API / Argus、本机 Codex 或本地 Flora，对已登记的可读 LeRobot 数据集逐 Episode 生成标注。模板标注使用专用提示词和统一业务时间线，结果保存在独立目录，不修改来源数据或 Doctor 质检结果。</p>
                 <div id="annotation-unavailable" class="warning" hidden></div>
                 <form id="annotation-form" class="conversion-form">
                   <div class="conversion-grid">
                     <div>
-                      <label for="annotation-engine">标注引擎 <span class="required">*</span></label>
-                      <select id="annotation-engine" required disabled><option value="argus">Argus 云端</option><option value="flora">Flora 本地</option></select>
+                      <label for="annotation-engine">标注引擎 / 执行方式 <span class="required">*</span></label>
+                      <select id="annotation-engine" required disabled><option value="argus">API / Argus</option><option value="codex">本机 Codex</option><option value="flora">Flora 本地</option></select>
                       <p class="small muted" id="annotation-engine-summary">Argus 使用模型网关生成自由分析或模板初稿。</p>
                     </div>
                     <div>
                       <label>执行环境</label>
-                      <p class="small" id="annotation-engine-status">正在读取引擎状态…</p>
+                      <p class="small" id="annotation-engine-status" aria-live="polite">正在读取引擎状态…</p>
+                      <p class="small muted" id="annotation-backend-status" aria-live="polite"></p>
+                      <details id="annotation-backend-diagnostics" hidden><summary>运行配置与诊断</summary><p id="annotation-backend-diagnostic-text" class="small muted"></p></details>
                     </div>
                   </div>
                   <div class="conversion-grid">
@@ -522,7 +525,7 @@
                       <p class="small annotation-model-warning" id="annotation-model-price" hidden aria-live="polite"></p>
                     </div>
                   </div>
-                  <div class="conversion-grid" data-annotation-argus-only>
+                  <div class="conversion-grid" id="annotation-gateway-fields" data-annotation-api-only>
                     <div>
                       <label for="annotation-base-url">模型 baseURL（可选）</label>
                       <input id="annotation-base-url" type="url" autocomplete="off" placeholder="留空使用服务器默认" disabled />
@@ -535,7 +538,7 @@
                     </div>
                   </div>
                   <div class="conversion-grid" data-annotation-argus-only>
-                    <div>
+                    <div data-annotation-api-only>
                       <label for="annotation-cap">本次费用上限（USD）</label>
                       <input id="annotation-cap" type="number" min="0.01" step="0.01" required disabled />
                       <p class="small muted" id="annotation-budget" aria-live="polite">正在读取预算…</p>
@@ -543,7 +546,7 @@
                     <div>
                       <label for="annotation-concurrency">并发 Episode 数</label>
                       <input id="annotation-concurrency" type="number" min="1" max="64" step="1" required disabled />
-                      <p class="small muted">并发越高，模型网关负载和峰值费用越高。</p>
+                      <p class="small muted">并发决定同时执行的 Episode 数；本机 Codex 默认一次一条，可调整。CLI 进程总量受此限制。</p>
                     </div>
                   </div>
                   <div class="conversion-grid" data-annotation-argus-only>
@@ -559,7 +562,7 @@
                         <option value="xhigh">xhigh</option>
                       </select>
                     </div>
-                    <div>
+                    <div data-annotation-api-only>
                       <label for="annotation-inspection">证据检查</label>
                       <select id="annotation-inspection" disabled>
                         <option value="auto">auto · 按数据自动选择</option>
@@ -570,16 +573,26 @@
                   </div>
                   <div class="conversion-grid" data-annotation-argus-only>
                     <div>
-                      <label for="annotation-sample-fps">采样帧率（留空使用 Argus 默认）</label>
+                      <label for="annotation-sample-fps">采样帧率 Hz（每秒帧数）</label>
                       <input id="annotation-sample-fps" type="number" min="0.1" max="10" step="0.1" disabled />
+                      <p class="small muted">本机 Codex 默认 3 Hz，即每秒三帧；所有来源相机使用统一时间基准。</p>
                     </div>
                     <div>
                       <label for="annotation-max-tokens">单 Episode 输出 token 上限</label>
                       <input id="annotation-max-tokens" type="number" min="256" max="200000" step="1" required disabled />
+                      <p id="annotation-token-help" class="small muted" hidden>Codex CLI 自行管理输出 token 限制，本页不能设置；模型仍须通过模板业务校验。</p>
                     </div>
                   </div>
-                  <label class="check-label" for="annotation-field-dictionary" data-annotation-argus-only><input id="annotation-field-dictionary" type="checkbox" disabled />允许模型解释来源字段的含义</label>
-                  <label for="annotation-note">任务说明 / Flora instruction（可选）</label>
+                  <div class="conversion-grid" data-annotation-argus-only>
+                    <div><label for="annotation-scope">运行范围</label><select id="annotation-scope"><option value="full">直接全量</option><option value="trial">任选一至五条试跑</option><option value="selection">仅重算明确选择的 Episode</option></select><p class="small muted">试跑不会自动启动全量；同配置可明确继续并复用成功结果。改参数时在这里决定重算范围。</p><p id="annotation-execution-support" class="small muted"></p></div>
+                    <div><label for="annotation-selected-episodes">Episode 编号（逗号分隔）</label><input id="annotation-selected-episodes" placeholder="例如：1, 4, 9" disabled><p class="small muted">填写来源实际数字编号；不以所有 subtask 总次数代替。</p></div>
+                  </div>
+                  <div class="conversion-grid" id="annotation-boundary-options">
+                    <div><label for="annotation-boundary-target">模板边界误差目标（秒）</label><input id="annotation-boundary-target" type="number" min="0.01" max="5" step="0.01" value="0.2"><p class="small muted">质量目标待真实模型验证；加密取证无法确定时标待复核。</p></div>
+                    <div><label for="annotation-boundary-window">交界附近取证窗口（±秒）</label><input id="annotation-boundary-window" type="number" min="0.2" max="30" step="0.1" value="1.0"><p class="small muted" id="annotation-boundary-cost">粗定位后在窗口内加密采样，额外调用、重试和未结算预留均计入预算。</p></div>
+                  </div>
+                  <label class="check-label" for="annotation-field-dictionary" data-annotation-api-only><input id="annotation-field-dictionary" type="checkbox" disabled />允许模型解释来源字段的含义</label>
+                  <label for="annotation-note">任务说明 / 标注说明（可选）</label>
                   <textarea id="annotation-note" maxlength="4000" rows="3" disabled placeholder="例如：这是双臂衣物折叠示教，关注抓取、对折和放置阶段。"></textarea>
                   <div class="conversion-submit"><button id="annotation-submit" class="primary" type="submit" disabled>提交自动标注</button><span id="annotation-help" class="small muted">正在读取标注配置…</span></div>
                 </form>
@@ -649,11 +662,14 @@
         <div class="dataset-delete-body">
           <p class="small muted">续跑需要模型访问凭据。密钥只保存在 Server 内存中，任务结束或取消后清除；不写入任务记录、日志或导出结果。</p>
           <p class="small muted" id="annotation-resume-hint"></p>
-          <p class="small muted">模板任务会保留有效初稿，对不符合模板的模型回复重新请求；重试费用计入本次预算。</p>
+          <p class="small muted" id="annotation-resume-cost">模板任务会保留有效初稿，对不符合模板的模型回复重新请求；重试费用计入本次预算。</p>
           <label for="annotation-resume-base-url">模型 baseURL（留空使用服务器默认）</label>
           <input id="annotation-resume-base-url" type="url" autocomplete="off" placeholder="https://gateway.example.com/v1" />
           <label for="annotation-resume-api-key">模型 API Key（服务器已有默认密钥时可留空）</label>
           <input id="annotation-resume-api-key" type="password" autocomplete="off" />
+<label class="check-label"><input type="checkbox" id="annotation-continue-full">明确继续全量，沿用相同配置与已成功结果</label>
+<label>新的累计费用上限（可留空）<input type="number" min="0.01" step="0.01" id="annotation-resume-cap"></label>
+
           <div class="conversion-submit"><button type="button" class="secondary" id="annotation-resume-cancel">取消</button><button class="primary" id="annotation-resume-submit" type="submit">重新加入队列</button></div>
         </div>
       </form>

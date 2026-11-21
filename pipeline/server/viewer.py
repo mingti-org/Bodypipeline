@@ -319,6 +319,7 @@ def create_gateway(settings):
             yield
         finally:
             await asyncio.to_thread(transport.close)
+            await asyncio.to_thread(_app.state.annotation_media.close)
 
     app = FastAPI(title="LeRobot Viewer Gateway", lifespan=lifespan)
     app.state.viewer_transport = transport
@@ -343,14 +344,17 @@ def create_gateway(settings):
         # Only server-owned preview identities are accepted, never a local_path
         # or arbitrary proxy destination. The Server alone writes draft state.
         score_preview(dataset_id)
-        return await annotation_proxy(f"/api/subtask-review/{dataset_id}/{suffix}", body)
+        return await annotation_proxy(
+            f"/api/subtask-review/{dataset_id}/{suffix}", body
+        )
 
     async def annotation_proxy(route, body=None):
         url = settings.server_url.rstrip("/") + route
         try:
             async with httpx.AsyncClient(trust_env=False) as client:
                 response = await client.request(
-                    "GET" if body is None else "POST", url,
+                    "GET" if body is None else "POST",
+                    url,
                     json=body.model_dump() if body is not None else None,
                     headers={"Authorization": "Bearer " + settings.token},
                     timeout=settings.command_timeout,
@@ -361,12 +365,23 @@ def create_gateway(settings):
             payload = response.json()
         except ValueError as exc:
             raise DomainError("Server 服务返回无效响应", 502) from exc
-        return JSONResponse(payload, status_code=response.status_code, headers={"Cache-Control": "no-store"})
+        return JSONResponse(
+            payload,
+            status_code=response.status_code,
+            headers={"Cache-Control": "no-store"},
+        )
+
+    # Workspace files are shared; writes continue through the Server proxy.
+    from .annotation_routes import mount_workbench
+
+    mount_workbench(app, settings, store)
 
     async def instruction_proxy(dataset_id, suffix, body=None, method="GET"):
         score_preview(dataset_id)
         suffix = f"/{suffix}" if suffix else ""
-        url = settings.server_url.rstrip("/") + f"/api/instructions/{dataset_id}{suffix}"
+        url = (
+            settings.server_url.rstrip("/") + f"/api/instructions/{dataset_id}{suffix}"
+        )
         try:
             async with httpx.AsyncClient(trust_env=False) as client:
                 response = await client.request(
@@ -377,9 +392,7 @@ def create_gateway(settings):
                     timeout=settings.command_timeout,
                 )
         except httpx.HTTPError as exc:
-            raise DomainError(
-                "Server 语言指令服务暂不可用，请稍后重试", 503
-            ) from exc
+            raise DomainError("Server 语言指令服务暂不可用，请稍后重试", 503) from exc
         try:
             payload = response.json()
         except ValueError as exc:
@@ -398,17 +411,34 @@ def create_gateway(settings):
     async def save_task_templates(body: TemplateRequest):
         return await annotation_proxy("/api/task-templates", body)
 
+    @app.get("/api/subtask-review/{dataset_id}/episodes/{episode}")
+    async def review_episode(dataset_id: str, episode: int):
+        return await review_proxy(dataset_id, f"episodes/{episode}")
+
+    @app.post("/api/subtask-review/{dataset_id}/episodes/{episode}")
+    async def review_save(dataset_id: str, episode: int, body: DraftRequest):
+        return await review_proxy(dataset_id, f"episodes/{episode}", body)
+
+    @app.post("/api/subtask-review/{dataset_id}/exports")
+    async def review_export(dataset_id: str, body: RevisionExportRequest):
+        return await review_proxy(dataset_id, "exports", body)
+
+    @app.get("/api/subtask-review/{dataset_id}/exports/{export_id}")
+    async def review_export_status(dataset_id: str, export_id: str):
+        if not export_id or any(
+            c not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-"
+            for c in export_id
+        ):
+            raise DomainError("修订导出任务编号无效", 404)
+        return await review_proxy(dataset_id, f"exports/{export_id}")
+
     @app.get("/api/instructions/{dataset_id}")
     async def instruction_dataset(dataset_id: str):
         return await instruction_proxy(dataset_id, "")
 
     @app.put("/api/instructions/{dataset_id}/template")
-    async def instruction_template_save(
-        dataset_id: str, body: TemplateSaveRequest
-    ):
-        return await instruction_proxy(
-            dataset_id, "template", body, method="PUT"
-        )
+    async def instruction_template_save(dataset_id: str, body: TemplateSaveRequest):
+        return await instruction_proxy(dataset_id, "template", body, method="PUT")
 
     @app.get("/api/instructions/{dataset_id}/episodes/{episode}")
     async def instruction_episode(dataset_id: str, episode: int):
@@ -434,9 +464,7 @@ def create_gateway(settings):
         )
 
     @app.post("/api/instructions/{dataset_id}/apply")
-    async def instruction_apply(
-        dataset_id: str, body: ApplyInstructionsRequest
-    ):
+    async def instruction_apply(dataset_id: str, body: ApplyInstructionsRequest):
         return await instruction_proxy(dataset_id, "apply", body, method="POST")
 
     @app.get("/api/instructions/{dataset_id}/apply/{apply_id}")
@@ -448,24 +476,6 @@ def create_gateway(settings):
         ):
             raise DomainError("语言指令任务编号无效", 404)
         return await instruction_proxy(dataset_id, f"apply/{apply_id}")
-
-    @app.get("/api/subtask-review/{dataset_id}/episodes/{episode}")
-    async def review_episode(dataset_id: str, episode: int):
-        return await review_proxy(dataset_id, f"episodes/{episode}")
-
-    @app.post("/api/subtask-review/{dataset_id}/episodes/{episode}")
-    async def review_save(dataset_id: str, episode: int, body: DraftRequest):
-        return await review_proxy(dataset_id, f"episodes/{episode}", body)
-
-    @app.post("/api/subtask-review/{dataset_id}/exports")
-    async def review_export(dataset_id: str, body: RevisionExportRequest):
-        return await review_proxy(dataset_id, "exports", body)
-
-    @app.get("/api/subtask-review/{dataset_id}/exports/{export_id}")
-    async def review_export_status(dataset_id: str, export_id: str):
-        if not export_id or any(c not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-" for c in export_id):
-            raise DomainError("修订导出任务编号无效", 404)
-        return await review_proxy(dataset_id, f"exports/{export_id}")
 
     @app.get("/api/episode-scores/{dataset_id}")
     async def score_status(dataset_id: str):
@@ -486,16 +496,15 @@ def create_gateway(settings):
         # The source is always the registered preview's own job, so the viewer
         # can never trim a dataset the caller does not have a preview for.
         row = score_preview(dataset_id)
-        return await annotation_proxy(
-            f"/api/jobs/{row['job_id']}/manual-trims", body
-        )
+        return await annotation_proxy(f"/api/jobs/{row['job_id']}/manual-trims", body)
 
     async def manual_job(dataset_id: str, job_id: str):
         """Fetch a trim job only when it belongs to this preview's dataset."""
 
         row = score_preview(dataset_id)
         if not job_id or any(
-            char not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_"
+            char
+            not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_"
             for char in job_id
         ):
             raise DomainError("裁剪任务编号无效", 404)
@@ -554,9 +563,7 @@ def create_gateway(settings):
             raise DomainError("Server 预览服务返回无效响应", 502) from exc
         if response.status_code >= 400:
             detail = (
-                opened.get("detail")
-                if isinstance(opened, dict)
-                else "无法打开裁剪结果"
+                opened.get("detail") if isinstance(opened, dict) else "无法打开裁剪结果"
             )
             raise DomainError(str(detail), response.status_code)
         return JSONResponse(
@@ -565,9 +572,7 @@ def create_gateway(settings):
 
     @app.get("/api/recycle/{dataset_id}")
     async def recycle_status(dataset_id: str):
-        result = await asyncio.to_thread(
-            transport.recycle.status, f"bp/{dataset_id}"
-        )
+        result = await asyncio.to_thread(transport.recycle.status, f"bp/{dataset_id}")
         return JSONResponse(result, headers={"Cache-Control": "no-store"})
 
     @app.post("/api/recycle/{dataset_id}/{action}")

@@ -8,8 +8,14 @@ import React, {
   useRef,
   useState,
 } from "react";
+
+import { AnnotationEpisodeNavigation } from "@/components/annotation-navigation";
+import {
+  EpisodeScoreBadge,
+  EpisodeScorePanel,
+  useEpisodeScores,
+} from "@/components/episode-scores";
 import { useFlaggedEpisodes } from "@/context/flagged-episodes-context";
-import { EpisodeScoreBadge, EpisodeScorePanel, useEpisodeScores } from "@/components/episode-scores";
 import {
   readEpisodeScroll,
   writeEpisodePage,
@@ -29,10 +35,25 @@ interface SidebarProps {
   showFlaggedOnly: boolean;
   onShowFlaggedOnlyChange: (v: boolean) => void;
   onEpisodeSelect?: (ep: number) => void;
+  annotationMode?: boolean;
 }
 
 function TrashIcon() {
-  return <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><path d="M3 6h18M9 6V4h6v2M5 6l1 14h12l1-14M10 10v6M14 10v6" /></svg>;
+  return (
+    <svg
+      width="15"
+      height="15"
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="1.6"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      aria-hidden="true"
+    >
+      <path d="M3 6h18M9 6V4h6v2M5 6l1 14h12l1-14M10 10v6M14 10v6" />
+    </svg>
+  );
 }
 
 const Sidebar: React.FC<SidebarProps> = ({
@@ -46,30 +67,57 @@ const Sidebar: React.FC<SidebarProps> = ({
   showFlaggedOnly,
   onShowFlaggedOnlyChange,
   onEpisodeSelect,
+  annotationMode = false,
 }) => {
   const [mobileVisible, setMobileVisible] = useState(false);
-  const { flagged, count, toggle } = useFlaggedEpisodes();
-  const { result: scores, retry: retryScores } = useEpisodeScores(datasetInfo.repoId);
-  const scoreByEpisode = useMemo(() => new Map(scores.report?.episodes.map(row => [row.episode_index, row]) || []), [scores.report]);
-  const [recycle, setRecycle] = useState<{entries: {episode: number}[]; revision: number; total_episodes: number; operation?: {id: string; state: string; mapping?: Record<string, number>}} | null>(null);
+  const { flagged, count, toggle, remap, canReload, storageError } =
+    useFlaggedEpisodes();
+  const { result: scores, retry: retryScores } = useEpisodeScores(
+    datasetInfo.repoId,
+  );
+  const scoreByEpisode = useMemo(
+    () =>
+      new Map(
+        scores.report?.episodes.map((row) => [row.episode_index, row]) || [],
+      ),
+    [scores.report],
+  );
+  const [recycle, setRecycle] = useState<{
+    entries: { episode: number }[];
+    revision: number;
+    total_episodes: number;
+    operation?: { id: string; state: string; mapping?: Record<string, number> };
+  } | null>(null);
   const [busy, setBusy] = useState(false);
   const [notice, setNotice] = useState("");
   const [undo, setUndo] = useState<number | null>(null);
   const api = `/api/recycle/${encodeURIComponent(datasetInfo.repoId.split("/")[1])}`;
+
   useEffect(() => {
     let active = true;
+    let request = 0;
     const load = async () => {
+      const current = ++request;
       try {
-        const response = await fetch(api, {cache: "no-store"});
+        const response = await fetch(api, { cache: "no-store" });
         const result = await response.json();
         if (!response.ok) throw new Error(result.detail || "无法读取回收站");
-        if (active) {
+        if (active && current === request) {
+          if (!remap(result)) {
+            setNotice("待检查版本已更新，请重试");
+            return;
+          }
           const operation = result.operation;
           if (operation?.state === "completed") {
             const key = `recycle-generation:${datasetInfo.repoId}`;
             if (sessionStorage.getItem(key) !== operation.id) {
-              const previous: number[] = JSON.parse(sessionStorage.getItem("flagged-episodes") || "[]");
-              sessionStorage.setItem("flagged-episodes", JSON.stringify(previous.filter(i => operation.mapping?.[i] !== undefined).map(i => operation.mapping[i])));
+              if (!canReload()) {
+                setRecycle(result);
+                setNotice(
+                  "编号已更新；本页待检查记录尚未保存，暂停自动刷新，请核对浏览器存储",
+                );
+                return;
+              }
               sessionStorage.setItem(key, operation.id);
               window.location.reload();
               return;
@@ -77,37 +125,83 @@ const Sidebar: React.FC<SidebarProps> = ({
           }
           setRecycle(result);
         }
-      } catch (error) { if (active) setNotice(String(error instanceof Error ? error.message : error)); }
+      } catch (error) {
+        if (active && current === request) {
+          setNotice(String(error instanceof Error ? error.message : error));
+        }
+      }
     };
     void load();
     const timer = setInterval(load, 5000);
     window.addEventListener("focus", load);
-    return () => { active = false; clearInterval(timer); window.removeEventListener("focus", load); };
-  }, [api, datasetInfo.repoId]);
-  const trashed = useMemo(() => new Set(recycle?.entries.map(e => e.episode) || []), [recycle]);
-  const cleaning = ["pending", "running"].includes(recycle?.operation?.state || "");
+    return () => {
+      active = false;
+      clearInterval(timer);
+      window.removeEventListener("focus", load);
+    };
+  }, [api, datasetInfo.repoId, remap, canReload]);
+
+  const trashed = useMemo(
+    () => new Set(recycle?.entries.map((entry) => entry.episode) || []),
+    [recycle],
+  );
+  const cleaning = ["pending", "running"].includes(
+    recycle?.operation?.state || "",
+  );
+
   async function changeEpisode(episode: number, action: "trash" | "restore") {
     if (!recycle || busy || cleaning) return;
     setBusy(true);
     try {
-      const response = await fetch(`${api}/${action}`, {method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify({episodes: [episode], revision: recycle.revision})});
+      const response = await fetch(`${api}/${action}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          episodes: [episode],
+          revision: recycle.revision,
+        }),
+      });
       const result = await response.json();
-      if (!response.ok) throw new Error(result.detail || "操作失败，请刷新重试");
+      if (!response.ok) {
+        throw new Error(result.detail || "操作失败，请刷新重试");
+      }
       setRecycle(result);
-      setNotice(action === "trash" ? `Episode ${episode} 已放入回收站` : `Episode ${episode} 已恢复`);
+      setNotice(
+        action === "trash"
+          ? `Episode ${episode} 已放入回收站`
+          : `Episode ${episode} 已恢复`,
+      );
       setUndo(action === "trash" ? episode : null);
       if (action === "trash" && episode === episodeId) {
-        const removed = new Set<number>(result.entries.map((e: {episode: number}) => e.episode));
-        const next = Array.from({length: datasetInfo.total_episodes}, (_, i) => i).find(i => !removed.has(i) && i > episode) ?? Array.from({length: datasetInfo.total_episodes}, (_, i) => i).find(i => !removed.has(i));
-        window.location.assign(next === undefined ? `/${datasetInfo.repoId}/trash` : `/${datasetInfo.repoId}/episode_${next}`);
+        const removed = new Set<number>(
+          result.entries.map((entry: { episode: number }) => entry.episode),
+        );
+        const next =
+          Array.from({ length: datasetInfo.total_episodes }, (_, i) => i).find(
+            (i) => !removed.has(i) && i > episode,
+          ) ??
+          Array.from({ length: datasetInfo.total_episodes }, (_, i) => i).find(
+            (i) => !removed.has(i),
+          );
+        window.location.assign(
+          next === undefined
+            ? `/${datasetInfo.repoId}/trash`
+            : `/${datasetInfo.repoId}/episode_${next}`,
+        );
       }
-    } catch (error) { setNotice(error instanceof Error ? error.message : "操作失败"); }
-    finally { setBusy(false); }
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : "操作失败");
+    } finally {
+      setBusy(false);
+    }
   }
 
   const displayEpisodes = useMemo(() => {
-    const episodes = !showFlaggedOnly || count === 0 ? paginatedEpisodes : [...flagged].sort((a, b) => a - b);
-    return episodes.filter(episode => !trashed.has(episode));
+    const episodes =
+      !showFlaggedOnly || count === 0
+        ? paginatedEpisodes
+        : [...flagged].sort((a, b) => a - b);
+    return episodes.filter((episode) => !trashed.has(episode));
   }, [paginatedEpisodes, showFlaggedOnly, flagged, count, trashed]);
   const navRef = useRef<HTMLElement | null>(null);
 
@@ -139,7 +233,7 @@ const Sidebar: React.FC<SidebarProps> = ({
         );
       });
     };
-    nav.addEventListener("scroll", saveScroll, {passive: true});
+    nav.addEventListener("scroll", saveScroll, { passive: true });
 
     const saved = readEpisodeScroll(
       sessionStorage,
@@ -152,7 +246,7 @@ const Sidebar: React.FC<SidebarProps> = ({
       nav.scrollTop = saved;
     } else {
       const active = nav.querySelector<HTMLElement>('[aria-current="page"]');
-      if (active) active.scrollIntoView({block: "nearest"});
+      if (active) active.scrollIntoView({ block: "nearest" });
       else nav.scrollTop = 0;
     }
 
@@ -188,7 +282,7 @@ const Sidebar: React.FC<SidebarProps> = ({
     <div className="flex z-10 shrink-0">
       <nav
         ref={navRef}
-        className={`shrink-0 overflow-y-auto bg-[var(--surface-0)] border-r border-white/5 p-4 break-words w-60 ${
+        className={`${annotationMode ? "annotation-sidebar" : ""} shrink-0 overflow-y-auto bg-[var(--surface-0)] border-r border-white/5 p-4 break-words w-60 ${
           mobileVisible ? "block" : "hidden"
         } md:block`}
         aria-label="数据集导航"
@@ -212,117 +306,214 @@ const Sidebar: React.FC<SidebarProps> = ({
           <dd className="text-slate-200">{datasetInfo.fps}</dd>
         </dl>
 
-        <EpisodeScorePanel result={scores} episodeId={episodeId} retry={retryScores} />
+        <EpisodeScorePanel
+          result={scores}
+          episodeId={episodeId}
+          retry={retryScores}
+        />
 
-        <a href={`/${datasetInfo.repoId}/trash`} className="pipeline-recycle-link"><TrashIcon /> 回收站 <span>{recycle?.entries.length ?? "…"}</span></a>
-        {notice && <div role="status" className="pipeline-recycle-notice">{notice} {undo !== null && <button disabled={busy || cleaning} onClick={() => changeEpisode(undo, "restore")}>撤销</button>}</div>}
-        {cleaning && <p className="pipeline-recycle-notice">正在永久清理，请等待完成后刷新。</p>}
-        <div className="mt-5 flex items-center justify-between">
-          <p className="text-[10px] uppercase tracking-wide text-slate-500">
-            Episode 列表
+        <a
+          href={`/${datasetInfo.repoId}/batch`}
+          className="pipeline-batch-link"
+        >
+          <span aria-hidden="true">▦</span> 批量视频预览
+        </a>
+        {storageError && (
+          <p role="alert" className="pipeline-recycle-notice">
+            {storageError}
           </p>
-          {count > 0 && (
-            <button
-              onClick={() => onShowFlaggedOnlyChange(!showFlaggedOnly)}
-              className={`text-[10px] uppercase tracking-wide px-2 py-0.5 rounded-md transition-colors ${
-                showFlaggedOnly
-                  ? "bg-orange-500/15 text-orange-300 border border-orange-500/30"
-                  : "text-slate-500 hover:text-slate-300 border border-white/10"
-              }`}
-            >
-              已标记 · {count}
-            </button>
-          )}
-        </div>
+        )}
 
-        <ul className="mt-2 space-y-px">
-          {displayEpisodes.map((episode) => {
-            const active = episode === episodeId;
-            const itemClass = `group flex items-center justify-between gap-2 px-2 py-1 rounded-md text-xs tabular transition-colors ${
-              active
-                ? "bg-cyan-400/10 text-cyan-300"
-                : "text-slate-300 hover:bg-white/5"
-            }`;
-            return (
-              <li key={episode}>
-                {onEpisodeSelect ? (
-                  <div className={itemClass}>
-                    <button
-                      onClick={() => onEpisodeSelect(episode)}
-                      aria-current={active ? "page" : undefined}
-                      className="flex-1 text-left"
-                    >
-                      Episode {episode}
-                    </button>
-                    <EpisodeScoreBadge score={scoreByEpisode.get(episode)} />
-                    <button type="button" className="pipeline-trash-button" title={`将 Episode ${episode} 放入回收站`} aria-label={`将 Episode ${episode} 放入回收站`} disabled={!recycle || busy || cleaning} onClick={() => changeEpisode(episode, "trash")}><TrashIcon /></button>
-                    <button
-                      onClick={() => toggle(episode)}
-                      className={`text-xs leading-none transition-colors ${
-                        flagged.has(episode)
-                          ? "text-orange-400 hover:text-orange-300"
-                          : "text-slate-600 hover:text-slate-400 opacity-0 group-hover:opacity-100"
-                      }`}
-                      title={flagged.has(episode) ? "取消标记" : "标记"}
-                    >
-                      ⚑
-                    </button>
-                  </div>
-                ) : (
-                  <div className={itemClass}>
-                    <Link
-                      href={`./episode_${episode}`}
-                      aria-current={active ? "page" : undefined}
-                      className="flex-1 text-left"
-                    >
-                      Episode {episode}
-                    </Link>
-                    <EpisodeScoreBadge score={scoreByEpisode.get(episode)} />
-                    <button type="button" className="pipeline-trash-button" title={`将 Episode ${episode} 放入回收站`} aria-label={`将 Episode ${episode} 放入回收站`} disabled={!recycle || busy || cleaning} onClick={() => changeEpisode(episode, "trash")}><TrashIcon /></button>
-                    <button
-                      onClick={() => toggle(episode)}
-                      className={`text-xs leading-none transition-colors ${
-                        flagged.has(episode)
-                          ? "text-orange-400 hover:text-orange-300"
-                          : "text-slate-600 hover:text-slate-400 opacity-0 group-hover:opacity-100"
-                      }`}
-                      title={flagged.has(episode) ? "取消标记" : "标记"}
-                    >
-                      ⚑
-                    </button>
-                  </div>
-                )}
-              </li>
-            );
-          })}
-        </ul>
-
-        {!showFlaggedOnly && totalPages > 1 && (
-          <div className="mt-3 flex items-center gap-2 text-[10px] uppercase tracking-wide text-slate-400">
-            <button
-              onClick={() => changePage(prevPage)}
-              className={`px-2 py-1 rounded-md border border-white/10 transition-colors hover:bg-white/5 hover:text-slate-200 ${
-                currentPage === 1 ? "cursor-not-allowed opacity-40" : ""
-              }`}
-              disabled={currentPage === 1}
-            >
-              ‹ 上一页
-            </button>
-            <span className="tabular text-slate-500">
-              {currentPage} / {totalPages}
-            </span>
-            <button
-              onClick={() => changePage(nextPage)}
-              className={`ml-auto px-2 py-1 rounded-md border border-white/10 transition-colors hover:bg-white/5 hover:text-slate-200 ${
-                currentPage === totalPages
-                  ? "cursor-not-allowed opacity-40"
-                  : ""
-              }`}
-              disabled={currentPage === totalPages}
-            >
-              下一页 ›
-            </button>
+        <a
+          href={`/${datasetInfo.repoId}/trash`}
+          className="pipeline-recycle-link"
+        >
+          <TrashIcon /> 回收站 <span>{recycle?.entries.length ?? "…"}</span>
+        </a>
+        {notice && (
+          <div role="status" className="pipeline-recycle-notice">
+            {notice}{" "}
+            {undo !== null && (
+              <button
+                disabled={busy || cleaning}
+                onClick={() => changeEpisode(undo, "restore")}
+              >
+                撤销
+              </button>
+            )}
           </div>
+        )}
+        {cleaning && (
+          <p className="pipeline-recycle-notice">
+            正在永久清理，请等待完成后刷新。
+          </p>
+        )}
+
+        {annotationMode ? (
+          <AnnotationEpisodeNavigation
+            episodeId={episodeId}
+            scores={scoreByEpisode}
+            excluded={trashed}
+            flagged={flagged}
+            showFlaggedOnly={showFlaggedOnly}
+            onShowFlaggedOnlyChange={onShowFlaggedOnlyChange}
+            renderActions={(episode) => (
+              <>
+                <button
+                  type="button"
+                  className="pipeline-trash-button"
+                  title={`将 Episode ${episode} 放入回收站`}
+                  aria-label={`将 Episode ${episode} 放入回收站`}
+                  disabled={!recycle || busy || cleaning}
+                  onClick={() => changeEpisode(episode, "trash")}
+                >
+                  <TrashIcon />
+                </button>
+                <button
+                  type="button"
+                  onClick={() => toggle(episode)}
+                  title={flagged.has(episode) ? "取消标记" : "标记"}
+                  className={
+                    flagged.has(episode) ? "text-orange-400" : "text-slate-500"
+                  }
+                >
+                  ⚑
+                </button>
+              </>
+            )}
+          />
+        ) : (
+          <>
+            <div className="mt-5 flex items-center justify-between">
+              <p className="text-[10px] uppercase tracking-wide text-slate-500">
+                Episode 列表
+              </p>
+              {count > 0 && (
+                <button
+                  onClick={() => onShowFlaggedOnlyChange(!showFlaggedOnly)}
+                  className={`text-[10px] uppercase tracking-wide px-2 py-0.5 rounded-md transition-colors ${
+                    showFlaggedOnly
+                      ? "bg-orange-500/15 text-orange-300 border border-orange-500/30"
+                      : "text-slate-500 hover:text-slate-300 border border-white/10"
+                  }`}
+                >
+                  已标记 · {count}
+                </button>
+              )}
+            </div>
+
+            <ul className="mt-2 space-y-px">
+              {displayEpisodes.map((episode) => {
+                const active = episode === episodeId;
+                const itemClass = `group flex items-center justify-between gap-2 px-2 py-1 rounded-md text-xs tabular transition-colors ${
+                  active
+                    ? "bg-cyan-400/10 text-cyan-300"
+                    : "text-slate-300 hover:bg-white/5"
+                }`;
+                return (
+                  <li key={episode}>
+                    {onEpisodeSelect ? (
+                      <div className={itemClass}>
+                        <button
+                          onClick={() => onEpisodeSelect(episode)}
+                          aria-current={active ? "page" : undefined}
+                          className="flex-1 text-left"
+                        >
+                          Episode {episode}
+                        </button>
+                        <EpisodeScoreBadge
+                          score={scoreByEpisode.get(episode)}
+                        />
+                        <button
+                          type="button"
+                          className="pipeline-trash-button"
+                          title={`将 Episode ${episode} 放入回收站`}
+                          aria-label={`将 Episode ${episode} 放入回收站`}
+                          disabled={!recycle || busy || cleaning}
+                          onClick={() => changeEpisode(episode, "trash")}
+                        >
+                          <TrashIcon />
+                        </button>
+                        <button
+                          onClick={() => toggle(episode)}
+                          className={`text-xs leading-none transition-colors ${
+                            flagged.has(episode)
+                              ? "text-orange-400 hover:text-orange-300"
+                              : "text-slate-600 hover:text-slate-400 opacity-0 group-hover:opacity-100"
+                          }`}
+                          title={flagged.has(episode) ? "取消标记" : "标记"}
+                        >
+                          ⚑
+                        </button>
+                      </div>
+                    ) : (
+                      <div className={itemClass}>
+                        <Link
+                          href={`./episode_${episode}`}
+                          aria-current={active ? "page" : undefined}
+                          className="flex-1 text-left"
+                        >
+                          Episode {episode}
+                        </Link>
+                        <EpisodeScoreBadge
+                          score={scoreByEpisode.get(episode)}
+                        />
+                        <button
+                          type="button"
+                          className="pipeline-trash-button"
+                          title={`将 Episode ${episode} 放入回收站`}
+                          aria-label={`将 Episode ${episode} 放入回收站`}
+                          disabled={!recycle || busy || cleaning}
+                          onClick={() => changeEpisode(episode, "trash")}
+                        >
+                          <TrashIcon />
+                        </button>
+                        <button
+                          onClick={() => toggle(episode)}
+                          className={`text-xs leading-none transition-colors ${
+                            flagged.has(episode)
+                              ? "text-orange-400 hover:text-orange-300"
+                              : "text-slate-600 hover:text-slate-400 opacity-0 group-hover:opacity-100"
+                          }`}
+                          title={flagged.has(episode) ? "取消标记" : "标记"}
+                        >
+                          ⚑
+                        </button>
+                      </div>
+                    )}
+                  </li>
+                );
+              })}
+            </ul>
+
+            {!showFlaggedOnly && totalPages > 1 && (
+              <div className="mt-3 flex items-center gap-2 text-[10px] uppercase tracking-wide text-slate-400">
+                <button
+                  onClick={() => changePage(prevPage)}
+                  className={`px-2 py-1 rounded-md border border-white/10 transition-colors hover:bg-white/5 hover:text-slate-200 ${
+                    currentPage === 1 ? "cursor-not-allowed opacity-40" : ""
+                  }`}
+                  disabled={currentPage === 1}
+                >
+                  ‹ 上一页
+                </button>
+                <span className="tabular text-slate-500">
+                  {currentPage} / {totalPages}
+                </span>
+                <button
+                  onClick={() => changePage(nextPage)}
+                  className={`ml-auto px-2 py-1 rounded-md border border-white/10 transition-colors hover:bg-white/5 hover:text-slate-200 ${
+                    currentPage === totalPages
+                      ? "cursor-not-allowed opacity-40"
+                      : ""
+                  }`}
+                  disabled={currentPage === totalPages}
+                >
+                  下一页 ›
+                </button>
+              </div>
+            )}
+          </>
         )}
       </nav>
 

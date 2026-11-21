@@ -130,15 +130,16 @@ class AnalysisRequest(BaseModel):
 
 class AnnotationRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
+    backend: Literal["argus", "codex"] = "argus"
     job_id: str = Field(min_length=1, max_length=128)
-    engine: Literal["argus", "flora"] = "argus"
+    engine: Literal["argus", "codex", "flora"] = "argus"
     note: str | None = Field(default=None, max_length=4000)
     model: str | None = Field(default=None, min_length=1, max_length=200)
     cap_usd: float | None = Field(default=None, gt=0, le=1_000_000)
     concurrency: int | None = Field(default=None, ge=1, le=64)
-    reasoning: (
-        Literal["none", "minimal", "low", "medium", "high", "xhigh"] | None
-    ) = None
+    reasoning: Literal["none", "minimal", "low", "medium", "high", "xhigh"] | None = (
+        None
+    )
     sample_fps: float | None = Field(default=None, gt=0, le=10)
     inspection: Literal["auto", "all", "off"] | None = None
     field_dictionary: StrictBool | None = None
@@ -147,10 +148,16 @@ class AnnotationRequest(BaseModel):
     api_key: str | None = Field(default=None, max_length=4096)
     template_id: str | None = Field(default=None, min_length=1, max_length=160)
     template_revision: StrictInt | None = Field(default=None, ge=0)
+    run_scope: Literal["full", "trial", "selection"] = "full"
+    episodes: list[StrictInt] | None = Field(default=None, max_length=100000)
+    boundary_target_s: float = Field(default=0.2, gt=0, le=5)
+    boundary_window_s: float = Field(default=1.0, gt=0, le=30)
 
 
 class AnnotationResumeRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
+    continue_full: bool = False
+    cap_usd: float | None = Field(default=None, gt=0, le=1_000_000)
     base_url: str | None = Field(default=None, max_length=2048)
     api_key: str | None = Field(default=None, max_length=4096)
 
@@ -243,9 +250,7 @@ def create_app(settings, background=True):
         close_allocation=runner._close_allocation,
     )
     analyses = AnalysisRunner(settings, ingest.store, runner.command)
-    annotations = AnnotationRunner(
-        settings, ingest.store, runtimes, runner=runner
-    )
+    annotations = AnnotationRunner(settings, ingest.store, runtimes, runner=runner)
     viewer = ViewerManager(settings, ingest.store)
     datasets = DatasetManager(settings, runner, viewer)
     descriptions = DatasetDescriptions(settings, runner)
@@ -399,7 +404,10 @@ def create_app(settings, background=True):
                             try:
                                 user_sessions.close_all()
                             finally:
-                                lock.release()
+                                try:
+                                    app.state.annotation_media.close()
+                                finally:
+                                    lock.release()
 
     app = FastAPI(title="Embodied Pipeline Server", lifespan=lifespan)
     viewer_transport = ViewerTransport(
@@ -411,6 +419,9 @@ def create_app(settings, background=True):
     app.state.viewer_transport = viewer_transport
     app.state.episode_scores = viewer_transport.scores
     app.state.user_sessions = user_sessions
+    from .annotation_routes import mount_workbench
+
+    mount_workbench(app, settings, ingest.store, runner, annotations)
     app.state.imports = imports
     app.state.deliveries = deliveries
     app.state.checks = checks
@@ -440,11 +451,24 @@ def create_app(settings, background=True):
             "/api/version-conversion-candidates",
             "/api/trim-candidates",
             "/api/annotations",
-            *(f"/api/listings/{name}" for name in (
-                "collections", "jobs", "merge-jobs", "results", "datasets", "merge-candidates",
-                "version-conversion-candidates", "trim-candidates", "annotations",
-                "annotation-candidates", "collection-detail", "status", "robots",
-            )),
+            *(
+                f"/api/listings/{name}"
+                for name in (
+                    "collections",
+                    "jobs",
+                    "merge-jobs",
+                    "results",
+                    "datasets",
+                    "merge-candidates",
+                    "version-conversion-candidates",
+                    "trim-candidates",
+                    "annotations",
+                    "annotation-candidates",
+                    "collection-detail",
+                    "status",
+                    "robots",
+                )
+            ),
         },
     )
     mount_ui(app, report=True)
@@ -526,7 +550,7 @@ def create_app(settings, background=True):
                 {"id": k, "label": v}
                 for k, v in settings.targets.items()
                 if k in allowed
-            ]
+            ],
         }
 
     @app.post("/device/uploads", status_code=201)
@@ -710,7 +734,9 @@ def create_app(settings, background=True):
                     blockers = robot_profile_blockers(row.get("profile", {}))
             result["blockers"] = blockers
         try:
-            result["dataset_path"] = str(dataset_for_job(settings, row) if metadata is None else metadata(row)[0])
+            result["dataset_path"] = str(
+                dataset_for_job(settings, row) if metadata is None else metadata(row)[0]
+            )
             result["dataset_available"] = True
         except (DomainError, OSError, ValueError) as exc:
             result["dataset_available"] = False
@@ -745,9 +771,7 @@ def create_app(settings, background=True):
         @app.get("/api/recycle/{dataset_id}")
         def embedded_recycle_status(dataset_id: str):
             registered_preview(viewer_transport, dataset_id)
-            return embedded_json(
-                viewer_transport.recycle.status(f"bp/{dataset_id}")
-            )
+            return embedded_json(viewer_transport.recycle.status(f"bp/{dataset_id}"))
 
         @app.post("/api/recycle/{dataset_id}/{action}")
         def embedded_recycle_change(
@@ -903,9 +927,7 @@ def create_app(settings, background=True):
         )
 
     @app.post("/api/jobs/{jid}/manual-trims", status_code=202)
-    def manual_trim_start(
-        jid: str, body: ManualTrimRequest, request: Request
-    ):
+    def manual_trim_start(jid: str, body: ManualTrimRequest, request: Request):
         accessible_job(jid, request, action="裁剪")
         return job_response(
             trims.enqueue_manual(
@@ -1034,9 +1056,7 @@ def create_app(settings, background=True):
         return instruction_review.dataset(dataset_id)
 
     @app.put("/api/instructions/{dataset_id}/template")
-    def instruction_template_save(
-        dataset_id: str, body: TemplateSaveRequest
-    ):
+    def instruction_template_save(dataset_id: str, body: TemplateSaveRequest):
         return instruction_review.save_template(dataset_id, body)
 
     @app.get("/api/instructions/{dataset_id}/episodes/{episode}")
@@ -1089,9 +1109,7 @@ def create_app(settings, background=True):
         return subtask_review.save(dataset_id, episode, body)
 
     @app.post("/api/subtask-review/{dataset_id}/exports", status_code=202)
-    def review_export(
-        dataset_id: str, body: RevisionExportRequest, request: Request
-    ):
+    def review_export(dataset_id: str, body: RevisionExportRequest, request: Request):
         accessible_job(dataset_id, request, action="导出")
         job = runner.subtask_exports.enqueue_review(
             dataset_id,
@@ -1106,9 +1124,14 @@ def create_app(settings, background=True):
     def review_export_status(dataset_id: str, export_id: str):
         subtask_review.resolve(dataset_id)
         job = ingest.store.get("job", export_id)
-        if job.get("source_kind") != "lerobot_subtask_revision" or job.get("source_job_id") != dataset_id:
+        if (
+            job.get("source_kind") != "lerobot_subtask_revision"
+            or job.get("source_job_id") != dataset_id
+        ):
             raise DomainError("修订导出任务不存在", 404)
-        return {k: job.get(k) for k in ("id", "state", "stage", "dataset_name", "error")}
+        return {
+            k: job.get(k) for k in ("id", "state", "stage", "dataset_name", "error")
+        }
 
     @app.get("/api/annotations/options")
     def annotation_options():
@@ -1151,7 +1174,12 @@ def create_app(settings, background=True):
                 template_id=body.template_id,
                 template_revision=body.template_revision,
                 engine=body.engine,
+                backend=body.backend,
                 principal=principal(request),
+                run_scope=body.run_scope,
+                episodes=body.episodes,
+                boundary_target_s=body.boundary_target_s,
+                boundary_window_s=body.boundary_window_s,
             )
         )
 
@@ -1191,9 +1219,15 @@ def create_app(settings, background=True):
                 aid,
                 base_url=body.base_url if body else None,
                 api_key=body.api_key if body else None,
+                continue_full=body.continue_full if body else False,
+                cap_usd=body.cap_usd if body else None,
                 principal=principal(request),
             )
         )
+
+    @app.post("/api/annotations/{aid}/workbench")
+    def annotation_workbench_candidates(aid: str):
+        return annotations.workbench_candidates(aid)
 
     @app.get("/api/annotations/{aid}/episodes")
     def annotation_episodes(aid: str):
@@ -1332,7 +1366,11 @@ def create_app(settings, background=True):
 
     def slim_upload_rows(records):
         return [
-            {key: value for key, value in row.items() if key in COLLECTION_UPLOAD_FIELDS}
+            {
+                key: value
+                for key, value in row.items()
+                if key in COLLECTION_UPLOAD_FIELDS
+            }
             for row in upload_rows(records)
         ]
 
@@ -1354,7 +1392,10 @@ def create_app(settings, background=True):
         return lists.deletion_preview(kind, id)
 
     @app.get("/api/listings/collection-detail")
-    def collection_detail(robot_type: str = Query(min_length=1, max_length=128), id: str = Query(min_length=1, max_length=128)):
+    def collection_detail(
+        robot_type: str = Query(min_length=1, max_length=128),
+        id: str = Query(min_length=1, max_length=128),
+    ):
         return lists.collection_detail(robot_type, id)
 
     @app.get("/api/listings/{resource}")
@@ -1366,6 +1407,8 @@ def create_app(settings, background=True):
         q: str = Query(default="", max_length=2000),
         kind: Literal["raw", "result"] | None = None,
     ):
-        return lists.page(resource, robot_type, offset=offset, limit=limit, q=q, kind=kind)
+        return lists.page(
+            resource, robot_type, offset=offset, limit=limit, q=q, kind=kind
+        )
 
     return app

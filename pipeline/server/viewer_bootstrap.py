@@ -132,7 +132,9 @@ def patch_presentation(cache: Path):
                     subprocess.run(command, input=patch, text=True, check=True)
                 break
         else:
-            raise RuntimeError("Unexpected Visualizer source; cannot apply presentation")
+            raise RuntimeError(
+                "Unexpected Visualizer source; cannot apply presentation"
+            )
     video_player = (source / "src/components/simple-videos-player.tsx").read_text()
     if "videosInfo: sourceVideosInfo" not in video_player:
         camera_patch = CAMERA_ORDER_PATCH.read_text()
@@ -145,7 +147,9 @@ def patch_presentation(cache: Path):
                     subprocess.run(command, input=camera_patch, text=True, check=True)
                 break
         else:
-            raise RuntimeError("Unexpected Visualizer source; cannot apply camera order")
+            raise RuntimeError(
+                "Unexpected Visualizer source; cannot apply camera order"
+            )
     patch_score_filter(cache)
     patch_subtask_review(cache)
     patch_instruction_editor(cache)
@@ -261,6 +265,7 @@ def _fingerprint(cache: Path, data_origin: str) -> str:
                     + CAMERA_ORDER_PATCH.read_bytes()
                     + SCORE_FILTER_PATCH.read_bytes()
                     + THEME_SCRIPT.read_bytes()
+                    + (Path(__file__).parents[1] / "web/workbench.css").read_bytes()
                     + Path(__file__).read_bytes()
                     + Path(__file__).with_name("viewer_annotations.py").read_bytes()
                     + Path(__file__).with_name("viewer_instructions.py").read_bytes()

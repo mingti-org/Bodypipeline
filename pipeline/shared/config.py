@@ -162,6 +162,17 @@ class Settings:
     argus_annotation_note: str = ""
     flora: dict = field(default_factory=dict)
     user_sessions: dict = field(default_factory=dict)
+    # Trusted deployment paths/settings; never accepted as HTTP commands.
+    codex_bin: str = "codex"
+    codex_model: str = ""
+    codex_models: list[str] = field(default_factory=list)
+    codex_reasoning: str = ""
+    codex_timeout: int = 1800
+    codex_max_images: int = 96
+    codex_max_image_bytes: int = 32 * 1024 * 1024
+    codex_max_prompt_chars: int = 180000
+    codex_max_output_bytes: int = 2 * 1024 * 1024
+    codex_max_part_seconds: float = 60.0
     slurm: dict = field(default_factory=dict)
     # Trusted deployment setting, not a user-supplied conversion option.
     conversion_image_storage: str = "materialized"
@@ -169,6 +180,8 @@ class Settings:
     devices: list[dict] = field(default_factory=list)
     accepted_capture_profile_hashes: list[str] = field(default_factory=list)
     replay: dict = field(default_factory=dict)
+    capture: dict = field(default_factory=dict)
+    background_transfer: dict = field(default_factory=dict)
 
     def __post_init__(self):
         if (
@@ -184,6 +197,30 @@ class Settings:
         self.argus_prices = validate_argus_prices(self.argus_prices)
         if type(self.argus_annotation_unlimited) is not bool:
             raise ValueError("argus_annotation_unlimited 必须是布尔值")
+        if not isinstance(self.codex_bin, str) or not self.codex_bin.strip():
+            raise ValueError("codex_bin 必须是受信 CLI 路径或可执行文件名")
+        if not isinstance(self.codex_models, list) or any(
+            not isinstance(v, str) or not v.strip() for v in self.codex_models
+        ):
+            raise ValueError("codex_models 必须是模型名列表")
+        if self.codex_reasoning not in {"", "low", "medium", "high", "xhigh"}:
+            raise ValueError("codex_reasoning 无效")
+        if (
+            type(self.codex_max_part_seconds) not in (int, float)
+            or not math.isfinite(self.codex_max_part_seconds)
+            or not 0.5 <= self.codex_max_part_seconds <= 450
+        ):
+            raise ValueError("codex_max_part_seconds 应在 0.5 到 450 秒之间")
+        for key, low, high in (
+            ("codex_timeout", 10, 86400),
+            ("codex_max_images", 1, 500),
+            ("codex_max_image_bytes", 1024, 200 * 1024 * 1024),
+            ("codex_max_prompt_chars", 1000, 1000000),
+            ("codex_max_output_bytes", 1024, 16 * 1024 * 1024),
+        ):
+            value = getattr(self, key)
+            if type(value) is not int or not low <= value <= high:
+                raise ValueError(f"{key} 应在 {low} 到 {high} 之间")
         if self.conversion_image_storage not in {"materialized", "reference"}:
             raise ValueError(
                 "conversion_image_storage 必须是 materialized 或 reference"
@@ -220,8 +257,7 @@ class Settings:
         unknown = set(self.viewer_execution_identity) - {"enabled"}
         if unknown:
             raise ValueError(
-                "viewer_execution_identity 包含未知字段："
-                + ", ".join(sorted(unknown))
+                "viewer_execution_identity 包含未知字段：" + ", ".join(sorted(unknown))
             )
         if (
             "enabled" in self.viewer_execution_identity
@@ -262,10 +298,11 @@ class Settings:
             )
         if settings.token and settings.token == settings.device_token:
             raise ValueError("用户密钥与设备密钥必须不同")
-        if settings.mode not in {"mock", "ros2"} or settings.processing_mode not in {
-            "demo",
-            "real",
-        }:
+        if settings.mode not in {
+            "mock",
+            "ros2",
+            "external",
+        } or settings.processing_mode not in {"demo", "real"}:
             raise ValueError("mode / processing_mode 配置无效")
         if (settings.mode == "ros2" or role == "bridge") and len(
             settings.bridge_token
@@ -374,9 +411,8 @@ class Settings:
         for node, host in connect_hosts.items():
             if node not in nodes:
                 raise ValueError("user_sessions.connect_hosts 包含未允许的登录节点")
-            if (
-                not isinstance(host, str)
-                or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9.-]{0,252}", host)
+            if not isinstance(host, str) or not re.fullmatch(
+                r"[A-Za-z0-9][A-Za-z0-9.-]{0,252}", host
             ):
                 raise ValueError("user_sessions.connect_hosts 主机地址无效")
         for key, default, low, high in (
@@ -453,9 +489,7 @@ class Settings:
             if spec.get("profile") not in {"human", "yam", "dex", "tianji"}:
                 raise ValueError(f"flora.profiles[{provider!r}].profile 无效")
             if type(spec.get("yam32", False)) is not bool:
-                raise ValueError(
-                    f"flora.profiles[{provider!r}].yam32 必须为布尔值"
-                )
+                raise ValueError(f"flora.profiles[{provider!r}].yam32 必须为布尔值")
             camera_roles = spec.get("camera_roles", {})
             if not isinstance(camera_roles, dict):
                 raise ValueError(

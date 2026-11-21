@@ -16,6 +16,7 @@ dependencies = [
     "numpy>=1.26,<3",
     "msgpack>=1.1,<2",
     "pyarrow>=17,<22",
+    "tomli>=2; python_version < '3.11'",
 ]
 
 [dependency-groups]
