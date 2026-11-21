@@ -4,6 +4,80 @@ function filterNavigationRows(rows, filter, visibility) {
   return rows.filter((row) => !excluded.has(row.episode) && (!flagged || flagged.has(row.episode)) && (filter.review === "checked" ? row.complete : filter.review === "unchecked" ? !row.complete : true));
 }
 
+class AnnotationNavigationStore {
+  state = {
+    dataset: "",
+    episode: 0,
+    ready: false,
+    loading: true,
+    error: "",
+    rows: [],
+    total: 0,
+    resultCount: 0,
+    page: 0,
+    pageCount: 1,
+    selected: [],
+    filter: {},
+    subtasks: [],
+    currentOutsideFilter: false
+  };
+  listeners = new Set;
+  actions = null;
+  visibility = { excluded: [], flagged: null };
+  getSnapshot = () => this.state;
+  subscribe = (listener) => {
+    this.listeners.add(listener);
+    return () => {
+      this.listeners.delete(listener);
+    };
+  };
+  publish(state) {
+    this.state = state;
+    this.listeners.forEach((listener) => listener());
+  }
+  connect(actions) {
+    this.actions = actions;
+    return () => {
+      if (this.actions === actions) {
+        this.actions = null;
+        this.publish({ ...this.state, ready: false, loading: true });
+      }
+    };
+  }
+  run(task) {
+    const actions = this.actions;
+    if (!actions)
+      return;
+    if (this.state.error)
+      this.publish({ ...this.state, error: "" });
+    const failed = (error) => {
+      if (this.actions === actions)
+        this.publish({
+          ...this.state,
+          error: error instanceof Error ? error.message : String(error)
+        });
+    };
+    try {
+      Promise.resolve(task(actions)).catch(failed);
+    } catch (error) {
+      failed(error);
+    }
+  }
+  getVisibility() {
+    return this.visibility;
+  }
+  setVisibility(excluded, flagged) {
+    const next = {
+      excluded: [...excluded].sort((a, b) => a - b),
+      flagged: flagged?.slice().sort((a, b) => a - b) ?? null
+    };
+    if (JSON.stringify(next) === JSON.stringify(this.visibility))
+      return;
+    this.visibility = next;
+    this.actions?.visibilityChanged();
+  }
+}
+
 // pipeline/server/viewer_ui/workbench-media.ts
 function nearestFrame(times, time) {
   let lo = 0, hi = times.length - 1;
@@ -412,7 +486,7 @@ function operation(doc, count, name, change) {
 }
 function resize(doc, count, id, side, frame) {
   return operation(doc, count, "boundary", (d) => {
-    const s = d.segments.find((s) => s.id === id);
+    const s = d.segments.find((s2) => s2.id === id);
     if (!s)
       throw Error("未选片段");
     const other = d.segments.find((o) => o.id !== id && (side === "start" ? o.end === s.start : o.start === s.end));
@@ -461,7 +535,7 @@ function replace(doc, count, start, end, segment, attempt) {
 }
 function move(doc, count, id, start) {
   return operation(doc, count, "move", (d) => {
-    const s = d.segments.find((s) => s.id === id);
+    const s = d.segments.find((s2) => s2.id === id);
     if (!s)
       throw Error("未选片段");
     const length = s.end - s.start;
@@ -471,7 +545,7 @@ function move(doc, count, id, start) {
 }
 function relabelAttempt(doc, count, id, subtaskId) {
   return operation(doc, count, "relabel-whole-attempt", (d) => {
-    const a = d.attempts.find((a) => a.id === id), step = d.templateSnapshot.subtasks.find((s) => s.id === subtaskId);
+    const a = d.attempts.find((a2) => a2.id === id), step = d.templateSnapshot.subtasks.find((s) => s.id === subtaskId);
     if (!a || !step)
       throw Error("标签或尝试不存在");
     a.subtaskId = step.id;
@@ -840,7 +914,7 @@ function mountWorkbench(root, options = {}) {
             status: result.status
           };
           Object.assign(row, saved);
-          const filteredRow = rows.find((row) => row.episode === s.head.episode);
+          const filteredRow = rows.find((row2) => row2.episode === s.head.episode);
           if (filteredRow)
             Object.assign(filteredRow, saved);
           renderEpisodes();
@@ -1023,7 +1097,7 @@ function mountWorkbench(root, options = {}) {
     $("page-status").textContent = `${page + 1} / ${Math.max(1, Math.ceil(rows.length / 10))} · ${rows.length} 条`;
     $("episode-list").querySelectorAll("[data-open]").forEach((el) => el.onclick = () => safe(() => openEpisode(Number(el.dataset.open))));
     $("episode-list").querySelectorAll("[data-add]").forEach((el) => el.onchange = () => {
-      const r = rows.find((r) => r.episode === Number(el.dataset.add));
+      const r = rows.find((r2) => r2.episode === Number(el.dataset.add));
       if (el.checked)
         selection.add(r.episode, r.revision, filterState.subtask ? "filter" : "manual", r.counts);
       else
@@ -1207,7 +1281,7 @@ function mountWorkbench(root, options = {}) {
       if (disposed || load !== loadGeneration || dataset !== sourceDataset)
         return;
       const use = saved && sameSource && (saved.dirty || saved.head.revision === head.revision);
-      const s = {
+      const s2 = {
         head,
         doc: use ? copy(saved.document) : copy(head.document),
         undo: new UndoHistory,
@@ -1220,17 +1294,17 @@ function mountWorkbench(root, options = {}) {
         readFailure
       };
       if (use) {
-        s.undo.past = saved.past || [];
-        s.undo.future = saved.future || [];
+        s2.undo.past = saved.past || [];
+        s2.undo.future = saved.future || [];
       }
       if (saved && (!sameSource || saved.dirty && saved.head.revision !== head.revision)) {
-        s.remote = copy(head);
-        s.head = saved.head;
-        s.doc = copy(saved.document);
-        s.error = "服务器修订或来源与本地草稿不同";
+        s2.remote = copy(head);
+        s2.head = saved.head;
+        s2.doc = copy(saved.document);
+        s2.error = "服务器修订或来源与本地草稿不同";
       }
-      sessions.set(ep, s);
-      active = s;
+      sessions.set(ep, s2);
+      active = s2;
     }
     if (disposed || load !== loadGeneration || dataset !== sourceDataset)
       return;
@@ -1435,7 +1509,7 @@ function mountWorkbench(root, options = {}) {
     const segments = s.doc.segments.filter((x) => x.start < hi && x.end > lo);
     $("track").innerHTML = segments.map((x) => {
       const name = x.label === "SUBTASK" ? s.doc.templateSnapshot.subtasks.find((t) => t.id === x.subtaskId)?.name : labels[x.label];
-      const a = s.doc.attempts.find((a) => a.id === x.attemptId);
+      const a = s.doc.attempts.find((a2) => a2.id === x.attemptId);
       return `<div class="segment ${x.label} ${s.input.selected === x.id ? "selected" : ""}" data-segment="${esc(x.id)}" style="left:${Math.max(0, visiblePercent(x.start))}%;width:${(Math.min(hi, x.end) - Math.max(lo, x.start)) / (hi - lo) * 100}%" tabindex="0" role="button" aria-label="${esc(name)}${a ? ` 第${attemptOrdinals(s.doc).get(a.id)}次` : ""} ${x.start} 至 ${x.end - 1}"><i class="edge start" data-side="start"></i><strong>${esc(name)}</strong><small>${x.start}–${x.end - 1}${a ? ` · 第${attemptOrdinals(s.doc).get(a.id)}次 · ${a.outcome ? outcomes[a.outcome] : "结果暂缺"}` : ""}</small><i class="edge end" data-side="end"></i></div>`;
     }).join("");
     try {
@@ -1449,7 +1523,7 @@ function mountWorkbench(root, options = {}) {
       tick.style.left = `${i / 6 * 100}%`;
     });
     $("track").querySelectorAll("[data-segment]").forEach((el) => {
-      const x = s.doc.segments.find((x) => x.id === el.dataset.segment);
+      const x = s.doc.segments.find((x2) => x2.id === el.dataset.segment);
       el.style.left = `${Math.max(0, visiblePercent(x.start))}%`;
       el.style.width = `${(Math.min(hi, x.end) - Math.max(lo, x.start)) / (hi - lo) * 100}%`;
     });
@@ -1486,7 +1560,7 @@ function mountWorkbench(root, options = {}) {
     if (!active || e.button !== 0)
       return;
     const target = e.target, segmentEl = target.closest("[data-segment]"), isRuler = !!target.closest("#ruler"), host = isRuler ? $("ruler") : $("track");
-    const id = segmentEl?.dataset.segment, s = id ? active.doc.segments.find((s) => s.id === id) : undefined;
+    const id = segmentEl?.dataset.segment, s = id ? active.doc.segments.find((s2) => s2.id === id) : undefined;
     const side = target.dataset.side;
     const at = pointFrame(e, host, !!side);
     if (s && tool !== "range" && !side && tool !== "move") {
@@ -1652,7 +1726,7 @@ function mountWorkbench(root, options = {}) {
   }
   function bindFields(host, scope, getValues, update) {
     host.querySelectorAll("[data-field]").forEach((el) => el.addEventListener("input", () => safe(() => {
-      const f = current().doc.templateSnapshot.fields.find((f) => f.id === el.dataset.field);
+      const f = current().doc.templateSnapshot.fields.find((f2) => f2.id === el.dataset.field);
       let v = el.value || null;
       if (f.kind === "multi")
         v = Array.from(el.selectedOptions).map((x) => x.value);
@@ -1679,7 +1753,7 @@ function mountWorkbench(root, options = {}) {
       return;
     }
     host.className = "";
-    const a = s.doc.attempts.find((a) => a.id === seg.attemptId), related = a ? s.doc.segments.filter((x) => x.attemptId === a.id) : [];
+    const a = s.doc.attempts.find((a2) => a2.id === seg.attemptId), related = a ? s.doc.segments.filter((x) => x.attemptId === a.id) : [];
     const name = seg.label === "SUBTASK" ? s.doc.templateSnapshot.subtasks.find((x) => x.id === seg.subtaskId)?.name : labels[seg.label];
     host.innerHTML = `<strong>${esc(name)}</strong><div class="row" style="margin-top:12px"><label>首帧（包含）<input id="selected-first" value="${esc(s.input[`first:${seg.id}`] ?? seg.start)}" inputmode="numeric"></label><label>末帧（包含）<input id="selected-last" value="${esc(s.input[`last:${seg.id}`] ?? seg.end - 1)}" inputmode="numeric"></label></div><div class="row"><button id="copy-range">用此片段范围重标</button></div><label>此片段局部备注<textarea id="selected-note" rows="2">${esc(seg.note || "")}</textarea></label>${seg.label === "OUT_OF_TEMPLATE" ? `<label>模板外活动描述<textarea id="selected-description">${esc(seg.description || "")}</textarea></label>` : ""}<div class="field-grid" id="segment-fields">${s.doc.templateSnapshot.fields.filter((f) => f.scope === "segment").map((f) => fieldControl(f, seg.values?.[f.id], seg.id)).join("")}</div>${a ? `<div class="attempt-info"><strong>本 Episode · ${esc(attemptText(a))}</strong><br>共 ${related.length} 个片段：${related.map((x) => `${x.start}–${x.end - 1}`).join("、")}<br>下方结果与评分作用于这些全部片段；局部备注保持各自归属。</div><label>整次执行结果<select id="selected-outcome"><option value="">尚未填写</option>${Object.entries(outcomes).map(([v, l]) => `<option value="${v}" ${a.outcome === v ? "selected" : ""}>${l}</option>`).join("")}</select></label><div class="field-grid" id="attempt-fields">${s.doc.templateSnapshot.fields.filter((f) => f.scope === "attempt" && f.id !== "attempt-outcome").map((f) => fieldControl(f, a.values[f.id], a.id)).join("")}</div><div class="row"><button id="whole-label">修改本次操作的标签</button></div>` : '<p class="hint">此片段未指定操作。可使用“用此片段范围重标”后选择对应操作。</p>'}<div class="row"><button id="delete-segment" class="danger">删除片段</button></div>${seg.risks?.length ? `<p class="special-help">标注提示：${esc(seg.risks.join("；"))}</p>` : ""}`;
     for (const [id, side] of [
@@ -1708,7 +1782,7 @@ function mountWorkbench(root, options = {}) {
         d.segments.find((x) => x.id === seg.id).description = value("selected-description").value;
       });
     bindFields($("segment-fields"), "segment", () => seg.values || {}, (d, id, v) => {
-      const x = d.segments.find((x) => x.id === seg.id);
+      const x = d.segments.find((x2) => x2.id === seg.id);
       (x.values ??= {})[id] = v;
     });
     if (a) {
@@ -1838,7 +1912,7 @@ function mountWorkbench(root, options = {}) {
     await loadLibrary();
     modal(`<h2>共享任务模板</h2><p>历史标注继续绑定实际快照。保存共享库不会自动升级当前 Episode。</p><div class="row"><select id="library-choice">${library.templates.map((t) => `<option value="${esc(t.id)}">${esc(t.name)}</option>`).join("")}</select><button id="edit-library">编辑所选模板</button><button id="new-template">新建模板</button><button id="upgrade-library" class="primary">查看差异并升级当前 Episode</button></div><hr><div class="row"><label>从文件导入模板<input id="template-file" type="file" accept=".json,application/json"></label><button id="download-template">下载所选模板</button></div><p class="hint">继续支持在网页中新建、编辑，也可以导入 JSON。<a href="/workbench-assets/template-example.json" download>下载格式示例</a> · <a href="/workbench-assets/screw-alignment-en.json" download>对准螺丝英文模板（4 类）</a> · <a href="/workbench-assets/screw-workflow-en.json" download>全流程英文模板（8 类）</a></p><div id="template-import-preview"></div><div id="template-form"></div>`);
     btn("download-template", () => {
-      const t = library.templates.find((t) => t.id === value("library-choice").value);
+      const t = library.templates.find((t2) => t2.id === value("library-choice").value);
       if (!t)
         throw Error("请选择要下载的模板");
       download(t, `${t.id}.json`);
@@ -1898,7 +1972,7 @@ function mountWorkbench(root, options = {}) {
     btn("edit-library", () => editTemplate(library.templates.find((t) => t.id === value("library-choice").value) || current().doc.templateSnapshot));
     btn("new-template", () => editTemplate({ id: uid(), name: "新任务模板", subtasks: [], fields: [] }));
     btn("upgrade-library", () => {
-      const t = library.templates.find((t) => t.id === value("library-choice").value);
+      const t = library.templates.find((t2) => t2.id === value("library-choice").value);
       if (!t)
         throw Error("请选择共享模板");
       upgradeDialog(t);
@@ -2408,7 +2482,7 @@ function mountWorkbench(root, options = {}) {
     renderEpisodes();
   }
   function selectEpisode(ep, checked) {
-    const row = availableRows().find((row) => row.episode === ep);
+    const row = availableRows().find((row2) => row2.episode === ep);
     if (!row)
       throw Error("该 Episode 已不可用，请刷新列表");
     if (checked)
