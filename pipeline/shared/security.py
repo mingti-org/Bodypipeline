@@ -86,6 +86,11 @@ VIEWER_LOGIN_PAGE = themed_html(VIEWER_LOGIN_PAGE)
 TRUSTED_NETWORK_VALUES = {"1", "true", "yes", "on"}
 
 
+def authorization_headers(token: str) -> dict[str, str]:
+    """A trusted deployment may omit its token; ``Bearer `` is invalid HTTP."""
+    return {"Authorization": "Bearer " + token} if token else {}
+
+
 def trusted_network_enabled(settings) -> bool:
     """Return whether browser login is disabled for this deployment.
 

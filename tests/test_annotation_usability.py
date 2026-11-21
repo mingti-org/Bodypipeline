@@ -164,7 +164,7 @@ def test_ai_initial_draft_prefers_newer_execution_over_candidate_id(
             "run_created_at": 200,
         },
     ]
-    _, path, job, snapshot, data = service.context("source")
+    key, path, job, snapshot, data = service.context("source")
     row, _ = service._head(
         "source",
         0,
@@ -172,6 +172,7 @@ def test_ai_initial_draft_prefers_newer_execution_over_candidate_id(
         job,
         snapshot,
         data,
+        source_key=key,
         pin=False,
         initial_candidates=candidates,
     )
