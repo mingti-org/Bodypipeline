@@ -45,6 +45,14 @@ def make_argus(root):
     python = venv / "python"
     python.write_text("#!/bin/sh\nexit 0\n")
     python.chmod(0o755)
+    for name in ("label/harness.py", "review/__main__.py"):
+        (src / name).write_text("# pipeline-argus-workbench-contract:v2\n")
+    with (src / "review/__main__.py").open("a") as f:
+        f.write('# pipeline-argus-unlimited:v1\n# "--no-cap"\n')
+    (src / "label/dictionary_stage.py").write_text("# pipeline-argus-unlimited:v1\n")
+    (src / "label/pipeline_runtime.py").write_text(
+        "def select_scope(): pass\nUNLIMITED_BUDGET_VERSION = 1\n"
+    )
     return src
 
 
@@ -677,6 +685,25 @@ def test_unlimited_annotation_bypasses_all_monetary_limits_and_keeps_costs(servi
     assert resumed["budget"]["daily_used_usd"] == 1500
 
 
+def test_unlimited_refuses_an_old_tool_before_enqueue_or_dispatch(service):
+    runner, _store, source, data = service
+    runner.settings.argus_annotation_unlimited = True
+    (source / "review/__main__.py").write_text(
+        "# pipeline-argus-workbench-contract:v2\n"
+    )
+    options = runner.options()
+    assert not options["available"] and options["unlimited"]
+    assert options["defaults"]["cap_usd"] is None
+    with pytest.raises(DomainError, match="0004"):
+        runner.enqueue("job-1")
+    with pytest.raises(DomainError, match="--no-cap"):
+        argus_annotation.command(
+            runner.settings, {"cap_usd": None}, data, Path("/tmp/work")
+        )
+    runner.settings.argus_annotation_unlimited = False
+    assert runner.options()["available"]
+
+
 def test_outputs_episode_and_cost_are_read_from_argus_sidecars(tmp_path):
     work = tmp_path / "annotation"
     argus = work / "argus"
@@ -1108,3 +1135,175 @@ def test_annotation_storage_area(settings_factory, tmp_path):
         storage_path(s, row, "annotations", "abc")
         == (tmp_path / "data/agilex_aloha/annotations/abc").resolve()
     )
+
+
+def test_resume_counts_unsettled_reserve_once_and_keeps_explicit_cap(service):
+    runner, store, _src, _data = service
+    runner.settings.argus_task_budget_usd = 20.0
+    runner.settings.argus_daily_budget_usd = 20.0
+    runner.settings.argus_per_episode_budget_usd = 10.0
+    row = runner.enqueue("job-1", cap_usd=20.0)
+    row.update(
+        state="PARTIAL", cost_usd=5.0, reserved_cost_usd=8.0, cost_complete=False
+    )
+    store.put("annotation", row["id"], row)
+    assert runner.budget("job-1", 2)["available_usd"] == 12.0
+    resumed = runner.resume(row["id"], cap_usd=20.0)
+    assert resumed["cap_usd"] == 20.0
+    resumed.update(state="PARTIAL", cap_usd=10.0)
+    store.put("annotation", row["id"], resumed)
+    assert runner.resume(row["id"])["cap_usd"] == 10.0
+
+
+def test_optional_trial_selection_and_explicit_full_continuation(service):
+    runner, store, _src, _data = service
+    with pytest.raises(DomainError, match="1–5"):
+        runner.enqueue("job-1", run_scope="trial", episodes=None)
+    row = runner.enqueue("job-1", run_scope="trial", episodes=[1])
+    assert row["selected_episodes"] == [1] and row["input_episode_count"] == 1
+    row.update(state="COMPLETED", cost_usd=0.1)
+    store.put("annotation", row["id"], row)
+    with pytest.raises(DomainError):
+        runner.resume(row["id"])
+    resumed = runner.resume(row["id"], continue_full=True)
+    assert resumed["id"] == row["id"]
+    assert resumed["selected_episodes"] is None and resumed["input_episode_count"] == 2
+    assert resumed["cost_usd"] == 0.1
+
+
+def test_old_native_argus_rejects_free_trial_and_selection_without_dispatch(service):
+    runner, store, src, _ = service
+    (src / "label/pipeline_runtime.py").unlink()
+    assert runner.options()["available"]
+    assert not runner.options()["execution_contract_v2"]
+    for scope in ("trial", "selection"):
+        with pytest.raises(DomainError, match="避免误跑全量"):
+            runner.enqueue("job-1", run_scope=scope, episodes=[0])
+    assert not store.all("annotation")
+    assert runner.enqueue("job-1")["run_scope"] == "full"
+
+
+def test_failed_run_cost_retains_retry_fine_and_dictionary_reservations(tmp_path):
+    work = tmp_path / "work"
+    out = work / "argus/run/out"
+    out.mkdir(parents=True)
+    (out / "episode_000000.json").write_text(
+        json.dumps({"usage": {"est_cost_usd": 1}, "final_attempt_index": 1})
+    )
+    (out / "noreply_episode_000000.json").write_text(
+        json.dumps(
+            {
+                "final_attempt_index": 2,
+                "final_dispatch_outcome": "unverified",
+                "final_reserved_usd": 2,
+                "final_cost_history": [{"usage": {"est_cost_usd": 1}}],
+                "auxiliary_cost_history": [
+                    {
+                        "kind": "bodypipeline_boundary",
+                        "cost_usd": 3,
+                        "cost_is_conservative_estimate": True,
+                    },
+                    {"kind": "bodypipeline_boundary", "cost_usd": 0.5},
+                ],
+            }
+        )
+    )
+    (work / "argus/dictionary.claim").write_text("claimed")
+    (work / "argus/dictionary_status.json").write_text(
+        json.dumps({"projected_upper_usd": 1.5})
+    )
+    cost = argus_annotation.cost(work)
+    assert cost["reserved_cost_usd"] == 8.0
+    assert cost["cost_usd"] is None and not cost["cost_complete"]
+
+
+def test_free_resume_retries_only_received_invalid_native_replies(service, tmp_path):
+    runner, _, _, data = service
+    row = runner.enqueue("job-1")
+    row["attempts"] = 2
+    work = tmp_path / "work"
+    out = work / "argus/run/out"
+    out.mkdir(parents=True)
+    for ep, record in enumerate(
+        [
+            {"parse_ok": True, "response": {}, "labels": {"task_summary": "valid"}},
+            {
+                "parse_ok": False,
+                "response": {},
+                "labels": {"_incomplete": ["no timeline"]},
+            },
+            {"parse_ok": False, "no_reply_kind": "client_timeout"},
+        ]
+    ):
+        (out / f"episode_{ep:06}.json").write_text(json.dumps(record))
+    argv = argus_annotation.command(runner.settings, row, data, work)
+    assert argv.count("--retry-received") == 1
+    assert argv[argv.index("--retry-received") + 1] == "episode_000001"
+
+
+def test_old_completed_summary_does_not_hide_new_continuation_receipts(tmp_path):
+    work = tmp_path / "work"
+    run = work / "argus/run"
+    run.mkdir(parents=True)
+    (run / "run.json").write_text(
+        json.dumps(
+            {
+                "status": "done",
+                "cost_usd": 5,
+                "reserved_cost_usd": 5,
+                "cost_complete": True,
+                "cap_usd": 20,
+            }
+        )
+    )
+    assert argus_annotation.cost(work)["cost_usd"] == 5  # summary-only legacy run
+    out = run / "out"
+    out.mkdir()
+    (out / "episode_000000.json").write_text(json.dumps({"usage": {"est_cost_usd": 5}}))
+    (out / "noreply_episode_000001.json").write_text(
+        json.dumps({"final_dispatch_outcome": "claimed", "final_reserved_usd": 3})
+    )
+    cost = argus_annotation.cost(work)
+    assert cost["reserved_cost_usd"] == 8
+    assert cost["cost_usd"] is None and not cost["cost_complete"]
+    (out / "noreply_episode_000001.json").write_text(
+        json.dumps({"final_dispatch_outcome": "received", "usage": {"est_cost_usd": 4}})
+    )
+    cost = argus_annotation.cost(work)
+    assert cost["cost_usd"] == cost["reserved_cost_usd"] == 9
+    assert cost["cost_complete"]
+
+
+def test_verified_newer_cumulative_receipt_releases_old_reserve_but_missing_does_not(
+    tmp_path,
+):
+    import os
+
+    work = tmp_path / "work"
+    run = work / "argus/run"
+    out = run / "out"
+    out.mkdir(parents=True)
+    receipt = out / "episode_000000.json"
+    receipt.write_text(json.dumps({"usage": {"est_cost_usd": 5}}))
+    summary = run / "run.json"
+    summary.write_text(
+        json.dumps({"cost_usd": 5, "reserved_cost_usd": 8, "cost_complete": False})
+    )
+    os.utime(
+        receipt, ns=(1, 1)
+    )  # only an older paid receipt; unknown hold not disproved
+    assert argus_annotation.cost(work)["reserved_cost_usd"] == 8
+    receipt.unlink()
+    assert argus_annotation.cost(work)["reserved_cost_usd"] == 8
+    receipt.write_text(
+        json.dumps(
+            {
+                "final_dispatch_outcome": "not dispatched",
+                "final_attempt_index": 2,
+                "final_cost_history": [{"usage": {"est_cost_usd": 5}}],
+            }
+        )
+    )
+    cost = argus_annotation.cost(work)
+    assert cost["cost_usd"] == cost["reserved_cost_usd"] == 5
+    assert cost["cost_complete"]

@@ -30,6 +30,7 @@ STAGE_TITLES = {
     "clips": "生成预览视频",
     "dry_run": "构造模型请求",
     "label": "大模型标注",
+    "boundary": "加密取证与边界细化",
     "board": "拼接标注结果",
 }
 
@@ -79,11 +80,53 @@ def available(settings) -> tuple[bool, str]:
         return False, f"Argus review 源码不存在：{source}"
     if _python(settings) is None:
         return False, "未找到 Argus Python 解释器"
+    if getattr(
+        settings, "argus_annotation_unlimited", False
+    ) and not unlimited_available(settings):
+        return (
+            False,
+            "Argus 尚不支持真正不限额；请运行 scripts/install_argus.sh 更新工具链（0004）",
+        )
     return True, ""
 
 
 def source_path(settings) -> Path:
     return Path(settings.argus_src).expanduser()
+
+
+def unlimited_available(settings) -> bool:
+    root = source_path(settings)
+    try:
+        return (
+            all(
+                "pipeline-argus-unlimited:v1" in (root / name).read_text()
+                for name in ("review/__main__.py", "label/dictionary_stage.py")
+            )
+            and '"--no-cap"' in (root / "review/__main__.py").read_text()
+            and "UNLIMITED_BUDGET_VERSION = 1"
+            in (root / "label/pipeline_runtime.py").read_text()
+        )
+    except OSError:
+        return False
+
+
+def execution_available(settings) -> bool:
+    """Scope selection and the shared retry/spend ledger require patch 0003.
+
+    Native full analysis remains available on older Argus installations. A
+    limited request must never be sent to a tool that ignores its scope.
+    """
+    root = source_path(settings)
+    try:
+        return (
+            all(
+                "pipeline-argus-workbench-contract:v2" in (root / name).read_text()
+                for name in ("label/harness.py", "review/__main__.py")
+            )
+            and "def select_scope(" in (root / "label/pipeline_runtime.py").read_text()
+        )
+    except OSError:
+        return False
 
 
 def template_available(settings) -> bool:
@@ -101,6 +144,19 @@ def template_available(settings) -> bool:
             )
             and "pipeline-argus-template-retry:v1"
             in (root / "label/harness.py").read_text()
+            and all(
+                "pipeline-argus-workbench-contract:v2" in (root / name).read_text()
+                for name in (
+                    "label/episode.py",
+                    "label/harness.py",
+                    "review/__main__.py",
+                )
+            )
+            and "CONTRACT_VERSION = 2"
+            in (root / "label/pipeline_template.py").read_text()
+            and "def refine_outputs("
+            in (root / "label/pipeline_runtime.py").read_text()
+            and "def select_scope(" in (root / "label/pipeline_runtime.py").read_text()
         )
     except OSError:
         return False
@@ -375,11 +431,35 @@ def environment(
         os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else ""
     )
     env["PATH"] = os.pathsep.join([str(source / "tools/bin"), env.get("PATH", "")])
+    env["PIPELINE_ARGUS_EPISODES"] = json.dumps(annotation.get("selected_episodes"))
     env.setdefault("MALLOC_ARENA_MAX", "2")
 
     cameras = provider_context.get("cameras") or {}
     if cameras:
         env["PIPELINE_ARGUS_CAMERA_MOUNTING"] = json.dumps(cameras, ensure_ascii=False)
+    if annotation.get("backend", "argus") == "codex":
+        from .annotation_backends import ensure_snapshot
+
+        ensure_snapshot(settings, annotation)
+        for name in (
+            *NATIVE_KEY_ENVS,
+            "PIPELINE_ARGUS_API_KEY",
+            "PIPELINE_ARGUS_BASE_URL",
+            "PIPELINE_ARGUS_GENERIC_GATEWAY",
+            "PIPELINE_ARGUS_ROUTE_MODEL",
+            "PIPELINE_ARGUS_PRICES",
+        ):
+            env.pop(name, None)
+        env["PIPELINE_ANNOTATION_BACKEND"] = "codex"
+        env["PIPELINE_CODEX_CONFIG"] = json.dumps(annotation["backend_config"])
+        env["PIPELINE_CODEX_RECEIPTS"] = str(
+            Path(annotation["work_path"]) / "codex-calls"
+        )
+        env["PIPELINE_CODEX_RESUME_INDEX"] = str(annotation.get("attempts") or 1)
+        env["RDA_DECODE_CONCURRENCY"] = str(
+            max(2, 2 * int(annotation.get("concurrency") or 1))
+        )
+        return env
     if settings.argus_base_url:
         env["PIPELINE_ARGUS_BASE_URL"] = settings.argus_base_url
         env["PIPELINE_ARGUS_GENERIC_GATEWAY"] = "1"
@@ -415,6 +495,11 @@ def command(settings, annotation: dict, data: Path, work: Path) -> list[str]:
     python = _python(settings)
     if python is None:
         raise DomainError("未找到 Argus Python 解释器", 503)
+    if annotation.get("cap_usd") is None and not unlimited_available(settings):
+        raise DomainError(
+            "Argus 不支持 --no-cap；请运行 scripts/install_argus.sh 更新工具链（0004），不会退回固定额度",
+            503,
+        )
     args = [
         "-m",
         "review",
@@ -455,14 +540,57 @@ def command(settings, annotation: dict, data: Path, work: Path) -> list[str]:
     elif annotation.get("field_dictionary") is False:
         args += ["--field-dictionary", "off"]
     max_tokens = annotation.get("max_tokens")
-    if max_tokens:
+    if max_tokens and annotation.get("backend", "argus") != "codex":
         args += ["--max-tokens", str(int(max_tokens))]
-    if annotation.get("task_template") and int(annotation.get("attempts") or 0) > 1:
-        from .template_annotation import invalid_received_units
+    if int(annotation.get("attempts") or 0) > 1:
+        if annotation.get("task_template"):
+            from .template_annotation import invalid_received_units
 
-        for name in invalid_received_units(work):
+            invalid = invalid_received_units(work)
+        else:
+            invalid = [
+                name
+                for name, path in _raw_files(Path(work) / "argus").items()
+                if (data := _read_json(path))
+                and (
+                    data.get("response") is not None
+                    or data.get("response_text") is not None
+                )
+                and not data.get("dry_run")
+                and (
+                    data.get("parse_ok") is False
+                    or (data.get("labels") or {}).get("_incomplete")
+                    or (data.get("labels") or {}).get("_schema_violations")
+                )
+            ]
+        if annotation.get("backend") == "codex":
+            # Explicit user resume may retry a rejected CLI login/configuration
+            # after it is repaired. Unknown outcomes remain held, successes stay
+            # cached, and the transport's durable four-send limit still applies.
+            invalid += [
+                name
+                for name, path in _raw_files(Path(work) / "argus").items()
+                if (_read_json(path).get("codex_error") or {}).get("kind")
+                in {"authentication", "quota", "unavailable", "configuration"}
+            ]
+            invalid = sorted(set(invalid))
+        for name in invalid:
             args += ["--retry-received", name]
     return [python, *args]
+
+
+def legacy_template_cache(work: Path) -> bool:
+    """Changing the paid request contract requires an explicit new scope."""
+    spec = _read_json(Path(work) / "task-template.json")
+    if spec.get("version") == 1:
+        return True
+    for path in _raw_files(Path(work) / "argus").values():
+        settings = (_read_json(path).get("input_identity") or {}).get("settings") or {}
+        if settings.get("bodypipeline_task_template") and not settings.get(
+            "bodypipeline_business_contract"
+        ):
+            return True
+    return False
 
 
 def stage_from_log(text: str, current: str = "") -> str:
@@ -569,7 +697,9 @@ def _summary(name: str, data: dict, source: str) -> dict:
         "run_episode": meta.get("run_episode") or name,
         "prompt": prompt,
         "duration_s": duration,
-        "completed": outcome == "success",
+        "completed": None
+        if source == "template" and outcome is None
+        else outcome == "success",
         "outcome": outcome,
         "failure_kind": completion.get("failure_kind"),
         "completed_at_s": completion.get("completed_at_s"),
@@ -583,6 +713,7 @@ def _summary(name: str, data: dict, source: str) -> dict:
         "source": source,
         "template_name": data.get("template_name"),
         "template_warnings": data.get("template_warnings", []),
+        "template_partial": data.get("template_partial", False),
     }
 
 
@@ -792,26 +923,54 @@ def cost(work: Path) -> dict:
         "cost_complete": info.get("cost_complete"),
         "cap_usd": info.get("cap_usd"),
     }
-    if value["cost_usd"] is None:
-        billed = 0.0
-        reserved = 0.0
-        complete = True
-        for path in _raw_files(Path(work) / "argus").values():
-            data = _read_json(path)
-            if data.get("dry_run"):
-                continue
-            usage = data.get("usage") if isinstance(data.get("usage"), dict) else {}
-            estimate = usage.get("est_cost_usd")
-            if isinstance(estimate, (int, float)) and not isinstance(estimate, bool):
-                billed += float(estimate)
-            else:
-                complete = False
-            bound = data.get("final_reserved_usd")
-            if isinstance(bound, (int, float)) and not isinstance(bound, bool):
-                reserved += float(bound)
-        value["cost_usd"] = round(billed, 6) if complete else None
-        value["reserved_cost_usd"] = round(reserved, 6)
-        value["cost_complete"] = complete
+    # A completed trial's summary can remain on disk while a continuation has
+    # already dispatched more work. Always consult durable cumulative receipts.
+    from .argus_billing import receipt_spend
+
+    root = Path(work) / "argus"
+    ledger = receipt_spend(root)
+    paths = [
+        p for p in (root / "dictionary.json", root / "dictionary.claim") if p.exists()
+    ]
+    for folder in ("run/out", "run_final/out"):
+        paths.extend((root / folder).glob("*episode_*.json"))
+        paths.extend((root / folder / ".evidence").glob("*.inspection.json"))
+    summary = next(
+        (
+            root / p
+            for p in ("run_final/run.json", "run/run.json")
+            if (root / p).exists()
+        ),
+        None,
+    )
+    fresh = summary is None or any(
+        p.stat().st_mtime_ns >= summary.stat().st_mtime_ns for p in paths
+    )
+    if paths:
+        previous_paid = float(value["cost_usd"] or 0)
+        previous = max(previous_paid, float(value["reserved_cost_usd"] or 0))
+        held = float(ledger["reserved_cost_usd"])
+        # Only newer, complete cumulative receipts can release an old hold.
+        # Missing or unresolved invoices keep the conservative previous reserve.
+        settled = (
+            ledger["cost_complete"]
+            and ledger["cost_usd"] is not None
+            and ledger["cost_usd"] >= previous_paid
+        )
+        if fresh and settled:
+            value.update(ledger)
+        else:
+            value["cost_usd"] = (
+                max(previous_paid, float(ledger["cost_usd"]))
+                if ledger["cost_usd"] is not None
+                else None
+            )
+            value["reserved_cost_usd"] = round(max(previous, held), 6)
+            value["cost_complete"] = bool(
+                ledger["cost_complete"] and (not info or value["cost_complete"])
+            )
+    elif not info:
+        value.update(ledger)
     return value
 
 

@@ -49,18 +49,24 @@ def _dataset_file_lock(
     store: Store,
     key: str,
     operation: int,
-    wait_seconds: float = 0.0,
+    wait_seconds: float | None = 0.0,
 ):
     directory = store.path / "recycle-locks"
     directory.mkdir(exist_ok=True)
     with (directory / f"{key}.lock").open("a") as lock:
-        deadline = time.monotonic() + max(0.0, wait_seconds)
+        deadline = (
+            time.monotonic() + max(0.0, wait_seconds)
+            if wait_seconds is not None
+            else None
+        )
         while True:
             try:
-                fcntl.flock(lock, operation | fcntl.LOCK_NB)
+                fcntl.flock(
+                    lock, operation | (fcntl.LOCK_NB if deadline is not None else 0)
+                )
                 break
             except BlockingIOError as exc:
-                remaining = deadline - time.monotonic()
+                remaining = deadline - time.monotonic() if deadline is not None else 0
                 if remaining <= 0:
                     raise DomainError(
                         "该数据集正在处理，请稍后重试", 409
@@ -84,8 +90,13 @@ def dataset_read_lock(store: Store, key: str):
 
 
 @contextlib.contextmanager
-def dataset_lock(store: Store, key: str):
-    with _dataset_file_lock(store, key, fcntl.LOCK_EX):
+def dataset_lock(store: Store, key: str, *, shared=False, wait=False):
+    with _dataset_file_lock(
+        store,
+        key,
+        fcntl.LOCK_SH if shared else fcntl.LOCK_EX,
+        wait_seconds=None if wait else 0.0,
+    ):
         yield
 
 
@@ -228,7 +239,11 @@ class RecycleBin:
 
                 job_id = repo.removeprefix("bp/")
                 try:
-                    job = self.store.get("job", job_id) if repo.startswith("bp/") else None
+                    job = (
+                        self.store.get("job", job_id)
+                        if repo.startswith("bp/")
+                        else None
+                    )
                 except DomainError as exc:
                     if exc.code != 404:
                         raise

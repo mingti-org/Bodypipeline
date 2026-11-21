@@ -30,14 +30,34 @@ class AnnotationModel(BaseModel):
 class Subtask(AnnotationModel):
     id: Identifier = Field(min_length=1, max_length=160)
     name: str = Field(min_length=1, max_length=400)
+    definition: str | None = Field(default=None, max_length=20000)
+    includes: str | None = Field(default=None, max_length=20000)
+    excludes: str | None = Field(default=None, max_length=20000)
+    startCondition: str | None = Field(default=None, max_length=20000)
+    endCondition: str | None = Field(default=None, max_length=20000)
 
 
 class AnnotationField(AnnotationModel):
     id: Identifier = Field(min_length=1, max_length=160)
     label: str = Field(min_length=1, max_length=400)
-    scope: Literal["episode", "attempt", "frame"]
+    scope: Literal["episode", "attempt", "segment", "frame"]
     kind: Literal["rating", "text", "textarea", "number", "single", "multi", "bool"]
     options: list[str] | None = Field(default=None, max_length=200)
+    description: str | None = Field(default=None, max_length=20000)
+    minimum: float | None = None
+    maximum: float | None = None
+    step: float | None = Field(default=None, gt=0)
+    scale: str | None = Field(default=None, max_length=20000)
+
+    @model_validator(mode="after")
+    def scale_valid(self):
+        if (
+            self.minimum is not None
+            and self.maximum is not None
+            and self.minimum >= self.maximum
+        ):
+            raise ValueError("评分最小值必须小于最大值")
+        return self
 
 
 class TaskTemplate(AnnotationModel):
@@ -134,7 +154,9 @@ class TaskDocument(AnnotationModel):
                     continue
                 valid = field.scope == scope
                 if field.kind == "rating":
-                    valid &= type(value) is int and 1 <= value <= 5
+                    valid &= type(value) in (int, float) and (
+                        field.minimum if field.minimum is not None else 1
+                    ) <= value <= (field.maximum if field.maximum is not None else 5)
                 elif field.kind == "number":
                     valid &= type(value) in (int, float)
                 elif field.kind == "bool":
@@ -166,6 +188,10 @@ def validate_document(document: TaskDocument, frames: int) -> dict:
 
 
 def document_segments(document: dict) -> list[dict]:
+    if document.get("version") == 2:
+        from .annotation_contract import formal_segments
+
+        return formal_segments(document)
     names = {
         s["id"]: s["name"].strip() for s in document["templateSnapshot"]["subtasks"]
     }
@@ -321,3 +347,39 @@ class TemplateLibrary:
                 raise DomainError("任务模板库不能超过 4 MiB", 422)
             self.store.put("task_templates", "library", row)
             return row
+
+
+def parse_template_file(value: dict | list) -> list[dict]:
+    """Validate an import preview without writing the shared library."""
+    from pydantic import ValidationError
+
+    if len(json.dumps(value, ensure_ascii=False).encode()) > 4 * 1024 * 1024:
+        raise DomainError("模板文件不能超过 4 MiB", 422)
+    items = value if isinstance(value, list) else value.get("templates", [value])
+    if not isinstance(items, list) or not 1 <= len(items) <= 200:
+        raise DomainError("模板文件需要包含 1–200 套模板", 422)
+    templates = []
+    for index, item in enumerate(items):
+        try:
+            templates.append(
+                TaskTemplate.model_validate(item).model_dump(exclude_none=True)
+            )
+        except ValidationError as exc:
+            details = []
+            for error in exc.errors(include_input=False):
+                location = " → ".join(
+                    str(key + 1) if isinstance(key, int) else str(key)
+                    for key in error["loc"]
+                )
+                reason = {
+                    "missing": "缺少必填内容",
+                    "extra_forbidden": "包含不支持的字段",
+                    "string_too_short": "内容不能为空",
+                    "list_type": "需要填写列表",
+                    "string_type": "需要填写文字",
+                }.get(error["type"], error["msg"].removeprefix("Value error, "))
+                details.append(f"第 {index + 1} 套模板 → {location}：{reason}")
+            raise DomainError("；".join(details), 422) from exc
+    if len({t["id"] for t in templates}) != len(templates):
+        raise DomainError("文件内存在重复的模板 ID，请先分别命名", 422)
+    return templates

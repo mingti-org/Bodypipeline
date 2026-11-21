@@ -58,6 +58,7 @@ JOB_SUMMARY_OMIT = (
     "merge_sources",
     "source_description",
     "source_snapshot",
+    "revision_plan",
 )
 
 # Keep the episode picker and Runtime checks intact; full manifests and paths
@@ -111,14 +112,15 @@ class AnalysisRequest(BaseModel):
 
 class AnnotationRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
+    backend: Literal["argus", "codex"] = "argus"
     job_id: str = Field(min_length=1, max_length=128)
     note: str | None = Field(default=None, max_length=4000)
     model: str | None = Field(default=None, min_length=1, max_length=200)
     cap_usd: float | None = Field(default=None, gt=0, le=1_000_000)
     concurrency: int | None = Field(default=None, ge=1, le=64)
-    reasoning: (
-        Literal["none", "minimal", "low", "medium", "high", "xhigh"] | None
-    ) = None
+    reasoning: Literal["none", "minimal", "low", "medium", "high", "xhigh"] | None = (
+        None
+    )
     sample_fps: float | None = Field(default=None, gt=0, le=10)
     inspection: Literal["auto", "all", "off"] | None = None
     field_dictionary: StrictBool | None = None
@@ -127,10 +129,16 @@ class AnnotationRequest(BaseModel):
     api_key: str | None = Field(default=None, max_length=4096)
     template_id: str | None = Field(default=None, min_length=1, max_length=160)
     template_revision: StrictInt | None = Field(default=None, ge=0)
+    run_scope: Literal["full", "trial", "selection"] = "full"
+    episodes: list[StrictInt] | None = Field(default=None, max_length=100000)
+    boundary_target_s: float = Field(default=0.2, gt=0, le=5)
+    boundary_window_s: float = Field(default=1.0, gt=0, le=30)
 
 
 class AnnotationResumeRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
+    continue_full: bool = False
+    cap_usd: float | None = Field(default=None, gt=0, le=1_000_000)
     base_url: str | None = Field(default=None, max_length=2048)
     api_key: str | None = Field(default=None, max_length=4096)
 
@@ -325,9 +333,13 @@ def create_app(settings, background=True):
             if tasks:
                 await asyncio.gather(*tasks)
             viewer.stop()
+            app.state.annotation_media.close()
             lock.release()
 
     app = FastAPI(title="Embodied Pipeline Server", lifespan=lifespan)
+    from .annotation_routes import mount_workbench
+
+    mount_workbench(app, settings, ingest.store, runner, annotations)
     app.state.ingest, app.state.runner, app.state.viewer = ingest, runner, viewer
     app.state.imports = imports
     app.state.deliveries = deliveries
@@ -748,15 +760,22 @@ def create_app(settings, background=True):
     @app.post("/api/subtask-review/{dataset_id}/exports", status_code=202)
     def review_export(dataset_id: str, body: RevisionExportRequest):
         job = runner.subtask_exports.enqueue_review(dataset_id, body)
-        return {k: job.get(k) for k in ("id", "state", "stage", "dataset_name", "error")}
+        return {
+            k: job.get(k) for k in ("id", "state", "stage", "dataset_name", "error")
+        }
 
     @app.get("/api/subtask-review/{dataset_id}/exports/{export_id}")
     def review_export_status(dataset_id: str, export_id: str):
         subtask_review.resolve(dataset_id)
         job = ingest.store.get("job", export_id)
-        if job.get("source_kind") != "lerobot_subtask_revision" or job.get("source_job_id") != dataset_id:
+        if (
+            job.get("source_kind") != "lerobot_subtask_revision"
+            or job.get("source_job_id") != dataset_id
+        ):
             raise DomainError("修订导出任务不存在", 404)
-        return {k: job.get(k) for k in ("id", "state", "stage", "dataset_name", "error")}
+        return {
+            k: job.get(k) for k in ("id", "state", "stage", "dataset_name", "error")
+        }
 
     @app.get("/api/instructions/{dataset_id}")
     def instruction_dataset(dataset_id: str):
@@ -824,6 +843,7 @@ def create_app(settings, background=True):
     def annotation_start(body: AnnotationRequest):
         return annotations.enqueue(
             body.job_id,
+            backend=body.backend,
             note=body.note,
             model=body.model,
             cap_usd=body.cap_usd,
@@ -837,6 +857,10 @@ def create_app(settings, background=True):
             api_key=body.api_key,
             template_id=body.template_id,
             template_revision=body.template_revision,
+            run_scope=body.run_scope,
+            episodes=body.episodes,
+            boundary_target_s=body.boundary_target_s,
+            boundary_window_s=body.boundary_window_s,
         )
 
     @app.get("/api/annotations/{aid}")
@@ -860,7 +884,13 @@ def create_app(settings, background=True):
             aid,
             base_url=body.base_url if body else None,
             api_key=body.api_key if body else None,
+            continue_full=body.continue_full if body else False,
+            cap_usd=body.cap_usd if body else None,
         )
+
+    @app.post("/api/annotations/{aid}/workbench")
+    def annotation_workbench_candidates(aid: str):
+        return annotations.workbench_candidates(aid)
 
     @app.get("/api/annotations/{aid}/episodes")
     def annotation_episodes(aid: str):
