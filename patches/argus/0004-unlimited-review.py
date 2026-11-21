@@ -22,50 +22,101 @@ def replace_once(text, before, after):
 def apply(root: Path):
     review = root / "review/__main__.py"
     dictionary = root / "label/dictionary_stage.py"
-    if MARKER not in review.read_text():
-        text = review.read_text()
+    text = review.read_text()
+    if "budget = ap.add_mutually_exclusive_group()" not in text:
         text = replace_once(
             text,
             '    ap.add_argument("--cap", type=float, default=20.0, help="most the labelling may spend, in USD (default 20)")',
             f"""    {MARKER}
     budget = ap.add_mutually_exclusive_group()
-    budget.add_argument("--cap", type=float, default=20.0, help="most the labelling may spend, in USD (default 20)")
-    budget.add_argument("--no-cap", dest="cap", action="store_const", const=None,
-                        default=argparse.SUPPRESS, help="no monetary limit; keep cost and usage receipts")""",
+    budget.add_argument("--cap", type=float, default=20.0, help="most the labelling may spend, in USD (default 20)")""",
         )
+    # Older production installs carried a boolean --no-cap patch. Move that
+    # dialect onto the shared mutually-exclusive parser without changing the
+    # public command line or losing their additional review features.
+    legacy_no_cap = (
+        '    ap.add_argument("--no-cap", action="store_true", '
+        'help="no monetary spending limit")'
+    )
+    if legacy_no_cap in text:
         text = replace_once(
             text,
-            "    if not math.isfinite(a.cap) or a.cap <= 0:",
-            "    if a.cap is not None and (not math.isfinite(a.cap) or a.cap <= 0):",
+            legacy_no_cap,
+            '    budget.add_argument("--no-cap", dest="cap", action="store_const", const=None,\n'
+            "                        default=argparse.SUPPRESS, "
+            'help="no monetary limit; keep cost and usage receipts")',
         )
+    elif 'budget.add_argument("--no-cap"' not in text:
+        text = replace_once(
+            text,
+            '    budget.add_argument("--cap", type=float, default=20.0, help="most the labelling may spend, in USD (default 20)")',
+            '    budget.add_argument("--cap", type=float, default=20.0, help="most the labelling may spend, in USD (default 20)")\n'
+            '    budget.add_argument("--no-cap", dest="cap", action="store_const", const=None,\n'
+            "                        default=argparse.SUPPRESS, "
+            'help="no monetary limit; keep cost and usage receipts")',
+        )
+    text = text.replace(
+        "    if a.no_cap:\n        a.cap = 0.0\n",
+        "",
+    )
+    text = text.replace(
+        "    if not math.isfinite(a.cap) or a.cap <= 0:",
+        "    if a.cap is not None and (not math.isfinite(a.cap) or a.cap <= 0):",
+    )
+    text = text.replace("if not a.no_cap and ", "if a.cap is not None and ")
+    if (
+        "        smallest = smallest_unit_reserve(job, run_dir / 'out')" in text
+        and "smallest_unit_reserve(job, run_dir / 'out') if a.cap is not None"
+        not in text
+    ):
         text = replace_once(
             text,
             "        smallest = smallest_unit_reserve(job, run_dir / 'out')",
             "        smallest = smallest_unit_reserve(job, run_dir / 'out') if a.cap is not None else None",
         )
+    if '"--max-spend", str(remaining),' in text:
         text = replace_once(
             text,
             '"--max-spend", str(remaining),',
             '"--max-spend", str(remaining if a.cap is not None else 0.0),',
         )
-        review.write_text(text)
-    if MARKER not in dictionary.read_text():
-        text = dictionary.read_text()
+    text = text.replace(
+        "        remaining = 0.0 if a.no_cap else "
+        "dictionary_stage.remaining_label_budget(job, a.cap)",
+        "        remaining = dictionary_stage.remaining_label_budget(job, a.cap)",
+    )
+    text = text.replace("if not a.no_cap and ", "if a.cap is not None and ")
+    text = text.replace(
+        "if a.no_cap or remaining > 0:", "if a.cap is None or remaining > 0:"
+    )
+    text = text.replace("None if a.no_cap else a.cap", "a.cap")
+    if "a.no_cap" in text:
+        raise RuntimeError("pinned Argus legacy unlimited references remain")
+    review.write_text(text)
+
+    text = dictionary.read_text()
+    if "def remaining_label_budget(job: Path, cap: float | None) -> float:" not in text:
         text = replace_once(
             text,
             "def remaining_label_budget(job: Path, cap: float) -> float:",
             "def remaining_label_budget(job: Path, cap: float | None) -> float:",
         )
+    if "    if cap is None:\n        return math.inf\n" not in text:
         text = replace_once(
             text,
             "    if not math.isfinite(cap) or cap < 0:",
             f"    {MARKER}\n    if cap is None:\n        return math.inf\n    if not math.isfinite(cap) or cap < 0:",
         )
+    if "*, free: bool, cap: float | None," not in text:
         text = replace_once(
             text,
             "*, free: bool, cap: float,",
             "*, free: bool, cap: float | None,",
         )
+    if (
+        "if cap is None:\n                    bound = harness.final_cost_bound"
+        not in text
+    ):
         text = replace_once(
             text,
             """                prices = harness.OPENAI_PRICES[dd.MODEL.split('/', 1)[-1]][n_in >= harness.LONG_PROMPT_TOKENS]
@@ -80,7 +131,7 @@ def apply(root: Path):
                     bound = n_in * prices[0] + plan['max_tokens'] * prices[2]
                     available = max(0.0, min(DICTIONARY_MAX_USD, cap - label_spend(job)))""",
         )
-        dictionary.write_text(text)
+    dictionary.write_text(text)
     runtime = root / "label/pipeline_runtime.py"
     shutil.copyfile(
         Path(__file__).resolve().parents[2]

@@ -17,6 +17,12 @@ PATCH = (
     / "argus"
     / "0001-pipeline-gateway.py"
 )
+UNLIMITED_PATCH = (
+    Path(__file__).resolve().parents[1]
+    / "patches"
+    / "argus"
+    / "0004-unlimited-review.py"
+)
 
 
 @pytest.fixture(scope="module")
@@ -27,8 +33,18 @@ def patch():
     return module
 
 
+@pytest.fixture(scope="module")
+def unlimited_patch():
+    spec = importlib.util.spec_from_file_location(
+        "argus_unlimited_patch", UNLIMITED_PATCH
+    )
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
 # The anchors the patch edits, in the shapes the pinned checkout uses.
-HARNESS = '''import json
+HARNESS = """import json
 import math
 import os
 
@@ -108,9 +124,9 @@ def main(args):
     keys = get_keys()
     if not args.dry_run and not is_openrouter_key(keys[0]) and args.model and not args.model.startswith("openai/"):
         raise SystemExit("bad")
-'''
+"""
 
-ROUTE = '''import json
+ROUTE = """import json
 
 ROUTE_MODEL = "openai/gpt-6-sol"
 
@@ -118,16 +134,16 @@ ROUTE_MODEL = "openai/gpt-6-sol"
 def rates():
     rates = OPENAI_PRICES[ROUTE_MODEL.split('/', 1)[-1]][1]
     return rates
-'''
+"""
 
-PRICING = '''import json
+PRICING = """import json
 
 
 def quote(model: str, timeout: int) -> dict:
     return {}
-'''
+"""
 
-FORMATS = '''def describe(cam: dict, view: str, name: str, rig: str) -> dict:
+FORMATS = """def describe(cam: dict, view: str, name: str, rig: str) -> dict:
     return {}
 
 
@@ -135,7 +151,7 @@ def read():
     ctx = {}
     set_unshown(ctx, lerobot_unshown(ctx))
     set_unshown(ctx, lerobot_unshown(ctx))
-'''
+"""
 
 
 def make_tree(root: Path) -> Path:
@@ -172,10 +188,9 @@ def test_patch_applies_and_is_idempotent(patch, tmp_path):
     # branch that must run before Argus's OpenRouter-key test.
     assert once.count(patch.GATEWAY_MARKER) == 2
     assert (root / "label/route.py").read_text().count(patch.GENERIC_ROUTE_MARKER) == 1
-    assert (
-        (root / "label/pricing.py").read_text().count(patch.GENERIC_PRICING_MARKER)
-        == 1
-    )
+    assert (root / "label/pricing.py").read_text().count(
+        patch.GENERIC_PRICING_MARKER
+    ) == 1
     assert (root / "prepare/formats.py").read_text().count(patch.MOUNTING_MARKER) == 1
 
 
@@ -202,3 +217,69 @@ def test_a_priced_gateway_model_records_its_final_reserve(patch, tmp_path):
         "        if ((_GENERIC or model.startswith('openai/'))\n"
         "                and model.split('/', 1)[-1] in OPENAI_PRICES):"
     ) in text
+
+
+def test_unlimited_patch_adopts_legacy_no_cap_idempotently(unlimited_patch, tmp_path):
+    """Older production installs used a boolean --no-cap flag."""
+
+    review = tmp_path / "review/__main__.py"
+    review.parent.mkdir(parents=True)
+    review.write_text(
+        """import argparse
+import math
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    budget = ap.add_mutually_exclusive_group()
+    budget.add_argument("--cap", type=float, default=20.0, help="most the labelling may spend, in USD (default 20)")
+    ap.add_argument("--no-cap", action="store_true", help="no monetary spending limit")
+    a = ap.parse_args()
+
+    if a.no_cap:
+        a.cap = 0.0
+    if not math.isfinite(a.cap) or a.cap <= 0:
+        raise SystemExit("invalid cap")
+    if not a.no_cap and 1 < 2:
+        if True:
+            smallest = smallest_unit_reserve(job, run_dir / 'out')
+            remaining = 0.0 if a.no_cap else dictionary_stage.remaining_label_budget(job, a.cap)
+            if a.no_cap or remaining > 0:
+                args = ["--max-spend", str(remaining), "--model", model]
+            cap = None if a.no_cap else a.cap
+"""
+    )
+    dictionary = tmp_path / "label/dictionary_stage.py"
+    dictionary.parent.mkdir(parents=True)
+    dictionary.write_text(
+        """import math
+
+
+def remaining_label_budget(job: Path, cap: float) -> float:
+    if not math.isfinite(cap) or cap < 0:
+        raise ValueError(cap)
+    return cap
+
+
+def refine(*, free: bool, cap: float, model: str):
+    for plan in []:
+        for dd in []:
+            for n_in in []:
+                prices = harness.OPENAI_PRICES[dd.MODEL.split('/', 1)[-1]][n_in >= harness.LONG_PROMPT_TOKENS]
+                bound = n_in * prices[0] + plan['max_tokens'] * prices[2]
+                available = max(0.0, min(DICTIONARY_MAX_USD, cap - label_spend(job)))
+                return bound, available
+"""
+    )
+
+    unlimited_patch.apply(tmp_path)
+    once = review.read_text()
+    unlimited_patch.apply(tmp_path)
+
+    assert review.read_text() == once
+    assert once.count('"--no-cap"') == 1
+    assert 'budget.add_argument("--no-cap"' in once
+    assert "a.no_cap" not in once
+    assert "if a.cap is not None and (not math.isfinite(a.cap)" in once
+    assert "if cap is None:\n        return math.inf" in dictionary.read_text()
+    assert "*, free: bool, cap: float | None," in dictionary.read_text()
