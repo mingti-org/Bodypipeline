@@ -333,10 +333,7 @@ def test_personal_review_export_sanitizes_remote_worker_diagnostics(
     monkeypatch.setattr(runner.settings, "letools_bin", str(tool))
     client = client_for(review_app)
     initial = client.get(URL).json()
-    assert (
-        client.post(URL, json=body(initial, initial["segments"])).status_code
-        == 200
-    )
+    assert client.post(URL, json=body(initial, initial["segments"])).status_code == 200
     head = client.get(URL).json()
     principal = Principal(
         username="alice",
@@ -355,12 +352,8 @@ def test_personal_review_export_sanitizes_remote_worker_diagnostics(
         expires_at=now() + 3600,
     )
     with review_app.state.user_sessions._lock:
-        review_app.state.user_sessions._by_token[
-            session.session_id
-        ] = session
-        review_app.state.user_sessions._by_execution[
-            session.execution_id
-        ] = session
+        review_app.state.user_sessions._by_token[session.session_id] = session
+        review_app.state.user_sessions._by_execution[session.execution_id] = session
     monkeypatch.setattr(
         runner,
         "require_principal_path_access",
@@ -377,8 +370,7 @@ def test_personal_review_export_sanitizes_remote_worker_diagnostics(
     control_path = "/tmp/bodypipeline-501/ssh/alice-secret.sock"
     session_token = "SSH_SESSION_TOKEN_8f93c"
     diagnostic = (
-        f"ssh: ControlPath={control_path} session={session_token} "
-        "connection failed"
+        f"ssh: ControlPath={control_path} session={session_token} connection failed"
     )
 
     def popen(_session, _argv, **kwargs):
@@ -419,10 +411,7 @@ def test_review_export_permission_denial_returns_403_without_a_queued_row(
     monkeypatch.setattr(runner.settings, "letools_bin", str(tool))
     client = client_for(review_app)
     initial = client.get(URL).json()
-    assert (
-        client.post(URL, json=body(initial, initial["segments"])).status_code
-        == 200
-    )
+    assert client.post(URL, json=body(initial, initial["segments"])).status_code == 200
     head = client.get(URL).json()
     request = RevisionExportRequest(
         revision=head["revision"],
@@ -450,10 +439,7 @@ def test_review_export_permission_denial_returns_403_without_a_queued_row(
     )
 
     def run(_session, argv, **_kwargs):
-        denied = (
-            argv[:2] == ["/usr/bin/test", "-w"]
-            and argv[-1] == str(cache_root)
-        )
+        denied = argv[:2] == ["/usr/bin/test", "-w"] and argv[-1] == str(cache_root)
         return SimpleNamespace(returncode=1 if denied else 0)
 
     monkeypatch.setattr(review_app.state.user_sessions, "run", run)
@@ -497,10 +483,7 @@ def test_personal_review_export_worker_binds_and_redacts_handle(
     monkeypatch.setattr(runner.settings, "letools_bin", str(tool))
     client = client_for(review_app)
     initial = client.get(URL).json()
-    assert (
-        client.post(URL, json=body(initial, initial["segments"])).status_code
-        == 200
-    )
+    assert client.post(URL, json=body(initial, initial["segments"])).status_code == 200
     head = client.get(URL).json()
     principal = Principal(
         username="alice",
@@ -519,12 +502,8 @@ def test_personal_review_export_worker_binds_and_redacts_handle(
         expires_at=now() + 3600,
     )
     with review_app.state.user_sessions._lock:
-        review_app.state.user_sessions._by_token[
-            session.session_id
-        ] = session
-        review_app.state.user_sessions._by_execution[
-            session.execution_id
-        ] = session
+        review_app.state.user_sessions._by_token[session.session_id] = session
+        review_app.state.user_sessions._by_execution[session.execution_id] = session
     monkeypatch.setattr(
         runner,
         "require_principal_path_access",
@@ -679,13 +658,16 @@ def test_gateway_forwards_only_authenticated_registered_id(review_app, monkeypat
 
 
 def test_patch_is_repeatable_on_pinned_viewer(tmp_path, monkeypatch):
-    from pipeline.server import viewer_annotations
+    from pipeline.server import viewer_annotations, viewer_task_annotations
 
     # Component anchors are exercised against the actual pinned source in the
     # UI build. This fixture checks migration of the previous replacement mount.
     replacements = []
     monkeypatch.setattr(
         viewer_annotations, "_replace", lambda *args: replacements.append(args)
+    )
+    monkeypatch.setattr(
+        viewer_task_annotations, "patch_task_annotations", lambda cache: None
     )
     path = tmp_path / "source/src/app/[org]/[dataset]/[episode]/episode-viewer.tsx"
     path.parent.mkdir(parents=True)
@@ -705,6 +687,24 @@ def test_patch_is_repeatable_on_pinned_viewer(tmp_path, monkeypatch):
     assert "<AnnotationsTimeline" in first and "<AnnotationsPanel" in first
     assert 'className="grounding-intro"' in first
     assert any("end_timestamp" in after for _, _, after in replacements)
+
+
+def test_viewer_bootstrap_installs_task_annotations(tmp_path, monkeypatch):
+    from pipeline.server import viewer_annotations, viewer_task_annotations
+
+    calls = []
+    monkeypatch.setattr(
+        viewer_annotations, "patch_annotations", lambda cache: calls.append("base")
+    )
+    monkeypatch.setattr(
+        viewer_task_annotations,
+        "patch_task_annotations",
+        lambda cache: calls.append("task"),
+    )
+
+    patch_subtask_review(tmp_path)
+
+    assert calls == ["base", "task"]
 
 
 def test_manual_annotations_are_saved_with_subtasks_and_survive_legacy_save(review_app):
@@ -802,10 +802,7 @@ def test_review_export_dedup_uses_canonical_service_identity(
     monkeypatch.setattr(runner.settings, "letools_bin", str(tool))
     client = client_for(review_app)
     initial = client.get(URL).json()
-    assert (
-        client.post(URL, json=body(initial, initial["segments"])).status_code
-        == 200
-    )
+    assert client.post(URL, json=body(initial, initial["segments"])).status_code == 200
     head = client.get(URL).json()
     request = RevisionExportRequest(
         revision=head["revision"],

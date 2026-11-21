@@ -238,8 +238,10 @@ def patch_score_filter(cache: Path):
 
 def patch_subtask_review(cache: Path):
     from .viewer_annotations import patch_annotations
+    from .viewer_task_annotations import patch_task_annotations
 
     patch_annotations(cache)
+    patch_task_annotations(cache)
 
 
 def patch_instruction_editor(cache: Path):
@@ -268,6 +270,9 @@ def _fingerprint(cache: Path, data_origin: str) -> str:
                     + (Path(__file__).parents[1] / "web/workbench.css").read_bytes()
                     + Path(__file__).read_bytes()
                     + Path(__file__).with_name("viewer_annotations.py").read_bytes()
+                    + Path(__file__)
+                    .with_name("viewer_task_annotations.py")
+                    .read_bytes()
                     + Path(__file__).with_name("viewer_instructions.py").read_bytes()
                     + b"".join(
                         path.name.encode() + path.read_bytes()
